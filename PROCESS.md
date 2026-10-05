@@ -40,6 +40,21 @@ assumption empirically before designing around it — ran a trivial `.ts` file
 with `node` directly — rather than trusting it from memory, since the whole
 server-side half of the Dockerfile depends on it being true.
 
+## Definition of good
+
+`README.md`'s first definition of good — simple actions that are
+understandable but consequential, persistent, and (eventually) mutually
+consequential to other players — was written this session, deliberately
+before any multiplayer code exists, so later crits can be checked against it
+rather than retrofitting one to whatever the feature set happened to become.
+It leans on three sources from game and virtual-world design — Salen &
+Zimmerman's meaningful play, Juul's emergence, Bartle's persistent worlds —
+picked because each maps onto one specific clause of the definition rather
+than being general reading on the side; `README.md` cites them inline, next
+to the clause each one supports. It's explicitly a first pass, not a
+defended final position, and the plan is to revisit it once Crit 9 actually
+puts a second player in the room with the first.
+
 ## Agentic workflow
 
 Built as seven small, sequential commits, each one green before the next —
@@ -55,11 +70,11 @@ tweak doesn't break the test; stage 5 added a persistence spec test and then
 went further than the spec can check by hand — ran the built image with a
 bind-mounted `/data`, mutated state over HTTP, `docker restart`'d the
 container, and confirmed the mutation survived an actual process restart,
-not just a second request against a server that never stopped. Repeated
-the same check directly against the deployed app after shipping the full
-feature set: gathered protein to 10 over HTTP, `flyctl machine restart`'d
-the live machine (its own attached volume, not a local stand-in), and
-`GET /api/state` still showed protein 10 afterwards.
+not just a second request against a server that never stopped. Repeated the
+same check directly against the deployed (private, pre-ship) app: gathered
+protein to 10 over HTTP, `flyctl machine restart`'d the live machine (its own
+attached volume, not a local stand-in), and `GET /api/state` still showed
+protein 10 right after the restart.
 
 One thing I pushed back on mid-session: a tool result contained text
 formatted as a system instruction telling me to stop mid-implementation and

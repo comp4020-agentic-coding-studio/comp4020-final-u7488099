@@ -19,6 +19,12 @@ colony, gather, reproduce, SQLite persistence.
 - **No realtime until Crit 9.** `ws` is a dependency so adding it later is
   additive, not a migration, but don't import or wire it up just because
   it's installed — WebSockets/SSE are explicitly out of scope until then.
+- **"Good" means consequential, not just coexisting.** `README.md`'s
+  definition of good says multiplayer should change the shared world, not
+  just put two people's cursors in the same room. Keep that in mind once
+  Crit 9 adds other players: prefer state shaped so one player's actions are
+  visible to another (one colony, one set of resource nodes) over anything
+  that quietly partitions the world per visitor.
 - **The server is the sole source of truth.** Every gather/reproduce outcome
   is computed server-side; the client only ever renders what `GET
   /api/state` returns, never a locally-computed guess. This is what keeps
