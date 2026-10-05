@@ -2,6 +2,9 @@ node_modules/
 dist/
 *.log
 
+# local SQLite DB (DB_PATH falls back here when /data isn't mounted)
+.data/
+
 # editor and OS junk
 .DS_Store
 ._*

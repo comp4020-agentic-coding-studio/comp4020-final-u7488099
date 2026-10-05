@@ -1,5 +1,6 @@
 import express from "express";
 import { readFileSync } from "node:fs";
+import { getState } from "./state.ts";
 
 const app = express();
 app.use(express.json());
@@ -26,6 +27,10 @@ ${escaped}
   </body>
 </html>
 `);
+});
+
+app.get("/api/state", (_req, res) => {
+  res.json(getState());
 });
 
 const port = Number(process.env.PORT ?? 8080);

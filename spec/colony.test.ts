@@ -1,0 +1,28 @@
+import { expect, inject, it } from "vitest";
+
+const baseUrl = inject("baseUrl");
+
+async function getState() {
+  const res = await fetch(new URL("/api/state", baseUrl));
+  expect(res.status).toBe(200);
+  return res.json();
+}
+
+it("seeds one colony with 3 workers near the queen and some food nodes", async () => {
+  const state = await getState();
+
+  expect(state.colony).toMatchObject({ protein: 0 });
+  expect(typeof state.colony.queenX).toBe("number");
+  expect(typeof state.colony.queenY).toBe("number");
+
+  expect(state.workers).toHaveLength(3);
+  for (const worker of state.workers) {
+    expect(Math.abs(worker.x - state.colony.queenX)).toBeLessThanOrEqual(2);
+    expect(Math.abs(worker.y - state.colony.queenY)).toBeLessThanOrEqual(2);
+  }
+
+  expect(state.resourceNodes.length).toBeGreaterThan(0);
+  for (const node of state.resourceNodes) {
+    expect(node.resourceType).toBe("food");
+  }
+});
