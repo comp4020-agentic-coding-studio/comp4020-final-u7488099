@@ -26,3 +26,31 @@ it("seeds one colony with 3 workers near the queen and some food nodes", async (
     expect(node.resourceType).toBe("food");
   }
 });
+
+it("gathering raises colony protein by the fixed yield", async () => {
+  const before = await getState();
+  const worker = before.workers[0];
+  const node = before.resourceNodes[0];
+
+  const res = await fetch(new URL("/api/gather", baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerId: worker.id, nodeId: node.id }),
+  });
+  expect(res.status).toBe(200);
+  const after = await res.json();
+
+  expect(after.colony.protein).toBeGreaterThan(before.colony.protein);
+
+  const refetched = await getState();
+  expect(refetched.colony.protein).toBe(after.colony.protein);
+});
+
+it("rejects gather from a worker or node that doesn't exist", async () => {
+  const res = await fetch(new URL("/api/gather", baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerId: 999999, nodeId: 999999 }),
+  });
+  expect(res.status).toBe(400);
+});

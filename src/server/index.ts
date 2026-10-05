@@ -1,5 +1,6 @@
 import express from "express";
 import { readFileSync } from "node:fs";
+import { gather } from "./actions.ts";
 import { getState } from "./state.ts";
 
 const app = express();
@@ -30,6 +31,20 @@ ${escaped}
 });
 
 app.get("/api/state", (_req, res) => {
+  res.json(getState());
+});
+
+app.post("/api/gather", (req, res) => {
+  const { workerId, nodeId } = req.body ?? {};
+  if (typeof workerId !== "number" || typeof nodeId !== "number") {
+    res.status(400).json({ error: "workerId and nodeId are required" });
+    return;
+  }
+  const result = gather(workerId, nodeId);
+  if (!result.ok) {
+    res.status(400).json(result);
+    return;
+  }
   res.json(getState());
 });
 

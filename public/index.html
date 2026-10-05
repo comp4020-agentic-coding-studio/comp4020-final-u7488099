@@ -36,10 +36,19 @@
       .worker {
         background: #90caf9;
         border: 2px solid #1565c0;
+        cursor: pointer;
+      }
+      .worker.selected {
+        outline: 3px solid #e91e63;
       }
       .node {
         background: #a5d6a7;
         border: 2px solid #2e7d32;
+        cursor: pointer;
+      }
+      #status {
+        min-height: 1.5rem;
+        color: #555;
       }
     </style>
   </head>
@@ -47,7 +56,9 @@
     <main>
       <h1>Colony</h1>
       <p>Protein: <strong id="protein">0</strong></p>
+      <p>Select a worker, then click a food node to gather.</p>
       <div id="map"></div>
+      <p id="status"></p>
       <p><a href="/readme/">About this app</a></p>
     </main>
     <script type="module" src="/app.js"></script>
