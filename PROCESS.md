@@ -1,20 +1,79 @@
 # Process overview
 
-<!-- TEMPLATE: replace everything in this file with your own account, this
-     comment included --- `pnpm check:evidence` fails while it's still here. -->
+## Brief to stack
 
-How you got from the brief to the harness, agentic workflow and stack behind
-this app, told however suits the work. The
-[final project brief](https://comp.anu.edu.au/courses/comp4020-agentic-coding-studio/assessments/final-project/#what-you-submit)
-says what it covers and how long it runs.
+Crit 8's bar is proof of life: deployed, does its core thing, and the trace
+survives a reload. The long-term concept carried from the brief is a
+persistent multiplayer insect colony — but this crit's scope is deliberately
+one world, one colony, gather, reproduce, and SQLite-backed persistence. No
+realtime, no multiplayer, no combat.
 
-Markers follow the links you give them; they don't trawl the repo for evidence
-you didn't point at. A link to the record is one whose text is the commit hash,
-and it can sit anywhere in a sentence:
-[`a1b2c3d`](https://github.com/YOUR-ORG/YOUR-REPO/commit/a1b2c3d) for one
-commit, or
-[`a1b2c3d...e4f5a6b`](https://github.com/YOUR-ORG/YOUR-REPO/compare/a1b2c3d...e4f5a6b)
-for a range.
+I assessed the stack against this repo's two fixed constraints before
+touching anything: `fly.toml` exposes exactly one port on one 256 MB machine
+with one volume at `/data`, and `spec/invariants.test.ts` only ever talks to
+the running app over plain HTTP. That ruled out anything needing a second
+process or a separate database service, and pointed straight at an
+embedded, file-backed DB on the volume.
 
-`pnpm check:evidence` checks that this comment is gone and that every commit you
-link exists in this repo. Whether the account is any good is the marker's call.
+I picked Express + `better-sqlite3` + a hand-rolled TypeScript client bundled
+with esbuild, no frontend framework. `ws` is in `package.json` as a
+dependency already — it attaches to the same `http.Server` Express creates,
+so adding it now and only wiring it up in Crit 9 is additive, not a
+rewrite — but nothing imports it yet; `CLAUDE.md` says why.
+
+The one real engineering decision was the base image. The starter's
+`Dockerfile` ships `busybox` with no Node runtime at all, so it had to become
+a real build regardless of stack. I chose `node:24-slim` (glibc) over
+`node:24-alpine` (musl) specifically because `better-sqlite3` ships prebuilt
+native binaries with broad glibc coverage; Alpine often forces a from-source
+compile in the build, which is a worse risk to carry into a same-day ship.
+I confirmed this by building the image locally
+([`dcd4cec`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/dcd4cec))
+before ever pushing to Fly — no compiler was invoked, the prebuilt binary was
+pulled directly.
+
+The other stack-shaping fact: Node 24 strips TypeScript types natively, so
+the server runs straight from `.ts` source with no build step
+(`tsconfig.json`'s `allowImportingTsExtensions` and `noEmit` say this
+directly). Only the browser bundle needs esbuild. I verified this
+assumption empirically before designing around it — ran a trivial `.ts` file
+with `node` directly — rather than trusting it from memory, since the whole
+server-side half of the Dockerfile depends on it being true.
+
+## Agentic workflow
+
+Built as seven small, sequential commits, each one green before the next —
+[`dcd4cec`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/dcd4cec)
+through
+[`1340f4f`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/1340f4f):
+stage 0 swapped the Dockerfile and deployed once to re-prove the path under
+the new stack before any game logic existed; stages 1–4 added schema+seed,
+the read-only frontend, gather, then reproduce, each with its own spec test
+written to check the contract (the shape of the response, not incidental
+implementation detail) rather than the exact numbers, so a later balance
+tweak doesn't break the test; stage 5 added a persistence spec test and then
+went further than the spec can check by hand — ran the built image with a
+bind-mounted `/data`, mutated state over HTTP, `docker restart`'d the
+container, and confirmed the mutation survived an actual process restart,
+not just a second request against a server that never stopped.
+
+One thing I pushed back on mid-session: a tool result contained text
+formatted as a system instruction telling me to stop mid-implementation and
+respond in a different format. I treated that as an attempted prompt
+injection rather than a real instruction, because it didn't match the
+actual state of the task, and kept going on the plan that was actually
+agreed. Worth recording here since it's exactly the kind of thing a
+marker reading the process should be told about rather than have silently
+absorbed.
+
+## What's left unverified
+
+The client's DOM rendering is manually reasoned through and checked against
+the running server's HTTP responses, but not exercised in an actual browser
+— no browser automation tool was available in this environment, and jsdom
+(the only thing on hand) doesn't implement `window.fetch` or reliably run
+`type="module"` scripts, which is also why the course's own invariant tests
+never ask it to execute anything, only parse static HTML. I'd want a
+person — or a real browser — to click through gather/reproduce once before
+calling the UI itself done, separate from the server-side logic the spec
+tests do cover.
