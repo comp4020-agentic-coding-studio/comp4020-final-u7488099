@@ -95,3 +95,19 @@ it("rejects reproduce with insufficient protein, without mutating state", async 
   expect(after.workers).toHaveLength(before.workers.length);
   expect(after.colony.protein).toBe(before.colony.protein);
 });
+
+it("still has the mutated protein and worker count on a fresh request", async () => {
+  // SQLite-backed, not in-memory: a gather/reproduce pair, then a fresh
+  // GET as its own request should see what the earlier requests wrote.
+  // This can only prove cross-request persistence, not cross-restart —
+  // that's verified manually against a running container (see PROCESS.md).
+  const before = await getState();
+  await gatherUntil(before.colony.protein + 10);
+
+  const mutated = await getState();
+  expect(mutated.colony.protein).toBeGreaterThan(before.colony.protein);
+
+  const stillThere = await getState();
+  expect(stillThere.colony.protein).toBe(mutated.colony.protein);
+  expect(stillThere.workers).toHaveLength(mutated.workers.length);
+});
