@@ -4,11 +4,50 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Colony</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 2rem;
+        color: #1a1a1a;
+      }
+      #map {
+        position: relative;
+        width: 400px;
+        height: 400px;
+        border: 1px solid #444;
+        margin-block: 1rem;
+        background: #eef7ee;
+      }
+      .entity {
+        position: absolute;
+        width: 28px;
+        height: 28px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 50%;
+        font-size: 0.9rem;
+        user-select: none;
+      }
+      .queen {
+        background: #ffd54d;
+        border: 2px solid #b8860b;
+      }
+      .worker {
+        background: #90caf9;
+        border: 2px solid #1565c0;
+      }
+      .node {
+        background: #a5d6a7;
+        border: 2px solid #2e7d32;
+      }
+    </style>
   </head>
   <body>
     <main>
       <h1>Colony</h1>
-      <p>This placeholder proves the deploy path works under the new stack. Replace it with the game.</p>
+      <p>Protein: <strong id="protein">0</strong></p>
+      <div id="map"></div>
       <p><a href="/readme/">About this app</a></p>
     </main>
     <script type="module" src="/app.js"></script>
