@@ -55,7 +55,11 @@ tweak doesn't break the test; stage 5 added a persistence spec test and then
 went further than the spec can check by hand — ran the built image with a
 bind-mounted `/data`, mutated state over HTTP, `docker restart`'d the
 container, and confirmed the mutation survived an actual process restart,
-not just a second request against a server that never stopped.
+not just a second request against a server that never stopped. Repeated
+the same check directly against the deployed app after shipping the full
+feature set: gathered protein to 10 over HTTP, `flyctl machine restart`'d
+the live machine (its own attached volume, not a local stand-in), and
+`GET /api/state` still showed protein 10 afterwards.
 
 One thing I pushed back on mid-session: a tool result contained text
 formatted as a system instruction telling me to stop mid-implementation and
