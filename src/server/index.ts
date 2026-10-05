@@ -1,6 +1,6 @@
 import express from "express";
 import { readFileSync } from "node:fs";
-import { gather } from "./actions.ts";
+import { gather, reproduce } from "./actions.ts";
 import { getState } from "./state.ts";
 
 const app = express();
@@ -41,6 +41,16 @@ app.post("/api/gather", (req, res) => {
     return;
   }
   const result = gather(workerId, nodeId);
+  if (!result.ok) {
+    res.status(400).json(result);
+    return;
+  }
+  res.json(getState());
+});
+
+app.post("/api/reproduce", (_req, res) => {
+  const { colony } = getState();
+  const result = reproduce(colony.id);
   if (!result.ok) {
     res.status(400).json(result);
     return;

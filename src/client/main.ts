@@ -10,6 +10,7 @@ let selectedWorkerId: number | null = null;
 const mapEl = document.querySelector<HTMLDivElement>("#map")!;
 const proteinEl = document.querySelector<HTMLElement>("#protein")!;
 const statusEl = document.querySelector<HTMLElement>("#status")!;
+const reproduceBtn = document.querySelector<HTMLButtonElement>("#reproduce")!;
 
 function place(el: HTMLElement, x: number, y: number): void {
   el.style.left = `${x * CELL}px`;
@@ -76,6 +77,18 @@ async function onNodeClick(nodeId: number): Promise<void> {
   statusEl.textContent = "Gathered!";
   render(state);
 }
+
+reproduceBtn.addEventListener("click", async () => {
+  const res = await fetch("/api/reproduce", { method: "POST" });
+  const state = await res.json();
+  if (!res.ok) {
+    statusEl.textContent = state.error ?? "reproduce failed";
+    return;
+  }
+  selectedWorkerId = null;
+  statusEl.textContent = "A new worker hatched!";
+  render(state);
+});
 
 async function refresh(): Promise<void> {
   const res = await fetch("/api/state");

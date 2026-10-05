@@ -54,3 +54,44 @@ it("rejects gather from a worker or node that doesn't exist", async () => {
   });
   expect(res.status).toBe(400);
 });
+
+async function gatherUntil(targetProtein: number): Promise<void> {
+  let state = await getState();
+  while (state.colony.protein < targetProtein) {
+    const res = await fetch(new URL("/api/gather", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerId: state.workers[0].id, nodeId: state.resourceNodes[0].id }),
+    });
+    state = await res.json();
+  }
+}
+
+it("reproduce spends protein and adds a worker at the queen's position", async () => {
+  await gatherUntil(50);
+  const before = await getState();
+
+  const res = await fetch(new URL("/api/reproduce", baseUrl), { method: "POST" });
+  expect(res.status).toBe(200);
+  const after = await res.json();
+
+  expect(after.workers).toHaveLength(before.workers.length + 1);
+  expect(after.colony.protein).toBe(before.colony.protein - 50);
+
+  const newWorker = after.workers.at(-1);
+  expect(newWorker).toMatchObject({ x: after.colony.queenX, y: after.colony.queenY });
+});
+
+it("rejects reproduce with insufficient protein, without mutating state", async () => {
+  // Runs right after the test above, which gathers to exactly 50 and spends
+  // exactly 50 reproducing — protein is back at 0, below REPRODUCE_COST.
+  const before = await getState();
+  expect(before.colony.protein).toBeLessThan(50);
+
+  const res = await fetch(new URL("/api/reproduce", baseUrl), { method: "POST" });
+  expect(res.status).toBe(400);
+
+  const after = await getState();
+  expect(after.workers).toHaveLength(before.workers.length);
+  expect(after.colony.protein).toBe(before.colony.protein);
+});
