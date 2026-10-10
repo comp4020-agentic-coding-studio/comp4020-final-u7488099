@@ -99,3 +99,9 @@ async function refresh(): Promise<void> {
 refresh().catch((err) => {
   mapEl.textContent = `Failed to load the colony: ${String(err)}`;
 });
+
+const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+const ws = new WebSocket(`${wsProtocol}//${location.host}/ws`);
+ws.addEventListener("message", (event) => {
+  render(JSON.parse(event.data as string));
+});
