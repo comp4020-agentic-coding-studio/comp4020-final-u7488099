@@ -33,23 +33,24 @@ accumulates from what players have actually done in it and is encountered by
 whoever arrives next — the source for why "shared" has to mean more than
 co-presence.
 
-## What's here (Crit 8)
+## What's here (Crit 8 + 9)
 
 - One global colony: a queen, a handful of workers, five food nodes on a
   10x10 grid.
 - Click a worker, then a food node, to gather. Protein goes up, immediately.
 - Spend 50 protein to hatch a new worker at the queen's position.
 - All of it lives on the server; the browser only ever renders what
-  `GET /api/state` returns, never computes an outcome itself. Reload, or
-  come back tomorrow, and it's still there.
+  `GET /api/state` or a `/ws` push returns, never computes an outcome
+  itself. Reload, or come back tomorrow, and it's still there.
+- Realtime: every tab holds a WebSocket open, so another tab's gather or
+  reproduce appears within about a second, with no reload.
 
 ## What's deliberately not here yet
 
-No realtime — multiple tabs open right now don't see each other's moves;
-that's Crit 9's job, and the direction this definition is pointing at. No
-multiplayer or accounts yet — one colony, visible to everyone, no login. No
-combat, predators or resource depletion — food nodes are an infinite supply
-for now, not an economy. No graphics beyond plain positioned circles. Each of
+No multiplayer accounts or identity yet — one colony, visible to everyone,
+no login. No presence (you can't see who else is connected). No combat,
+predators or resource depletion — food nodes are an infinite supply for
+now, not an economy. No graphics beyond plain positioned circles. Each of
 these is a layer to add on top of what's here, not a rewrite of it.
 
 ## Stack
