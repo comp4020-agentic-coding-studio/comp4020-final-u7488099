@@ -1,5 +1,6 @@
 import express from "express";
 import { readFileSync } from "node:fs";
+import { WebSocket, WebSocketServer } from "ws";
 import { gather, reproduce } from "./actions.ts";
 import { getState } from "./state.ts";
 
@@ -45,7 +46,9 @@ app.post("/api/gather", (req, res) => {
     res.status(400).json(result);
     return;
   }
-  res.json(getState());
+  const state = getState();
+  broadcastState(state);
+  res.json(state);
 });
 
 app.post("/api/reproduce", (_req, res) => {
@@ -55,10 +58,23 @@ app.post("/api/reproduce", (_req, res) => {
     res.status(400).json(result);
     return;
   }
-  res.json(getState());
+  const state = getState();
+  broadcastState(state);
+  res.json(state);
 });
 
 const port = Number(process.env.PORT ?? 8080);
-app.listen(port, "0.0.0.0", () => {
+const server = app.listen(port, "0.0.0.0", () => {
   console.log(`listening on http://0.0.0.0:${port}`);
 });
+
+const wss = new WebSocketServer({ server, path: "/ws" });
+
+function broadcastState(state: ReturnType<typeof getState>): void {
+  const payload = JSON.stringify(state);
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  }
+}
