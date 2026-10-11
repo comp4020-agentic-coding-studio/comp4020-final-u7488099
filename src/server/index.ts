@@ -8,6 +8,7 @@ import {
   checkpointSimulation,
   computeGroupDestinations,
   consumeDirty,
+  issueAttackCommand,
   issueGatherCommand,
   issueMoveCommand,
 } from "./simulation.ts";
@@ -118,6 +119,23 @@ app.post("/api/command/gather", (req, res) => {
     return;
   }
   runBatchCommand(res, workerIds, (workerId) => issueGatherCommand(workerId, resourceId));
+});
+
+// Stage 6: same batch-command contract as move/gather. Attack is ephemeral
+// (see simulation.ts) — nothing here persists beyond issuing the command;
+// chasing, range/cooldown resolution, and damage all happen in the existing
+// advanceSimulation tick, with no new interval.
+app.post("/api/command/attack", (req, res) => {
+  const { workerIds, creatureId } = req.body ?? {};
+  if (!Array.isArray(workerIds) || workerIds.length === 0 || !workerIds.every((id) => typeof id === "number")) {
+    res.status(400).json({ error: "workerIds must be a non-empty array of numbers" });
+    return;
+  }
+  if (typeof creatureId !== "number") {
+    res.status(400).json({ error: "creatureId is required" });
+    return;
+  }
+  runBatchCommand(res, workerIds, (workerId) => issueAttackCommand(workerId, creatureId));
 });
 
 const port = Number(process.env.PORT ?? 8080);
