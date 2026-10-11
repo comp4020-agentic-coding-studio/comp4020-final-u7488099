@@ -55,8 +55,33 @@ app.post("/api/reproduce", (_req, res) => {
   res.json(state);
 });
 
-// Stage 1b: single-worker-only in the UI, but the array shape is kept so
-// Stage 2 (group selection) can reuse this route unchanged.
+// Stage 2: a batch command never lets one bad id block the rest. Every id is
+// attempted; ids that fail are collected into `errors` rather than aborting
+// the loop. Only when *every* id fails does the whole request 400 — if at
+// least one succeeded, the response is 200 with the resulting state plus
+// `errors` naming exactly which ids didn't go through. See CLAUDE.md.
+function runBatchCommand<E extends string>(
+  res: express.Response,
+  workerIds: number[],
+  issue: (workerId: number) => E | null,
+): void {
+  const errors: Record<number, E> = {};
+  for (const workerId of workerIds) {
+    const error = issue(workerId);
+    if (error) errors[workerId] = error;
+  }
+
+  const succeeded = workerIds.length - Object.keys(errors).length;
+  if (succeeded === 0) {
+    res.status(400).json({ error: Object.values(errors)[0], errors });
+    return;
+  }
+
+  const state = getState();
+  broadcastState(state);
+  res.json(Object.keys(errors).length > 0 ? { ...state, errors } : state);
+}
+
 app.post("/api/command/move", (req, res) => {
   const { workerIds, x, y } = req.body ?? {};
   if (!Array.isArray(workerIds) || workerIds.length === 0 || !workerIds.every((id) => typeof id === "number")) {
@@ -67,16 +92,7 @@ app.post("/api/command/move", (req, res) => {
     res.status(400).json({ error: "x and y are required" });
     return;
   }
-  for (const workerId of workerIds) {
-    const error = issueMoveCommand(workerId, x, y);
-    if (error) {
-      res.status(400).json({ error });
-      return;
-    }
-  }
-  const state = getState();
-  broadcastState(state);
-  res.json(state);
+  runBatchCommand(res, workerIds, (workerId) => issueMoveCommand(workerId, x, y));
 });
 
 // Preferred, and now only, gather entry point: issues a gather command that
@@ -92,16 +108,7 @@ app.post("/api/command/gather", (req, res) => {
     res.status(400).json({ error: "resourceId is required" });
     return;
   }
-  for (const workerId of workerIds) {
-    const error = issueGatherCommand(workerId, resourceId);
-    if (error) {
-      res.status(400).json({ error });
-      return;
-    }
-  }
-  const state = getState();
-  broadcastState(state);
-  res.json(state);
+  runBatchCommand(res, workerIds, (workerId) => issueGatherCommand(workerId, resourceId));
 });
 
 const port = Number(process.env.PORT ?? 8080);

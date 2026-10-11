@@ -92,6 +92,50 @@ it("gathering requires travel: no instant credit on issue, then the clicked node
   expect(refetched.colony.resources.sugar).toBe(after.colony.resources.sugar);
 });
 
+it("a move command with several valid worker ids moves all of them", async () => {
+  const before = await getState();
+  const movers = before.workers.slice(0, 2);
+  const target = { x: Math.min(before.world.width - 10, before.colony.queenX + 400), y: before.colony.queenY };
+
+  const res = await fetch(new URL("/api/command/move", baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: movers.map((w: any) => w.id), x: target.x, y: target.y }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.errors).toBeUndefined();
+
+  // Movement is continuous and server-driven — just confirm both workers
+  // are travelling, not that they've arrived.
+  await new Promise((r) => setTimeout(r, 300));
+  const moved = await getState();
+  for (const worker of movers) {
+    const current = moved.workers.find((w: any) => w.id === worker.id);
+    expect(current.x !== worker.x || current.y !== worker.y).toBe(true);
+  }
+});
+
+it("a move command with one valid and one invalid id still moves the valid worker and names the invalid one", async () => {
+  const before = await getState();
+  const worker = before.workers[0];
+  const target = { x: Math.min(before.world.width - 10, worker.x + 400), y: worker.y };
+
+  const res = await fetch(new URL("/api/command/move", baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: [worker.id, 999999], x: target.x, y: target.y }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.errors).toEqual({ 999999: "no such worker" });
+
+  await new Promise((r) => setTimeout(r, 300));
+  const after = await getState();
+  const current = after.workers.find((w: any) => w.id === worker.id);
+  expect(current.x !== worker.x || current.y !== worker.y).toBe(true);
+});
+
 it("rejects a gather command for a worker or resource that doesn't exist, with no instant credit either way", async () => {
   const before = await getState();
   const res = await fetch(new URL("/api/command/gather", baseUrl), {
