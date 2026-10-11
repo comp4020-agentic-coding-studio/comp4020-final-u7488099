@@ -112,3 +112,59 @@ economy yet — those are later stages.
   wasn't worth an ALTER TABLE migration. This is a one-time transition;
   don't repeat this drop-and-reseed pattern for later schema changes
   without the same justification.
+
+## Stage 1b: authoritative simulation, worker movement
+
+Stage 1 had no movement — positions were static rows. Stage 1b adds a real
+tick loop (`src/server/simulation.ts`) that moves workers continuously
+toward a commanded target. This changes where "the current state" lives.
+
+- **In-memory simulation state is authoritative; SQLite is a checkpoint,
+  not a live store.** `simulation.ts` holds the one `Map` of worker
+  positions/commands the server trusts. `GET /api/state`, every broadcast,
+  and `reproduce()`'s result must all read worker positions through
+  `getWorkersForColony()` — never with a direct `SELECT ... FROM workers`
+  — or they'll show a stale, last-checkpointed position instead of where
+  the worker actually is mid-tick. The `workers` table only exists so a
+  restart has somewhere to resume from.
+- **Checkpoint, don't write every tick.** Writing SQLite at `tickHz` would
+  turn continuous movement into a continuous write load for no benefit —
+  nothing reads `workers.x`/`y` live. `checkpointSimulation()` flushes all
+  positions in one transaction on a timer (`SIMULATION.checkpointIntervalMs`)
+  and again on `SIGTERM`/`SIGINT`, so a graceful restart loses at most one
+  interval's movement. In-flight commands are never part of the checkpoint:
+  `loadSimulation()` always brings every worker back `idle`, deliberately —
+  a command is ephemeral intent, not durable state (same reasoning as
+  Stage 1's note on worker commands above, now exercised for real).
+- **Tick and broadcast run at different rates on purpose.**
+  `SIMULATION.tickHz` (10) advances positions; `SIMULATION.broadcastHz` (5)
+  is how often clients get a frame. Ticking faster than broadcasting is what
+  makes movement smooth in memory without doubling network chatter — don't
+  collapse them to one rate without a reason. The broadcast loop also skips
+  sending when `consumeDirty()` reports nothing moved since the last frame,
+  so an idle world doesn't push identical state forever; any action's own
+  HTTP response still broadcasts unconditionally, as before.
+- **Reproduce must keep the sim cache and SQLite in lockstep.**
+  `actions.ts`'s `reproduce()` inserts the new worker row and then calls
+  `registerWorker()` synchronously, in the same call stack, immediately
+  after the transaction commits — no `await` in between. Skipping this
+  would leave a newly-hatched worker invisible to `getWorkersForColony()`
+  until the next full `loadSimulation()`, i.e. the next restart. This is
+  also why `advanceSimulation()`/`issueMoveCommand()`/`checkpointSimulation()`
+  stay fully synchronous: an `await` anywhere in that path would let an
+  HTTP handler's mutation interleave with a tick, which is exactly the
+  invariant Crit 9's concurrency note above protects.
+- **Tests get simulation time without sleeping, and without a debug
+  endpoint.** `spec/simulation.test.ts` imports `simulation.ts` directly
+  into the Vitest process — the one exception to the rest of `spec/`, which
+  tests the app strictly as a black box over HTTP against a separately
+  running process. It points `DB_PATH` at a throwaway file
+  (`./.data/colony.sim-test.db`, gitignored) via `process.env.DB_PATH`
+  (see `db.ts`), so it shares no state with the dev DB, the deployed
+  volume, or the HTTP-tested app, and can call `advanceSimulation(dt)`
+  with whatever `dt` it likes instead of waiting on a real timer. This was
+  chosen over adding a `/api/debug/tick` style endpoint, which would be
+  one more production surface to secure for a need that's purely a test
+  harness. `spec/realtime.test.ts` still uses real (short) wall-clock waits
+  for its one movement-broadcast test, since that test's job is to confirm
+  the production timer loop actually fires, not to check the movement math.
