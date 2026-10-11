@@ -3,7 +3,7 @@ import { WORKER_RADIUS } from "../server/balance.ts";
 interface ColonyState {
   world: { width: number; height: number };
   colony: { id: number; queenX: number; queenY: number; resources: Record<string, number> };
-  workers: { id: number; x: number; y: number }[];
+  workers: { id: number; x: number; y: number; carrying: { resourceType: string; amount: number } | null }[];
   resourceNodes: {
     id: number;
     x: number;
@@ -78,6 +78,23 @@ function drawSelectionRing(wx: number, wy: number, r: number): void {
   ctx.restore();
 }
 
+// Stage 4 placeholder: a small filled dot offset toward the worker's
+// upper-right, coloured the same as the resource type it's carrying — reuses
+// NODE_COLOR rather than inventing a second palette. Drawn on top of (not
+// instead of) the worker's own circle, same convention as drawSelectionRing.
+function drawCarryingBadge(wx: number, wy: number, r: number, resourceType: string): void {
+  const [sx, sy] = worldToScreen(wx + r * 0.7, wy - r * 0.7);
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(sx, sy, r * 0.45, 0, Math.PI * 2);
+  ctx.fillStyle = NODE_COLOR[resourceType] ?? "#a5d6a7";
+  ctx.fill();
+  ctx.strokeStyle = "#2e7d32";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+}
+
 // Drawn in world space (worldToScreen'd per corner on every frame) so it
 // stays correct even if WASD panning moves the camera mid-drag.
 function drawSelectionBox(box: { startWorld: [number, number]; currentWorld: [number, number] }): void {
@@ -108,6 +125,7 @@ function draw(): void {
   for (const worker of state.workers) {
     circle(worker.x, worker.y, WORKER_RADIUS, "#90caf9", "#1565c0");
     if (selectedWorkerIds.has(worker.id)) drawSelectionRing(worker.x, worker.y, WORKER_RADIUS + 4);
+    if (worker.carrying) drawCarryingBadge(worker.x, worker.y, WORKER_RADIUS, worker.carrying.resourceType);
   }
 
   if (dragMode === "select" && dragged && selectionDrag) drawSelectionBox(selectionDrag);
@@ -270,7 +288,9 @@ function onCanvasClick(sx: number, sy: number): void {
     // no shift-add, no toggle-off. Drag-select (selectWorkersInBox) is the
     // only way to select more than one.
     selectedWorkerIds = new Set([hit.id]);
-    statusEl.textContent = `Worker #${hit.id} selected — click a resource node to gather, or empty ground to move.`;
+    const worker = state?.workers.find((w) => w.id === hit.id);
+    const carryingSuffix = worker?.carrying ? ` (carrying ${worker.carrying.amount} ${worker.carrying.resourceType})` : "";
+    statusEl.textContent = `Worker #${hit.id} selected${carryingSuffix} — click a resource node to gather, or empty ground to move.`;
     return;
   }
   onNodeClick(hit.id);
