@@ -1,3 +1,5 @@
+import { WORKER_RADIUS } from "../server/balance.ts";
+
 interface ColonyState {
   world: { width: number; height: number };
   colony: { id: number; queenX: number; queenY: number; resources: Record<string, number> };
@@ -18,7 +20,6 @@ const resourcesEl = document.querySelector<HTMLElement>("#resources")!;
 const statusEl = document.querySelector<HTMLElement>("#status")!;
 const reproduceBtn = document.querySelector<HTMLButtonElement>("#reproduce")!;
 
-const WORKER_RADIUS = 10;
 const QUEEN_RADIUS = 20;
 const NODE_RADIUS: Record<string, number> = { sugar: 8, protein: 14, biomass: 20 };
 const NODE_COLOR: Record<string, string> = { sugar: "#f4c542", protein: "#90caf9", biomass: "#8d6e63" };
