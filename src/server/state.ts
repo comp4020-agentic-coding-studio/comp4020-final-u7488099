@@ -1,6 +1,6 @@
 import { RESOURCE_TYPES } from "./balance.ts";
 import { db } from "./db.ts";
-import { getWorkersForColony, type Carrying } from "./simulation.ts";
+import { getCreaturesForWorld, getWorkersForColony, type Carrying } from "./simulation.ts";
 
 export interface ColonyState {
   world: { width: number; height: number };
@@ -19,6 +19,7 @@ export interface ColonyState {
     amount: number | null;
     maxAmount: number | null;
   }[];
+  creatures: { id: number; species: string; x: number; y: number }[];
 }
 
 export function getState(): ColonyState {
@@ -48,10 +49,13 @@ export function getState(): ColonyState {
     )
     .all(world.id) as ColonyState["resourceNodes"];
 
+  const creatures = getCreaturesForWorld(world.id);
+
   return {
     world: { width: world.width, height: world.height },
     colony: { id: colonyRow.id, queenX: colonyRow.queenX, queenY: colonyRow.queenY, resources },
     workers,
     resourceNodes,
+    creatures,
   };
 }

@@ -1,4 +1,4 @@
-import { WORKER_RADIUS } from "../server/balance.ts";
+import { APHID_RADIUS, WORKER_RADIUS } from "../server/balance.ts";
 
 interface ColonyState {
   world: { width: number; height: number };
@@ -12,6 +12,7 @@ interface ColonyState {
     amount: number | null;
     maxAmount: number | null;
   }[];
+  creatures: { id: number; species: string; x: number; y: number }[];
 }
 
 const canvas = document.querySelector<HTMLCanvasElement>("#world")!;
@@ -57,6 +58,26 @@ function circle(wx: number, wy: number, r: number, fill: string, stroke: string)
   if (sx < -r || sy < -r || sx > canvas.width + r || sy > canvas.height + r) return;
   ctx.beginPath();
   ctx.arc(sx, sy, r, 0, Math.PI * 2);
+  ctx.fillStyle = fill;
+  ctx.fill();
+  ctx.strokeStyle = stroke;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+// Stage 5: aphid placeholder marker. A diamond, not a circle, so it reads as
+// visually distinct from every other marker (workers/queen/resource nodes are
+// all circles) at a glance, per the brief — not selectable/clickable, so
+// deliberately never considered by hitTest.
+function diamond(wx: number, wy: number, r: number, fill: string, stroke: string): void {
+  const [sx, sy] = worldToScreen(wx, wy);
+  if (sx < -r || sy < -r || sx > canvas.width + r || sy > canvas.height + r) return;
+  ctx.beginPath();
+  ctx.moveTo(sx, sy - r);
+  ctx.lineTo(sx + r, sy);
+  ctx.lineTo(sx, sy + r);
+  ctx.lineTo(sx - r, sy);
+  ctx.closePath();
   ctx.fillStyle = fill;
   ctx.fill();
   ctx.strokeStyle = stroke;
@@ -120,6 +141,9 @@ function draw(): void {
 
   for (const node of state.resourceNodes) {
     circle(node.x, node.y, NODE_RADIUS[node.resourceType] ?? 10, NODE_COLOR[node.resourceType] ?? "#a5d6a7", "#2e7d32");
+  }
+  for (const creature of state.creatures) {
+    diamond(creature.x, creature.y, APHID_RADIUS, "#7cb342", "#33691e");
   }
   circle(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS, "#ffd54d", "#b8860b");
   for (const worker of state.workers) {
