@@ -18,8 +18,9 @@ export interface ColonyState {
     resourceType: string;
     amount: number | null;
     maxAmount: number | null;
+    kind: "source" | "item";
   }[];
-  creatures: { id: number; species: string; x: number; y: number }[];
+  creatures: { id: number; species: string; x: number; y: number; health: number; maxHealth: number }[];
 }
 
 export function getState(): ColonyState {
@@ -45,7 +46,7 @@ export function getState(): ColonyState {
 
   const resourceNodes = db
     .prepare(
-      "SELECT id, x, y, resource_type AS resourceType, amount, max_amount AS maxAmount FROM resource_nodes WHERE world_id = ? ORDER BY id",
+      "SELECT id, x, y, resource_type AS resourceType, amount, max_amount AS maxAmount, kind FROM resource_nodes WHERE world_id = ? ORDER BY id",
     )
     .all(world.id) as ColonyState["resourceNodes"];
 
