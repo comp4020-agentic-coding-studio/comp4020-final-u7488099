@@ -173,18 +173,26 @@ it("a group move command broadcasts one frame reflecting every moved worker to e
   }
 });
 
+// Stage 4: a claim no longer credits the colony instantly — the worker has
+// to carry the payload home and deposit it, roughly doubling the round trip
+// versus the old single-leg travel. A worker that's already carrying/
+// returning also rejects a re-issued gather command (see CLAUDE.md), so this
+// polls for every currently-idle (not carrying) worker each cycle and sends
+// it after protein, rather than blindly re-posting to one fixed worker id
+// that might now be busy returning a previous claim.
 async function gatherProteinUntil(targetProtein: number): Promise<void> {
   let state = await getState();
-  const workerId = state.workers[0].id;
-  const deadline = Date.now() + 30000;
+  const deadline = Date.now() + 45000;
   while (state.colony.resources.protein < targetProtein && Date.now() < deadline) {
-    const worker = state.workers.find((w: any) => w.id === workerId);
-    const node = closestNode(state, worker, "protein");
-    await fetch(new URL("/api/command/gather", baseUrl), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workerIds: [workerId], resourceId: node.id }),
-    });
+    const idleWorkers = state.workers.filter((w: any) => !w.carrying);
+    for (const worker of idleWorkers) {
+      const node = closestNode(state, worker, "protein");
+      await fetch(new URL("/api/command/gather", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
+      });
+    }
     await new Promise((r) => setTimeout(r, 250));
     state = await getState();
   }
@@ -193,7 +201,7 @@ async function gatherProteinUntil(targetProtein: number): Promise<void> {
   }
 }
 
-it("two simultaneous reproduce calls racing for the same protein: exactly one succeeds", async () => {
+it("two simultaneous reproduce calls racing for the same protein: exactly one succeeds", { timeout: 60000 }, async () => {
   await gatherProteinUntil(50);
   const before = await getState();
 
@@ -207,3 +215,57 @@ it("two simultaneous reproduce calls racing for the same protein: exactly one su
   const after = await getState();
   expect(after.workers).toHaveLength(before.workers.length + 1);
 });
+
+it(
+  "the full claim -> carrying -> return -> deposit lifecycle is visible over the wire to two open connections",
+  { timeout: 30000 },
+  async () => {
+    const before = await getState();
+    const worker = before.workers.find((w: any) => !w.carrying) ?? before.workers[0];
+    const node = closestNode(before, worker, "sugar");
+    const baselineSugar = before.colony.resources.sugar;
+
+    const [wsA, wsB] = await Promise.all([connect(), connect()]);
+    try {
+      const res = await fetch(new URL("/api/command/gather", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
+      });
+      expect(res.status).toBe(200);
+
+      // First: a broadcast frame shows the worker carrying a payload while
+      // the colony's sugar bucket is still at baseline — claim precedes
+      // credit, even over the wire.
+      async function waitForCarrying(ws: WebSocket): Promise<any> {
+        const deadline = Date.now() + 15000;
+        while (Date.now() < deadline) {
+          const message = await nextMessage(ws, 15000);
+          const current = message.workers.find((w: any) => w.id === worker.id);
+          if (current?.carrying) return message;
+        }
+        throw new Error("no broadcast frame showed the worker carrying a payload");
+      }
+      const [carryingA, carryingB] = await Promise.all([waitForCarrying(wsA), waitForCarrying(wsB)]);
+      expect(carryingA.colony.resources.sugar).toBe(baselineSugar);
+      expect(carryingB.colony.resources.sugar).toBe(baselineSugar);
+
+      // Then: a later frame shows the deposit — sugar credited, carrying
+      // cleared back to null — on both open connections.
+      async function waitForDeposit(ws: WebSocket): Promise<any> {
+        const deadline = Date.now() + 15000;
+        while (Date.now() < deadline) {
+          const message = await nextMessage(ws, 15000);
+          const current = message.workers.find((w: any) => w.id === worker.id);
+          if (current && !current.carrying && message.colony.resources.sugar > baselineSugar) return message;
+        }
+        throw new Error("no broadcast frame showed the deposit completing");
+      }
+      const [depositA, depositB] = await Promise.all([waitForDeposit(wsA), waitForDeposit(wsB)]);
+      expect(depositA.colony.resources.sugar).toBe(depositB.colony.resources.sugar);
+    } finally {
+      wsA.close();
+      wsB.close();
+    }
+  },
+);

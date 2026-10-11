@@ -149,18 +149,26 @@ it("rejects a gather command for a worker or resource that doesn't exist, with n
   expect(after.colony.resources).toEqual(before.colony.resources);
 });
 
+// Stage 4: a claim no longer credits the colony instantly — the worker has
+// to carry the payload home and deposit it, roughly doubling the round trip
+// versus the old single-leg travel. A worker that's already carrying/
+// returning also rejects a re-issued gather command (see CLAUDE.md), so this
+// polls for every currently-idle (not carrying) worker each cycle and sends
+// it after protein, rather than blindly re-posting to one fixed worker id
+// that might now be busy returning a previous claim.
 async function gatherProteinUntil(targetProtein: number): Promise<void> {
   let state = await getState();
-  const workerId = state.workers[0].id;
-  const deadline = Date.now() + 30000;
+  const deadline = Date.now() + 45000;
   while (state.colony.resources.protein < targetProtein && Date.now() < deadline) {
-    const worker = state.workers.find((w: any) => w.id === workerId);
-    const node = closestNode(state, worker, "protein");
-    await fetch(new URL("/api/command/gather", baseUrl), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workerIds: [workerId], resourceId: node.id }),
-    });
+    const idleWorkers = state.workers.filter((w: any) => !w.carrying);
+    for (const worker of idleWorkers) {
+      const node = closestNode(state, worker, "protein");
+      await fetch(new URL("/api/command/gather", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
+      });
+    }
     await new Promise((r) => setTimeout(r, 250));
     state = await getState();
   }
@@ -169,7 +177,7 @@ async function gatherProteinUntil(targetProtein: number): Promise<void> {
   }
 }
 
-it("reproduce spends protein and adds a worker at the queen's position", async () => {
+it("reproduce spends protein and adds a worker at the queen's position", { timeout: 60000 }, async () => {
   await gatherProteinUntil(50);
   const before = await getState();
 
@@ -212,4 +220,41 @@ it("still has the mutated resource count and worker count on a fresh request", a
   const stillThere = await getState();
   expect(stillThere.colony.resources.protein).toBe(mutated.colony.resources.protein);
   expect(stillThere.workers).toHaveLength(mutated.workers.length);
+});
+
+it("a worker that's carrying resources home rejects a new move command, but a free worker in the same batch still moves", async () => {
+  const before = await getState();
+  const [busyCandidate, freeWorker] = before.workers;
+  const sugarNode = closestNode(before, busyCandidate, "sugar");
+
+  await fetch(new URL("/api/command/gather", baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: [busyCandidate.id], resourceId: sugarNode.id }),
+  });
+
+  const deadline = Date.now() + 15000;
+  let state = await getState();
+  let busyWorker = state.workers.find((w: any) => w.id === busyCandidate.id);
+  while (!busyWorker.carrying && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 200));
+    state = await getState();
+    busyWorker = state.workers.find((w: any) => w.id === busyCandidate.id);
+  }
+  expect(busyWorker.carrying).toBeTruthy();
+
+  const target = { x: Math.min(before.world.width - 10, freeWorker.x + 400), y: freeWorker.y };
+  const res = await fetch(new URL("/api/command/move", baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: [busyWorker.id, freeWorker.id], x: target.x, y: target.y }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.errors).toEqual({ [busyWorker.id]: "worker is busy returning resources" });
+
+  await new Promise((r) => setTimeout(r, 300));
+  const after = await getState();
+  const movedFreeWorker = after.workers.find((w: any) => w.id === freeWorker.id);
+  expect(movedFreeWorker.x !== freeWorker.x || movedFreeWorker.y !== freeWorker.y).toBe(true);
 });
