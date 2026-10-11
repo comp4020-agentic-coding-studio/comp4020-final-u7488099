@@ -1,6 +1,7 @@
 import {
   APHID_IDLE_MAX,
   APHID_IDLE_MIN,
+  APHID_PROTEIN_VALUE,
   APHID_SPEED,
   APHID_WANDER_RADIUS,
   DEPOSIT_RANGE,
@@ -10,6 +11,9 @@ import {
   MIN_SEPARATION,
   RESOURCE_REGEN_RATES,
   SEPARATION_STRENGTH,
+  WORKER_ATTACK_COOLDOWN,
+  WORKER_ATTACK_DAMAGE,
+  WORKER_ATTACK_RANGE,
   WORKER_SPEED,
 } from "./balance.ts";
 import { db } from "./db.ts";
@@ -26,7 +30,13 @@ type WorkerCommand =
   | { type: "idle" }
   | { type: "move"; targetX: number; targetY: number }
   | { type: "gather"; resourceId: number; lastKnownX: number; lastKnownY: number }
-  | { type: "return" }; // target is always the worker's own colony's nest — see nestPositions
+  | { type: "return" } // target is always the worker's own colony's nest — see nestPositions
+  // Stage 6: ephemeral, same category as the rest — never written to the
+  // workers table, always reset to idle on loadSimulation(). No
+  // lastKnownX/Y: the target creature's live position is re-read from the
+  // `creatures` Map every tick (see handleAttackCommand), not captured once
+  // at issue time like gather's lastKnownX/Y is.
+  | { type: "attack"; creatureId: number; cooldownRemaining: number };
 
 interface SimWorker {
   id: number;
@@ -43,18 +53,21 @@ export type MoveCommandError =
   | "coordinates out of bounds"
   | "worker is busy returning resources";
 export type GatherCommandError = "no such worker" | "no such resource node" | "worker is busy returning resources";
+export type AttackCommandError = "no such worker" | "no such creature" | "worker is busy returning resources";
 
-// Stage 5: a neutral, non-interactable creature (first species: aphid).
-// Deliberately minimal — species as a plain string rather than an enum, and
-// only the fields a wandering creature actually needs — so a later stage can
-// add fields (health, a pursued target) without replacing this shape, but
-// nothing beyond wander exists yet. See CLAUDE.md.
+// Stage 5: a neutral creature (first species: aphid). Stage 6 makes it
+// interactable: health/maxHealth are durable (see db.ts's creatures table),
+// loaded fresh from SQLite on every loadSimulation() rather than defaulted
+// in memory, so a restart never silently resets an injured aphid to full
+// health. See CLAUDE.md.
 interface SimCreature {
   id: number;
   worldId: number;
   species: string;
   x: number;
   y: number;
+  health: number;
+  maxHealth: number;
   command: CreatureCommand;
   rngState: number; // not exposed externally; reseeded fresh on every loadSimulation()
 }
@@ -128,14 +141,17 @@ export function loadSimulation(): void {
   // paused, then kept wandering". Only existence and position are durable.
   // See CLAUDE.md.
   creatures.clear();
-  const creatureRows = db.prepare("SELECT id, world_id AS worldId, species, x, y FROM creatures ORDER BY id").all() as
-    {
-      id: number;
-      worldId: number;
-      species: string;
-      x: number;
-      y: number;
-    }[];
+  const creatureRows = db
+    .prepare("SELECT id, world_id AS worldId, species, x, y, health, max_health AS maxHealth FROM creatures ORDER BY id")
+    .all() as {
+    id: number;
+    worldId: number;
+    species: string;
+    x: number;
+    y: number;
+    health: number;
+    maxHealth: number;
+  }[];
   for (const row of creatureRows) {
     creatures.set(row.id, {
       ...row,
@@ -209,11 +225,13 @@ function advanceCreatures(dt: number): void {
   }
 }
 
-export function getCreaturesForWorld(worldId: number): { id: number; species: string; x: number; y: number }[] {
+export function getCreaturesForWorld(
+  worldId: number,
+): { id: number; species: string; x: number; y: number; health: number; maxHealth: number }[] {
   return [...creatures.values()]
     .filter((c) => c.worldId === worldId)
     .sort((a, b) => a.id - b.id)
-    .map(({ id, species, x, y }) => ({ id, species, x, y }));
+    .map(({ id, species, x, y, health, maxHealth }) => ({ id, species, x, y, health, maxHealth }));
 }
 
 // Resource nodes have no in-memory cache (every claim already mutates SQLite
@@ -256,7 +274,7 @@ export function getWorkersForColony(colonyId: number): { id: number; x: number; 
     .map(({ id, x, y, carrying }) => ({ id, x, y, carrying }));
 }
 
-export function getWorkerCommand(workerId: number): "idle" | "move" | "gather" | "return" {
+export function getWorkerCommand(workerId: number): "idle" | "move" | "gather" | "return" | "attack" {
   const worker = workers.get(workerId);
   if (!worker) throw new Error(`no such worker: ${workerId}`);
   return worker.command.type;
@@ -293,6 +311,21 @@ export function issueGatherCommand(workerId: number, resourceId: number): Gather
     | undefined;
   if (!node) return "no such resource node";
   worker.command = { type: "gather", resourceId, lastKnownX: node.x, lastKnownY: node.y };
+  return null;
+}
+
+// Stage 6: same batch-command contract as move/gather (per-id errors, no
+// cross-worker effects). A carrying worker is rejected exactly like
+// move/gather — committed to returning home, not available to be
+// redirected mid-carry. `cooldownRemaining: 0` lets a freshly issued attack
+// land a hit the instant it's in range, rather than forcing a full
+// cooldown wait first.
+export function issueAttackCommand(workerId: number, creatureId: number): AttackCommandError | null {
+  const worker = workers.get(workerId);
+  if (!worker) return "no such worker";
+  if (worker.carrying) return "worker is busy returning resources";
+  if (!creatures.has(creatureId)) return "no such creature";
+  worker.command = { type: "attack", creatureId, cooldownRemaining: 0 };
   return null;
 }
 
@@ -426,6 +459,94 @@ function attemptDeposit(worker: SimWorker): void {
   worker.carrying = null;
   worker.command = { type: "idle" };
   dirty = true;
+}
+
+// Stage 6: health is written synchronously on every hit (not batched into
+// the periodic checkpoint) — same durability-on-mutation precedent as
+// attemptGatherClaim/attemptDeposit's own transactions, just a plain UPDATE
+// since there's nothing else to keep atomic with it until death.
+function applyDamage(creature: SimCreature, amount: number): void {
+  creature.health = Math.max(0, creature.health - amount);
+  db.prepare("UPDATE creatures SET health = ? WHERE id = ?").run(creature.health, creature.id);
+  dirty = true;
+  if (creature.health <= 0) killCreature(creature);
+}
+
+// Death and carcass creation commit in one SQLite transaction (§7): a crash
+// mid-kill can never leave an orphaned creature row or a missing/duplicate
+// carcass. In-memory cleanup (creatures.delete, attacker idle-sweep) only
+// happens after tx() returns, keeping in-memory state synced to the
+// committed result. Carcass is inserted with kind='item' — protein has no
+// entry in RESOURCE_REGEN_RATES, so attemptGatherClaim's existing
+// non-renewable branch already makes it finite and delete-at-zero with no
+// further code. See CLAUDE.md.
+function killCreature(creature: SimCreature): void {
+  const tx = db.transaction(() => {
+    db.prepare("DELETE FROM creatures WHERE id = ?").run(creature.id);
+    db.prepare(
+      "INSERT INTO resource_nodes (world_id, x, y, resource_type, amount, max_amount, kind) " +
+        "VALUES (?, ?, ?, 'protein', ?, ?, 'item')",
+    ).run(creature.worldId, creature.x, creature.y, APHID_PROTEIN_VALUE, APHID_PROTEIN_VALUE);
+  });
+  tx();
+  creatures.delete(creature.id);
+  // Post-kill (§10): every worker attacking this creature goes idle in
+  // place — no auto-gather of the new carcass, no auto-retarget to another
+  // creature. The player must issue both explicitly.
+  for (const worker of workers.values()) {
+    if (worker.command.type === "attack" && worker.command.creatureId === creature.id) {
+      worker.command = { type: "idle" };
+    }
+  }
+  dirty = true;
+}
+
+// Stage 6: chase + attack resolution. Unlike move/gather/return, "in range"
+// here is a continuous check, never a one-shot arrival — the target keeps
+// moving and the attack never "completes" — so this gets its own branch
+// rather than being forced into resolveTarget/resolveArrival. Always reads
+// the creature's *current* position (never a captured lastKnownX/Y), so a
+// wandering target is chased live every tick.
+function handleAttackCommand(
+  worker: SimWorker,
+  command: Extract<WorkerCommand, { type: "attack" }>,
+  separation: { dx: number; dy: number },
+  dt: number,
+): void {
+  const creature = creatures.get(command.creatureId);
+  if (!creature) {
+    worker.command = { type: "idle" };
+    return;
+  }
+
+  const dx = creature.x - worker.x;
+  const dy = creature.y - worker.y;
+  const dist = Math.hypot(dx, dy);
+
+  if (dist > WORKER_ATTACK_RANGE) {
+    const step = Math.min(WORKER_SPEED * dt, dist - WORKER_ATTACK_RANGE + ARRIVAL_EPSILON);
+    worker.x = clamp(worker.x + (dx / dist) * step + separation.dx, 0, worldBounds.width);
+    worker.y = clamp(worker.y + (dy / dist) * step + separation.dy, 0, worldBounds.height);
+  } else {
+    // Already in range: still take the separation nudge so multiple
+    // attackers on the same creature don't stack on top of each other.
+    worker.x = clamp(worker.x + separation.dx, 0, worldBounds.width);
+    worker.y = clamp(worker.y + separation.dy, 0, worldBounds.height);
+  }
+  dirty = true;
+
+  const cooldownRemaining = Math.max(0, command.cooldownRemaining - dt);
+  if (dist <= WORKER_ATTACK_RANGE && cooldownRemaining <= 0) {
+    applyDamage(creature, WORKER_ATTACK_DAMAGE);
+    // killCreature (inside applyDamage) may already have reset this worker
+    // to idle if that hit was lethal — only write the cooldown back if the
+    // command is still "attack".
+    if (worker.command.type === "attack") {
+      worker.command = { ...worker.command, cooldownRemaining: WORKER_ATTACK_COOLDOWN };
+    }
+  } else if (worker.command.type === "attack") {
+    worker.command = { ...worker.command, cooldownRemaining };
+  }
 }
 
 // Stage 3: a uniform spatial hash rebuilt fresh every tick from everyone's
@@ -596,6 +717,11 @@ export function advanceSimulation(dt: number): void {
           dirty = true;
         }
       }
+      continue;
+    }
+
+    if (worker.command.type === "attack") {
+      handleAttackCommand(worker, worker.command, separation, dt);
       continue;
     }
 
