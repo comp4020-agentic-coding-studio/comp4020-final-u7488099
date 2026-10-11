@@ -2,9 +2,11 @@ import Database from "better-sqlite3";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
+  APHID_MAX_HEALTH,
   APHID_SEED_POSITIONS,
   RESOURCE_NODES,
   RESOURCE_TYPES,
+  SPECIES_MAX_HEALTH,
   STARTING_WORKERS,
   SUGAR_NODE_MAX_AMOUNT,
   WORLD,
@@ -21,6 +23,8 @@ db.pragma("journal_mode = WAL");
 dropLegacySchema();
 migrateWorkersCarrying();
 migrateSugarNodesFinite();
+migrateResourceNodeKind();
+migrateCreatureHealth();
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS worlds (
@@ -59,6 +63,10 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  -- Stage 6: 'kind' distinguishes a renewable, fixed-location "source"
+  -- (sugar/biomass/protein nodes, unchanged) from a finite dropped "item"
+  -- (a carcass). Defaults to 'source' so every pre-Stage-6 row is correctly
+  -- classified with no backfill needed. See CLAUDE.md.
   CREATE TABLE IF NOT EXISTS resource_nodes (
     id INTEGER PRIMARY KEY,
     world_id INTEGER NOT NULL REFERENCES worlds(id),
@@ -66,25 +74,30 @@ db.exec(`
     y REAL NOT NULL,
     resource_type TEXT NOT NULL,
     amount REAL,
-    max_amount REAL
+    max_amount REAL,
+    kind TEXT NOT NULL DEFAULT 'source'
   );
 
   -- Stage 5: neutral, non-interactable creatures (first species: aphid).
   -- World-scoped rather than colony-scoped — aphids aren't owned by anyone.
-  -- No HP/species-specific fields yet; see CLAUDE.md for why this stays
-  -- minimal on purpose.
+  -- Stage 6 adds durable health/max_health (nullable so a fresh ALTER on an
+  -- already-deployed DB is cheap; backfillCreatureHealth() fills them in
+  -- immediately). See CLAUDE.md.
   CREATE TABLE IF NOT EXISTS creatures (
     id INTEGER PRIMARY KEY,
     world_id INTEGER NOT NULL REFERENCES worlds(id),
     species TEXT NOT NULL,
     x REAL NOT NULL,
     y REAL NOT NULL,
+    health REAL,
+    max_health REAL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
 
 seedIfEmpty();
 seedCreaturesIfEmpty();
+backfillCreatureHealth();
 
 // Pre-Stage-1 deployments have a `colonies` table from the Crit 8/9 schema:
 // integer grid coordinates, a flat `protein` column, no `world_id`. That
@@ -131,6 +144,42 @@ function migrateSugarNodesFinite(): void {
   ).run(SUGAR_NODE_MAX_AMOUNT, SUGAR_NODE_MAX_AMOUNT);
 }
 
+// Stage 6: distinguishes a renewable "source" from a finite dropped "item"
+// (a carcass). Defaulting to 'source' means every existing row is correctly
+// classified with no backfill UPDATE needed — only the ALTER itself.
+function migrateResourceNodeKind(): void {
+  const columns = db.prepare("PRAGMA table_info(resource_nodes)").all() as { name: string }[];
+  if (columns.length === 0) return; // table doesn't exist yet; CREATE TABLE below defines it with the column
+  if (columns.some((c) => c.name === "kind")) return;
+  db.exec("ALTER TABLE resource_nodes ADD COLUMN kind TEXT NOT NULL DEFAULT 'source'");
+}
+
+// Stage 6: creatures gain durable health. Nullable so the ALTER is cheap;
+// backfillCreatureHealth() immediately fills every row via SPECIES_MAX_HEALTH,
+// so "health IS NULL" never persists past one boot. Mirrors
+// migrateWorkersCarrying()'s guard pattern.
+function migrateCreatureHealth(): void {
+  const columns = db.prepare("PRAGMA table_info(creatures)").all() as { name: string }[];
+  if (columns.length === 0) return; // table doesn't exist yet; CREATE TABLE below defines it with the columns
+  if (columns.some((c) => c.name === "health")) return;
+  db.exec(`
+    ALTER TABLE creatures ADD COLUMN health REAL;
+    ALTER TABLE creatures ADD COLUMN max_health REAL;
+  `);
+}
+
+// Idempotent: only rows with max_health IS NULL match (brand-new rows from
+// seedCreaturesIfEmpty already insert health/max_health directly). Runs
+// every boot so a species added to SPECIES_MAX_HEALTH later also backfills.
+function backfillCreatureHealth(): void {
+  const backfill = db.prepare(
+    "UPDATE creatures SET health = ?, max_health = ? WHERE species = ? AND max_health IS NULL",
+  );
+  for (const [species, maxHealth] of Object.entries(SPECIES_MAX_HEALTH)) {
+    backfill.run(maxHealth, maxHealth, species);
+  }
+}
+
 function seedIfEmpty(): void {
   const row = db.prepare("SELECT COUNT(*) AS n FROM colonies").get() as { n: number };
   if (row.n > 0) return;
@@ -172,8 +221,12 @@ function seedCreaturesIfEmpty(): void {
   if (row.n > 0) return;
   const world = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number } | undefined;
   if (!world) return;
-  const insertCreature = db.prepare("INSERT INTO creatures (world_id, species, x, y) VALUES (?, 'aphid', ?, ?)");
-  for (const pos of APHID_SEED_POSITIONS) insertCreature.run(world.id, pos.x, pos.y);
+  const insertCreature = db.prepare(
+    "INSERT INTO creatures (world_id, species, x, y, health, max_health) VALUES (?, 'aphid', ?, ?, ?, ?)",
+  );
+  for (const pos of APHID_SEED_POSITIONS) {
+    insertCreature.run(world.id, pos.x, pos.y, APHID_MAX_HEALTH, APHID_MAX_HEALTH);
+  }
 }
 
 // Test-only isolation seam (Stage 4): wipes every table, then reseeds via
@@ -193,4 +246,5 @@ export function resetForTests(): void {
   `);
   seedIfEmpty();
   seedCreaturesIfEmpty();
+  backfillCreatureHealth();
 }
