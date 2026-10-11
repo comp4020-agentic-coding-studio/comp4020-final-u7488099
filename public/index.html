@@ -14,10 +14,7 @@
         display: block;
         border: 1px solid #444;
         margin-block: 1rem;
-        cursor: grab;
-      }
-      #world:active {
-        cursor: grabbing;
+        cursor: crosshair;
       }
       #resources {
         font-weight: 600;
@@ -36,9 +33,14 @@
     <main>
       <h1>Colony</h1>
       <p id="resources">sugar: 0 · protein: 0 · biomass: 0</p>
-      <p>Select a worker, then click a resource node to gather, or empty ground to send it there.</p>
+      <p>
+        Click a worker to select it, or left-drag a box to select several. Then click a resource node to gather, or
+        empty ground to send them there.
+      </p>
       <canvas id="world" width="960" height="600"></canvas>
-      <p id="hint">Pan with WASD, the arrow keys, or by dragging the map.</p>
+      <p id="hint">
+        Left-drag on the map to box-select workers. Middle- or right-drag to pan. WASD and the arrow keys also pan.
+      </p>
       <button id="reproduce">Reproduce worker (50 protein)</button>
       <p id="status"></p>
       <p><a href="/readme/">About this app</a></p>

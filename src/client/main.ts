@@ -23,10 +23,10 @@ const QUEEN_RADIUS = 20;
 const NODE_RADIUS: Record<string, number> = { sugar: 8, protein: 14, biomass: 20 };
 const NODE_COLOR: Record<string, string> = { sugar: "#f4c542", protein: "#90caf9", biomass: "#8d6e63" };
 const PAN_SPEED = 600; // world units per second
-const DRAG_THRESHOLD = 4; // screen px of movement before a mousedown counts as a pan, not a click
+const DRAG_THRESHOLD = 4; // screen px of movement before a mousedown counts as a drag, not a click
 
 let state: ColonyState | null = null;
-let selectedWorkerId: number | null = null;
+let selectedWorkerIds = new Set<number>();
 let cameraInitialised = false;
 const camera = { x: 0, y: 0 };
 
@@ -63,6 +63,38 @@ function circle(wx: number, wy: number, r: number, fill: string, stroke: string)
   ctx.stroke();
 }
 
+// Dashed ring, drawn on top of (not instead of) the worker's own circle, so
+// selection never changes a worker's actual rendered colour.
+function drawSelectionRing(wx: number, wy: number, r: number): void {
+  const [sx, sy] = worldToScreen(wx, wy);
+  ctx.save();
+  ctx.setLineDash([4, 3]);
+  ctx.strokeStyle = "#e91e63";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(sx, sy, r, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Drawn in world space (worldToScreen'd per corner on every frame) so it
+// stays correct even if WASD panning moves the camera mid-drag.
+function drawSelectionBox(box: { startWorld: [number, number]; currentWorld: [number, number] }): void {
+  const [sx1, sy1] = worldToScreen(...box.startWorld);
+  const [sx2, sy2] = worldToScreen(...box.currentWorld);
+  const x = Math.min(sx1, sx2);
+  const y = Math.min(sy1, sy2);
+  const w = Math.abs(sx2 - sx1);
+  const h = Math.abs(sy2 - sy1);
+  ctx.save();
+  ctx.fillStyle = "rgba(33, 150, 243, 0.15)";
+  ctx.strokeStyle = "rgba(33, 150, 243, 0.8)";
+  ctx.lineWidth = 1;
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeRect(x, y, w, h);
+  ctx.restore();
+}
+
 function draw(): void {
   ctx.fillStyle = "#eef7ee";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -73,8 +105,11 @@ function draw(): void {
   }
   circle(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS, "#ffd54d", "#b8860b");
   for (const worker of state.workers) {
-    circle(worker.x, worker.y, WORKER_RADIUS, "#90caf9", worker.id === selectedWorkerId ? "#e91e63" : "#1565c0");
+    circle(worker.x, worker.y, WORKER_RADIUS, "#90caf9", "#1565c0");
+    if (selectedWorkerIds.has(worker.id)) drawSelectionRing(worker.x, worker.y, WORKER_RADIUS + 4);
   }
+
+  if (dragMode === "select" && dragged && selectionDrag) drawSelectionBox(selectionDrag);
 }
 
 function renderResourceCounts(): void {
@@ -126,15 +161,28 @@ function frame(now: number): void {
 }
 requestAnimationFrame(frame);
 
-// --- mouse drag-to-pan, falling back to click-to-select/gather ---------
+// --- mouse controls -----------------------------------------------------
+// Left button: drag a box to select workers inside it, or click (no drag) to
+// select a single worker / issue a move / gather. Middle or right button:
+// drag to pan the camera. One button, one meaning — never both at once, so
+// there's no ambiguity about which gesture a drag is. See CLAUDE.md.
 
 let dragStart: { x: number; y: number; camX: number; camY: number } | null = null;
+let dragMode: "pan" | "select" | null = null;
 let dragged = false;
+let selectionDrag: { startWorld: [number, number]; currentWorld: [number, number] } | null = null;
+
+// Right-drag-to-pan would otherwise pop the browser's context menu on mouseup.
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
 canvas.addEventListener("mousedown", (e) => {
   const rect = canvas.getBoundingClientRect();
-  dragStart = { x: e.clientX - rect.left, y: e.clientY - rect.top, camX: camera.x, camY: camera.y };
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  dragStart = { x, y, camX: camera.x, camY: camera.y };
+  dragMode = e.button === 0 ? "select" : "pan";
   dragged = false;
+  selectionDrag = dragMode === "select" ? { startWorld: screenToWorld(x, y), currentWorld: screenToWorld(x, y) } : null;
 });
 
 window.addEventListener("mousemove", (e) => {
@@ -145,19 +193,55 @@ window.addEventListener("mousemove", (e) => {
   const dx = x - dragStart.x;
   const dy = y - dragStart.y;
   if (!dragged && Math.hypot(dx, dy) > DRAG_THRESHOLD) dragged = true;
-  if (dragged) {
+  if (!dragged) return;
+
+  if (dragMode === "pan") {
     camera.x = dragStart.camX - dx;
     camera.y = dragStart.camY - dy;
     clampCamera();
+  } else if (dragMode === "select" && selectionDrag) {
+    // World-space, not screen-space: re-derived every move so the box stays
+    // correct even if WASD panning shifts the camera mid-drag.
+    selectionDrag.currentWorld = screenToWorld(x, y);
   }
 });
 
 window.addEventListener("mouseup", (e) => {
   if (!dragStart) return;
   const rect = canvas.getBoundingClientRect();
-  if (!dragged) onCanvasClick(e.clientX - rect.left, e.clientY - rect.top);
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+
+  if (dragMode === "select") {
+    if (dragged && selectionDrag) {
+      selectWorkersInBox(selectionDrag.startWorld, selectionDrag.currentWorld);
+    } else {
+      onCanvasClick(x, y);
+    }
+  }
+
   dragStart = null;
+  dragMode = null;
+  dragged = false;
+  selectionDrag = null;
 });
+
+// Selects every worker whose centre (not just a partial overlap) falls
+// inside the box; an empty box clears the selection, matching normal RTS
+// drag-select behaviour.
+function selectWorkersInBox(a: [number, number], b: [number, number]): void {
+  if (!state) return;
+  const minX = Math.min(a[0], b[0]);
+  const maxX = Math.max(a[0], b[0]);
+  const minY = Math.min(a[1], b[1]);
+  const maxY = Math.max(a[1], b[1]);
+  const hits = state.workers.filter((w) => w.x >= minX && w.x <= maxX && w.y >= minY && w.y <= maxY);
+  selectedWorkerIds = new Set(hits.map((w) => w.id));
+  statusEl.textContent =
+    selectedWorkerIds.size > 0
+      ? `${selectedWorkerIds.size} worker${selectedWorkerIds.size === 1 ? "" : "s"} selected — click a resource node to gather, or empty ground to move.`
+      : "";
+}
 
 function hitTest(wx: number, wy: number): { kind: "worker" | "node"; id: number } | null {
   if (!state) return null;
@@ -176,55 +260,68 @@ function onCanvasClick(sx: number, sy: number): void {
   const hit = hitTest(wx, wy);
 
   if (!hit) {
-    if (selectedWorkerId !== null) onMoveClick(wx, wy);
+    if (selectedWorkerIds.size > 0) onMoveClick(wx, wy);
     return;
   }
 
   if (hit.kind === "worker") {
-    selectedWorkerId = selectedWorkerId === hit.id ? null : hit.id;
-    statusEl.textContent = selectedWorkerId
-      ? `Worker #${selectedWorkerId} selected — click a resource node to gather, or empty ground to move.`
-      : "";
+    // A plain click always replaces the selection with just this worker —
+    // no shift-add, no toggle-off. Drag-select (selectWorkersInBox) is the
+    // only way to select more than one.
+    selectedWorkerIds = new Set([hit.id]);
+    statusEl.textContent = `Worker #${hit.id} selected — click a resource node to gather, or empty ground to move.`;
     return;
   }
   onNodeClick(hit.id);
 }
 
+// Commands never clear the selection — a worker can be issued several
+// commands in a row (or stay selected to watch it arrive) without reselecting.
 async function onMoveClick(wx: number, wy: number): Promise<void> {
-  const workerId = selectedWorkerId;
-  if (workerId === null) return;
+  const workerIds = [...selectedWorkerIds];
+  if (workerIds.length === 0) return;
   const res = await fetch("/api/command/move", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ workerIds: [workerId], x: wx, y: wy }),
+    body: JSON.stringify({ workerIds, x: wx, y: wy }),
   });
   const body = await res.json();
   if (!res.ok) {
     statusEl.textContent = body.error ?? "move failed";
     return;
   }
-  statusEl.textContent = `Worker #${workerId} is moving.`;
+  statusEl.textContent = describeBatchOutcome(workerIds.length, body.errors, "moving");
   setState(body);
 }
 
 async function onNodeClick(nodeId: number): Promise<void> {
-  if (selectedWorkerId === null) {
+  const workerIds = [...selectedWorkerIds];
+  if (workerIds.length === 0) {
     statusEl.textContent = "Select a worker first.";
     return;
   }
-  const workerId = selectedWorkerId;
   const res = await fetch("/api/command/gather", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ workerIds: [workerId], resourceId: nodeId }),
+    body: JSON.stringify({ workerIds, resourceId: nodeId }),
   });
   const body = await res.json();
   if (!res.ok) {
     statusEl.textContent = body.error ?? "gather failed";
     return;
   }
-  statusEl.textContent = `Worker #${workerId} is heading to the resource.`;
+  statusEl.textContent = describeBatchOutcome(workerIds.length, body.errors, "heading to the resource");
   setState(body);
+}
+
+// Names exactly how many of a batch command succeeded, surfacing a partial
+// failure (some invalid ids, see runBatchCommand in index.ts) instead of
+// silently reporting the whole batch as a plain success.
+function describeBatchOutcome(total: number, errors: Record<string, string> | undefined, verb: string): string {
+  const failed = errors ? Object.keys(errors).length : 0;
+  const succeeded = total - failed;
+  if (failed === 0) return `${succeeded} worker${succeeded === 1 ? "" : "s"} ${verb}.`;
+  return `${succeeded}/${total} workers ${verb} (${failed} failed).`;
 }
 
 reproduceBtn.addEventListener("click", async () => {
@@ -234,7 +331,7 @@ reproduceBtn.addEventListener("click", async () => {
     statusEl.textContent = body.error ?? "reproduce failed";
     return;
   }
-  selectedWorkerId = null;
+  selectedWorkerIds = new Set();
   statusEl.textContent = "A new worker hatched!";
   setState(body);
 });
