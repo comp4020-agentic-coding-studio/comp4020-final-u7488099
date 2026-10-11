@@ -1,9 +1,14 @@
 import {
+  APHID_IDLE_MAX,
+  APHID_IDLE_MIN,
+  APHID_SPEED,
+  APHID_WANDER_RADIUS,
   DEPOSIT_RANGE,
   GATHER_RANGE,
   GATHER_YIELD,
   GROUP_DESTINATION_SPACING,
   MIN_SEPARATION,
+  RESOURCE_REGEN_RATES,
   SEPARATION_STRENGTH,
   WORKER_SPEED,
 } from "./balance.ts";
@@ -38,6 +43,25 @@ export type MoveCommandError =
   | "coordinates out of bounds"
   | "worker is busy returning resources";
 export type GatherCommandError = "no such worker" | "no such resource node" | "worker is busy returning resources";
+
+// Stage 5: a neutral, non-interactable creature (first species: aphid).
+// Deliberately minimal — species as a plain string rather than an enum, and
+// only the fields a wandering creature actually needs — so a later stage can
+// add fields (health, a pursued target) without replacing this shape, but
+// nothing beyond wander exists yet. See CLAUDE.md.
+interface SimCreature {
+  id: number;
+  worldId: number;
+  species: string;
+  x: number;
+  y: number;
+  command: CreatureCommand;
+  rngState: number; // not exposed externally; reseeded fresh on every loadSimulation()
+}
+
+type CreatureCommand = { type: "idle"; remaining: number } | { type: "wander"; targetX: number; targetY: number };
+
+const creatures = new Map<number, SimCreature>();
 
 const workers = new Map<number, SimWorker>();
 let worldBounds = { width: 0, height: 0 };
@@ -97,7 +121,124 @@ export function loadSimulation(): void {
       command: carrying ? { type: "return" } : { type: "idle" },
     });
   }
+
+  // Ephemeral wander state (idle/wander, remaining time, target) doesn't need
+  // to survive a restart, so every reload starts each creature idle-briefly
+  // rather than restoring whatever it was mid-leg doing — it reads as "it
+  // paused, then kept wandering". Only existence and position are durable.
+  // See CLAUDE.md.
+  creatures.clear();
+  const creatureRows = db.prepare("SELECT id, world_id AS worldId, species, x, y FROM creatures ORDER BY id").all() as
+    {
+      id: number;
+      worldId: number;
+      species: string;
+      x: number;
+      y: number;
+    }[];
+  for (const row of creatureRows) {
+    creatures.set(row.id, {
+      ...row,
+      command: { type: "idle", remaining: APHID_IDLE_MIN },
+      rngState: seedRng(row.id),
+    });
+  }
+
   dirty = false;
+}
+
+// Small deterministic xorshift32 PRNG, seeded from the creature's own id —
+// wander destinations are reproducible for a given seed and tick sequence
+// without relying on Math.random(). See CLAUDE.md.
+function seedRng(id: number): number {
+  const seed = (id * 0x9e3779b1) >>> 0;
+  return seed === 0 ? 1 : seed;
+}
+
+function nextRandom(creature: SimCreature): number {
+  let x = creature.rngState;
+  x ^= x << 13;
+  x ^= x >>> 17;
+  x ^= x << 5;
+  creature.rngState = x >>> 0;
+  return creature.rngState / 0xffffffff;
+}
+
+function pickWanderTarget(creature: SimCreature): { x: number; y: number } {
+  const angle = nextRandom(creature) * Math.PI * 2;
+  const dist = nextRandom(creature) * APHID_WANDER_RADIUS;
+  return {
+    x: clamp(creature.x + Math.cos(angle) * dist, 0, worldBounds.width),
+    y: clamp(creature.y + Math.sin(angle) * dist, 0, worldBounds.height),
+  };
+}
+
+function pickIdleDuration(creature: SimCreature): number {
+  return APHID_IDLE_MIN + nextRandom(creature) * (APHID_IDLE_MAX - APHID_IDLE_MIN);
+}
+
+// Aphid wandering: idle -> choose a nearby destination -> walk toward it ->
+// arrive -> idle briefly -> repeat. Same step-capped movement idiom as
+// workers, but with no separation/collision against workers or other
+// creatures — not required this stage (see CLAUDE.md) — and no spatial grid,
+// since aphids don't need one yet either.
+function advanceCreatures(dt: number): void {
+  for (const creature of creatures.values()) {
+    const command = creature.command;
+    if (command.type === "idle") {
+      const remaining = command.remaining - dt;
+      if (remaining <= 0) {
+        const target = pickWanderTarget(creature);
+        creature.command = { type: "wander", targetX: target.x, targetY: target.y };
+      } else {
+        creature.command = { type: "idle", remaining };
+      }
+      continue;
+    }
+    const dx = command.targetX - creature.x;
+    const dy = command.targetY - creature.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist <= ARRIVAL_EPSILON) {
+      creature.command = { type: "idle", remaining: pickIdleDuration(creature) };
+      continue;
+    }
+    const step = Math.min(APHID_SPEED * dt, dist);
+    creature.x = clamp(creature.x + (dx / dist) * step, 0, worldBounds.width);
+    creature.y = clamp(creature.y + (dy / dist) * step, 0, worldBounds.height);
+    dirty = true;
+  }
+}
+
+export function getCreaturesForWorld(worldId: number): { id: number; species: string; x: number; y: number }[] {
+  return [...creatures.values()]
+    .filter((c) => c.worldId === worldId)
+    .sort((a, b) => a.id - b.id)
+    .map(({ id, species, x, y }) => ({ id, species, x, y }));
+}
+
+// Resource nodes have no in-memory cache (every claim already mutates SQLite
+// directly — see attemptGatherClaim), so regen follows that same precedent: a
+// direct SQL UPDATE per renewable type, run every tick. Each UPDATE commits
+// atomically on its own, just not inside the same transaction as a claim —
+// worst case a crash loses a fraction of one tick's regen, which is fine per
+// the brief (not required to be crash-perfect). The `amount IS NOT NULL`
+// guard is what keeps a genuinely infinite node (amount: null) out of this
+// entirely — it never matches this WHERE clause. See CLAUDE.md.
+const regenStatements = new Map(
+  Object.keys(RESOURCE_REGEN_RATES).map((type) => [
+    type,
+    db.prepare(
+      "UPDATE resource_nodes SET amount = MIN(max_amount, amount + ?) " +
+        "WHERE resource_type = ? AND amount IS NOT NULL AND max_amount IS NOT NULL AND amount < max_amount",
+    ),
+  ]),
+);
+
+function advanceResourceRegen(dt: number): void {
+  for (const [type, rate] of Object.entries(RESOURCE_REGEN_RATES)) {
+    const info = regenStatements.get(type)!.run(rate * dt, type);
+    if (info.changes > 0) dirty = true;
+  }
 }
 
 // Registers a worker created outside the simulation (reproduce() inserts it
@@ -232,10 +373,16 @@ function creditColony(colonyId: number, resourceType: string, amount: number): v
 function attemptGatherClaim(worker: SimWorker, resourceId: number): boolean {
   const node = findResourceNode(resourceId);
   if (!node) return false; // already claimed/depleted by someone else this tick
+  const renewable = node.resourceType in RESOURCE_REGEN_RATES;
 
   if (node.amount !== null && node.amount <= 0) {
-    db.prepare("DELETE FROM resource_nodes WHERE id = ?").run(resourceId);
-    dirty = true;
+    // Renewable: stays present at 0 so it can regenerate (see
+    // advanceResourceRegen) — nothing to claim yet, but not deleted.
+    // Non-renewable: depletion is permanent, same as before Stage 5.
+    if (!renewable) {
+      db.prepare("DELETE FROM resource_nodes WHERE id = ?").run(resourceId);
+      dirty = true;
+    }
     return false;
   }
 
@@ -243,10 +390,10 @@ function attemptGatherClaim(worker: SimWorker, resourceId: number): boolean {
   const tx = db.transaction(() => {
     if (node.amount !== null) {
       const remaining = node.amount - claimedAmount;
-      if (remaining <= 0) {
+      if (remaining <= 0 && !renewable) {
         db.prepare("DELETE FROM resource_nodes WHERE id = ?").run(resourceId);
       } else {
-        db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(remaining, resourceId);
+        db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(Math.max(remaining, 0), resourceId);
       }
     }
     db.prepare("UPDATE workers SET carrying_type = ?, carrying_amount = ? WHERE id = ?").run(
@@ -431,6 +578,9 @@ function resolveArrival(worker: SimWorker, command: WorkerCommand): void {
 // never blocks one that does, and every resulting position is clamped into
 // world bounds so separation can never push a worker out of them.
 export function advanceSimulation(dt: number): void {
+  advanceResourceRegen(dt);
+  advanceCreatures(dt);
+
   const grid = buildSpatialGrid();
 
   for (const worker of workers.values()) {
@@ -515,10 +665,12 @@ export function consumeDirty(): boolean {
 // "fix" that by adding carrying columns to the UPDATE below.
 export function checkpointSimulation(): void {
   const update = db.prepare("UPDATE workers SET x = ?, y = ? WHERE id = ?");
-  const tx = db.transaction((list: SimWorker[]) => {
-    for (const w of list) update.run(w.x, w.y, w.id);
+  const updateCreature = db.prepare("UPDATE creatures SET x = ?, y = ? WHERE id = ?");
+  const tx = db.transaction((workerList: SimWorker[], creatureList: SimCreature[]) => {
+    for (const w of workerList) update.run(w.x, w.y, w.id);
+    for (const c of creatureList) updateCreature.run(c.x, c.y, c.id);
   });
-  tx([...workers.values()]);
+  tx([...workers.values()], [...creatures.values()]);
 }
 
 loadSimulation();
