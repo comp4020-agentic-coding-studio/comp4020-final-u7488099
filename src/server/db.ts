@@ -12,6 +12,7 @@ export const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 
 dropLegacySchema();
+migrateWorkersCarrying();
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS worlds (
@@ -36,15 +37,17 @@ db.exec(`
     PRIMARY KEY (colony_id, resource_type)
   );
 
-  -- Worker commands (idle/move/gather, added in a later stage) are never
-  -- persisted here — they live only in in-memory simulation state. This
-  -- table only ever gets columns that must survive a restart: position now,
-  -- carrying once Stage 5 adds it. See CLAUDE.md.
+  -- Worker commands (idle/move/gather/return) are never persisted here —
+  -- they live only in in-memory simulation state. This table only ever gets
+  -- columns that must survive a restart: position, and (Stage 4) carrying —
+  -- NULL/NULL means "not carrying". See CLAUDE.md.
   CREATE TABLE IF NOT EXISTS workers (
     id INTEGER PRIMARY KEY,
     colony_id INTEGER NOT NULL REFERENCES colonies(id),
     x REAL NOT NULL,
     y REAL NOT NULL,
+    carrying_type TEXT,
+    carrying_amount REAL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -78,6 +81,23 @@ function dropLegacySchema(): void {
   `);
 }
 
+// Stage 4 added carrying_type/carrying_amount to the already-deployed
+// `workers` table. `CREATE TABLE IF NOT EXISTS` above is a no-op against an
+// existing table, so it would never add these columns in production — this
+// guarded ALTER TABLE does, mirroring dropLegacySchema()'s PRAGMA-guard
+// pattern. Every pre-Stage-4 row gets NULL/NULL, correctly meaning "not
+// carrying" (no worker could have been carrying anything before this
+// existed). See CLAUDE.md.
+function migrateWorkersCarrying(): void {
+  const columns = db.prepare("PRAGMA table_info(workers)").all() as { name: string }[];
+  if (columns.length === 0) return; // table doesn't exist yet; CREATE TABLE below defines it with the columns
+  if (columns.some((c) => c.name === "carrying_type")) return;
+  db.exec(`
+    ALTER TABLE workers ADD COLUMN carrying_type TEXT;
+    ALTER TABLE workers ADD COLUMN carrying_amount REAL;
+  `);
+}
+
 function seedIfEmpty(): void {
   const row = db.prepare("SELECT COUNT(*) AS n FROM colonies").get() as { n: number };
   if (row.n > 0) return;
@@ -108,4 +128,21 @@ function seedIfEmpty(): void {
   for (const node of RESOURCE_NODES) {
     insertNode.run(worldId, node.x, node.y, node.resourceType, node.amount, node.maxAmount);
   }
+}
+
+// Test-only isolation seam (Stage 4): wipes every table, then reseeds via
+// seedIfEmpty(). None of these tables use AUTOINCREMENT, so SQLite reuses
+// the lowest free rowid — every reset reproduces the exact same ids
+// (world=1, colony=1, workers=1/2/3, resource_nodes=1..12), which is why
+// spec/simulation.test.ts can capture `colony`/`world` once at import time
+// and have them stay valid across every reset. Not used by production code.
+export function resetForTests(): void {
+  db.exec(`
+    DELETE FROM resource_nodes;
+    DELETE FROM workers;
+    DELETE FROM colony_resources;
+    DELETE FROM colonies;
+    DELETE FROM worlds;
+  `);
+  seedIfEmpty();
 }

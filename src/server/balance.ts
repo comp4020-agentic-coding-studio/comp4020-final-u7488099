@@ -37,14 +37,24 @@ export const RESOURCE_NODES: {
   { x: 2700, y: 2700, resourceType: "biomass", amount: 500, maxAmount: 500 },
 ];
 
-// How much a single successful claim credits, and how much it decrements a
-// finite node's remaining amount (capped at whatever's left — see
-// attemptGatherClaim in simulation.ts).
+// How much a single successful claim picks up into a worker's `carrying`,
+// and how much it decrements a finite node's remaining amount (capped at
+// whatever's left — see attemptGatherClaim in simulation.ts). Stage 4
+// repurposed this from "amount credited on claim" to "amount picked up on
+// claim" — the colony isn't credited until deposit.
 export const GATHER_YIELD = 10;
 // How close a gathering worker must get to a resource's centre before a
 // claim is attempted. Bigger than any NODE_RADIUS so workers visibly stop at
 // the node's edge rather than overlapping its centre.
 export const GATHER_RANGE = 30;
+// How close a returning worker must get to the queen before its carried
+// payload is deposited. A separate constant from GATHER_RANGE even though
+// both start at 30 — gather and deposit ranges are conceptually unrelated
+// and may diverge later. Kept above MIN_SEPARATION (20) for the same reason
+// GATHER_RANGE already is: several simultaneous returners can all be in
+// deposit range of the queen while still keeping separation distance from
+// each other.
+export const DEPOSIT_RANGE = 30;
 export const REPRODUCE_COST = 50;
 
 export const WORKER_SPEED = 150; // world units per second
