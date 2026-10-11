@@ -10,54 +10,35 @@
         margin: 2rem;
         color: #1a1a1a;
       }
-      #map {
-        position: relative;
-        width: 400px;
-        height: 400px;
+      #world {
+        display: block;
         border: 1px solid #444;
         margin-block: 1rem;
-        background: #eef7ee;
+        cursor: grab;
       }
-      .entity {
-        position: absolute;
-        width: 28px;
-        height: 28px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        border-radius: 50%;
-        font-size: 0.9rem;
-        user-select: none;
+      #world:active {
+        cursor: grabbing;
       }
-      .queen {
-        background: #ffd54d;
-        border: 2px solid #b8860b;
-      }
-      .worker {
-        background: #90caf9;
-        border: 2px solid #1565c0;
-        cursor: pointer;
-      }
-      .worker.selected {
-        outline: 3px solid #e91e63;
-      }
-      .node {
-        background: #a5d6a7;
-        border: 2px solid #2e7d32;
-        cursor: pointer;
+      #resources {
+        font-weight: 600;
       }
       #status {
         min-height: 1.5rem;
         color: #555;
+      }
+      #hint {
+        color: #777;
+        font-size: 0.9rem;
       }
     </style>
   </head>
   <body>
     <main>
       <h1>Colony</h1>
-      <p>Protein: <strong id="protein">0</strong></p>
-      <p>Select a worker, then click a food node to gather.</p>
-      <div id="map"></div>
+      <p id="resources">sugar: 0 · protein: 0 · biomass: 0</p>
+      <p>Select a worker, then click a resource node to gather.</p>
+      <canvas id="world" width="960" height="600"></canvas>
+      <p id="hint">Pan with WASD, the arrow keys, or by dragging the map.</p>
       <button id="reproduce">Reproduce worker (50 protein)</button>
       <p id="status"></p>
       <p><a href="/readme/">About this app</a></p>
