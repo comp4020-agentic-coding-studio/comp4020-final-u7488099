@@ -174,16 +174,37 @@ function hitTest(wx: number, wy: number): { kind: "worker" | "node"; id: number 
 function onCanvasClick(sx: number, sy: number): void {
   const [wx, wy] = screenToWorld(sx, sy);
   const hit = hitTest(wx, wy);
-  if (!hit) return;
+
+  if (!hit) {
+    if (selectedWorkerId !== null) onMoveClick(wx, wy);
+    return;
+  }
 
   if (hit.kind === "worker") {
     selectedWorkerId = selectedWorkerId === hit.id ? null : hit.id;
     statusEl.textContent = selectedWorkerId
-      ? `Worker #${selectedWorkerId} selected — click a resource node to gather.`
+      ? `Worker #${selectedWorkerId} selected — click a resource node to gather, or empty ground to move.`
       : "";
     return;
   }
   onNodeClick(hit.id);
+}
+
+async function onMoveClick(wx: number, wy: number): Promise<void> {
+  const workerId = selectedWorkerId;
+  if (workerId === null) return;
+  const res = await fetch("/api/command/move", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: [workerId], x: wx, y: wy }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    statusEl.textContent = body.error ?? "move failed";
+    return;
+  }
+  statusEl.textContent = `Worker #${workerId} is moving.`;
+  setState(body);
 }
 
 async function onNodeClick(nodeId: number): Promise<void> {
