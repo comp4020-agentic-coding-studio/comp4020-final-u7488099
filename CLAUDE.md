@@ -368,3 +368,101 @@ worker's footprint.
   another `POST /api/command/move` with a new centre; a fresh call to
   `computeGroupDestinations` naturally produces fresh offsets, so Stage 2's
   "new command replaces the old, per worker" semantics fall out for free.
+
+## Stage 4: carry, return, deposit economy
+
+Every stage through Stage 3 credited the colony the instant a worker arrived
+at a resource. That made distance free — there was never a reason not to
+send a worker to the farthest node on the map. Stage 4 splits "gather" into
+`idle → gather (travel, claim payload into carrying) → return (auto, travel
+home) → deposit (credit colony, clear carrying) → idle`, so the trip back
+is where distance actually costs something.
+
+- **`carrying` is economic state, not a command — it gets its own
+  durability discipline.** A worker's `command` is still never persisted
+  (Stage 1b/1's rule, unchanged): it resets to idle on every reload. But
+  `carrying` is real, uncredited value a worker is holding, and it survives
+  a restart via two new nullable `workers` columns (`carrying_type`,
+  `carrying_amount`). On `loadSimulation()`, a worker with non-null carrying
+  comes back with `command: {type:"return"}` instead of idle — a restart
+  must not stand between a worker and the payload it's already holding.
+- **Claim and deposit are each one `db.transaction()`, because each pairs
+  an economic change with a durability change that must never split.**
+  `attemptGatherClaim` combines the node's depletion/deletion with writing
+  `carrying_type`/`carrying_amount` onto the worker's row — otherwise a
+  crash between "node decremented" and "worker's payload persisted" would
+  destroy resources that came from nowhere and went nowhere.
+  `attemptDeposit` combines crediting `colony_resources` with clearing
+  those same two columns back to NULL — otherwise a crash between "colony
+  credited" and "carrying cleared" would mean a reload resurrects the
+  worker still holding a payload it already turned in, and it deposits
+  again. Both transactions are the only two places economic ownership of a
+  resource actually changes hands; nowhere else needs this discipline.
+- **A claim and the deposit it triggers never resolve in the same tick,
+  even if the claim happens within `DEPOSIT_RANGE` of the queen.**
+  `resolveArrival` only ever converts `gather → return` on a claim — it
+  doesn't re-check arrival against the new `return` target in the same
+  pass. This mirrors the pre-existing `gather → move` demotion (Stage 1c),
+  which has the same one-conversion-per-tick shape. A test asserting
+  deposit completion needs at least two `advanceSimulation` ticks even for
+  a worker claiming right next to the nest.
+- **The busy-worker gate checks `worker.carrying`, not
+  `command.type === "return"`.** They're always set together in practice,
+  but carrying is the thing that's actually consequential — it's the value
+  a stray move/gather command must not be allowed to silently abandon.
+  `issueMoveCommand`/`issueGatherCommand` return `"worker is busy returning
+  resources"` for a carrying worker, before any other validation.
+  `runBatchCommand` (Stage 2) needed no changes: it already collects
+  per-id errors without failing a whole batch over one busy id, so a batch
+  move with one carrying worker and one free worker still moves the free
+  one and names the busy one in `errors`.
+- **The nest-position cache assumes `colonies.queen_x/y` never changes
+  after seeding.** `nestPositions` is populated once in `loadSimulation()`
+  and never invalidated. If a later stage ever lets a colony's queen move
+  or allows multiple colonies with different nests, this cache needs to be
+  rebuilt or keyed more carefully — right now it's safe only because
+  nothing ever updates those two columns.
+- **`checkpointSimulation()` deliberately does not flush carrying.**
+  Position is checkpointed periodically because nothing else makes it
+  durable; carrying is already made durable the instant it changes, inside
+  claim's and deposit's own transactions. Don't "fix" this by adding
+  carrying to the periodic checkpoint — that would just be a second, looser
+  writer of the same columns.
+- **Reproduction needed zero code changes.** `actions.ts`'s `reproduce()`
+  already reads `colony_resources` directly, never a worker's carrying —
+  so carried-but-undeposited protein was never spendable, purely because of
+  where the read happens, not because of new logic added for this stage.
+- **Test isolation seam: `resetForTests()` plus a `beforeEach`, not test
+  ordering.** `spec/simulation.test.ts` had relied on each test picking a
+  synthetic id range or an as-yet-untouched seeded node to avoid colliding
+  with what earlier tests had already claimed or depleted — workable at 41
+  tests, but not something to keep stacking tests onto. `db.ts` now exports
+  `resetForTests()` (wipe every table, reseed via the existing
+  `seedIfEmpty()`), and `simulation.test.ts` calls it plus
+  `sim.loadSimulation()` in a top-level `beforeEach`. This is safe because
+  none of the seeded tables use `AUTOINCREMENT`, so a reset always
+  reproduces the exact same ids (world=1, colony=1, workers=1/2/3,
+  resource_nodes=1..12) — the handful of `const colony = …` /
+  `const world = …` lookups captured once at module load time stay valid
+  across every reset. Per-test synthetic id ranges are kept where they
+  already existed (harmless extra safety) but are no longer load-bearing.
+  **Caveat that cost real debugging time while writing this stage's
+  reload-persistence tests:** a synthetic worker registered via
+  `sim.registerWorker()` only exists in the in-memory Map — it never gets a
+  `workers` SQL row. `loadSimulation()` clears the Map and repopulates it
+  strictly from that table, so a synthetic worker is silently erased by any
+  test that calls `loadSimulation()`. Tests that need a worker to survive a
+  reload use one of the 3 real seeded workers (via `getWorkersForColony`)
+  and, when they need it positioned on a node or near the queen for fast
+  test setup, call `sim.registerWorker({id: <that seeded id>, ...})` purely
+  as an in-memory teleport — its SQL row (and thus `loadSimulation()`'s
+  view of it) is unaffected by that in-memory overwrite.
+- **HTTP-level protein tests got slower and their helper got less naive.**
+  A full claim→return→deposit round trip for protein is roughly 2x the old
+  single-leg travel time, and a worker that's already carrying/returning
+  now rejects a re-issued gather command. `gatherProteinUntil` in both
+  `spec/colony.test.ts` and `spec/realtime.test.ts` now re-issues gather to
+  every currently-idle (`!carrying`) worker each poll cycle instead of
+  blindly re-posting to one fixed worker id that might now be busy; the
+  tests that call it with a target of 50 (one full `REPRODUCE_COST`) carry
+  an explicit longer `it()` timeout rather than raising the global one.
