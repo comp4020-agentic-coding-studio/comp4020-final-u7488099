@@ -1,5 +1,5 @@
 import { existsSync, rmSync } from "node:fs";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 
 // Stage 1b direct-module-level testability seam: this file is the one
 // exception to the rest of spec/, which is strictly black-box over HTTP
@@ -18,9 +18,10 @@ process.env.DB_PATH = DB_PATH;
 
 // Dynamic imports, not static ones: DB_PATH must be set in process.env
 // before db.ts's module-level `new Database(DB_PATH)` runs.
-const { db } = await import("../src/server/db.ts");
+const { db, resetForTests } = await import("../src/server/db.ts");
 const sim = await import("../src/server/simulation.ts");
-const { SIMULATION, GATHER_YIELD } = await import("../src/server/balance.ts");
+const actions = await import("../src/server/actions.ts");
+const { SIMULATION, GATHER_YIELD, REPRODUCE_COST } = await import("../src/server/balance.ts");
 
 const TICK_DT = 1 / SIMULATION.tickHz;
 
@@ -63,10 +64,31 @@ function findNodesByType(resourceType: string): { id: number; x: number; y: numb
   ) as { id: number; x: number; y: number; amount: number | null }[];
 }
 
-beforeAll(() => {
-  // A fresh throwaway DB seeds 3 workers (see db.ts) — one per test below so
-  // tests don't interfere with each other's commands.
-  expect(sim.getWorkersForColony(colony.id)).toHaveLength(3);
+function queenPosition(): { x: number; y: number } {
+  return db.prepare("SELECT queen_x AS x, queen_y AS y FROM colonies WHERE id = ?").get(colony.id) as {
+    x: number;
+    y: number;
+  };
+}
+
+function insertNode(x: number, y: number, resourceType: string, amount: number | null): number {
+  const worldRow = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number };
+  const { lastInsertRowid } = db
+    .prepare("INSERT INTO resource_nodes (world_id, x, y, resource_type, amount, max_amount) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(worldRow.id, x, y, resourceType, amount, amount);
+  return Number(lastInsertRowid);
+}
+
+// Stage 4 test-isolation seam: every test starts from the exact same fresh
+// seed (world=1, colony=1, workers=1/2/3, resource_nodes=1..12 — see
+// resetForTests in db.ts), so no test can see another's leftover commands,
+// claims, or depleted nodes. This replaces the old convention of giving each
+// test its own non-overlapping synthetic worker/node id range as the primary
+// isolation mechanism; that convention is kept where it already exists
+// (harmless) but nothing below relies on it anymore. See CLAUDE.md.
+beforeEach(() => {
+  resetForTests();
+  sim.loadSimulation();
 });
 
 describe("gradual movement", () => {
@@ -91,7 +113,7 @@ describe("gradual movement", () => {
     // settle so later tests' own geometry is the only thing in play.
     expect(sim.issueMoveCommand(worker.id, start.x, start.y)).toBeNull();
     sim.advanceSimulation(TICK_DT);
-    expect(workerById(worker.id)).toEqual({ id: worker.id, x: start.x, y: start.y });
+    expect(workerById(worker.id)).toEqual({ id: worker.id, x: start.x, y: start.y, carrying: null });
     expect(sim.getWorkerCommand(worker.id)).toBe("idle");
   });
 });
@@ -155,13 +177,13 @@ describe("checkpoint persistence", () => {
   });
 });
 
-// Stage 1c: runs last, deliberately. loadSimulation() above already reset
-// every worker to idle from a checkpoint, but these tests register their own
-// synthetic workers anyway (see registerTestWorker) — placing this block
-// after every other describe() means its many extra advanceSimulation calls
-// (test G alone advances 200 ticks) can never finish off some *other* test's
-// still-in-flight real worker out from under it, the way inserting this
-// block earlier once did to the checkpoint-persistence test above.
+// Stage 1c, extended by Stage 4: a successful claim no longer credits the
+// colony directly — it picks the payload up into worker.carrying and sends
+// the worker home (see simulation.ts's attemptGatherClaim/attemptDeposit).
+// These tests register their own synthetic workers (see registerTestWorker)
+// positioned right on top of whichever node they're exercising, which is
+// what lets a test force an arrival in a single tick instead of waiting out
+// real travel time.
 describe("gather: travel + claim", () => {
   it("A: issuing a gather command starts travel without crediting anything instantly", () => {
     const [sugarNode] = findNodesByType("sugar");
@@ -174,7 +196,7 @@ describe("gather: travel + claim", () => {
     expect(resourceAmount("sugar")).toBe(before);
   });
 
-  it("B: arriving at an infinite node credits GATHER_YIELD and leaves its amount at null", () => {
+  it("B: arriving at an infinite node claims GATHER_YIELD into carrying without crediting the colony, and leaves its amount at null", () => {
     const [sugarNode] = findNodesByType("sugar");
     const worker = registerTestWorker(9002, sugarNode.x, sugarNode.y);
     const before = resourceAmount("sugar");
@@ -182,12 +204,13 @@ describe("gather: travel + claim", () => {
     expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
-    expect(resourceAmount("sugar")).toBe(before + GATHER_YIELD);
-    expect(sim.getWorkerCommand(worker.id)).toBe("idle");
-    expect(nodeRow(sugarNode.id)?.amount).toBeNull();
+    expect(resourceAmount("sugar")).toBe(before); // not credited yet — only deposit credits the colony
+    expect(workerById(worker.id).carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
+    expect(sim.getWorkerCommand(worker.id)).toBe("return"); // auto-issued, no client command involved
+    expect(nodeRow(sugarNode.id)?.amount).toBeNull(); // infinite node's payload doesn't deplete it
   });
 
-  it("C: arriving at a finite node credits GATHER_YIELD and decrements its remaining amount", () => {
+  it("C: arriving at a finite node claims GATHER_YIELD into carrying, decrements the node, and still doesn't credit the colony", () => {
     const [proteinNode] = findNodesByType("protein");
     const worker = registerTestWorker(9003, proteinNode.x, proteinNode.y);
     const beforeColony = resourceAmount("protein");
@@ -196,7 +219,9 @@ describe("gather: travel + claim", () => {
     expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
-    expect(resourceAmount("protein")).toBe(beforeColony + GATHER_YIELD);
+    expect(resourceAmount("protein")).toBe(beforeColony); // not credited until deposit
+    expect(workerById(worker.id).carrying).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
+    expect(sim.getWorkerCommand(worker.id)).toBe("return");
     expect(nodeRow(proteinNode.id)?.amount).toBe(beforeNode - GATHER_YIELD);
   });
 
@@ -209,11 +234,13 @@ describe("gather: travel + claim", () => {
     expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
-    expect(resourceAmount("protein")).toBe(beforeColony + 4);
+    expect(resourceAmount("protein")).toBe(beforeColony); // still not credited
+    expect(workerById(worker.id).carrying).toEqual({ resourceType: "protein", amount: 4 }); // capped, not the full GATHER_YIELD
+    expect(sim.getWorkerCommand(worker.id)).toBe("return");
     expect(nodeRow(proteinNode.id)).toBeUndefined();
   });
 
-  it("E: a node claimed by another worker earlier in the same tick isn't double-credited", () => {
+  it("E: a node claimed by another worker earlier in the same tick isn't double-claimed", () => {
     const [, , proteinNode] = findNodesByType("protein");
     db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD, proteinNode.id);
     // Registered (and so processed by advanceSimulation) in this order, so
@@ -227,7 +254,10 @@ describe("gather: travel + claim", () => {
     sim.advanceSimulation(TICK_DT);
 
     // The node only had GATHER_YIELD left — exactly one claim can have landed.
-    expect(resourceAmount("protein")).toBe(beforeColony + GATHER_YIELD);
+    expect(resourceAmount("protein")).toBe(beforeColony);
+    expect(workerById(first.id).carrying).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
+    expect(sim.getWorkerCommand(first.id)).toBe("return");
+    expect(workerById(second.id).carrying).toBeNull();
     expect(nodeRow(proteinNode.id)).toBeUndefined();
     expect(sim.getWorkerCommand(second.id)).toBe("idle");
   });
@@ -241,9 +271,7 @@ describe("gather: travel + claim", () => {
   });
 
   it("G: a node that disappears mid-flight redirects the worker to its last-known position instead of crediting anything", () => {
-    // Pick one of the two full-amount protein nodes the D/E tests above
-    // haven't touched yet (those deplete/delete whichever nodes they pick).
-    const proteinNode = findNodesByType("protein").find((n) => n.amount === 200)!;
+    const [proteinNode] = findNodesByType("protein");
     const worker = registerTestWorker(9008, proteinNode.x - 1000, proteinNode.y);
     const beforeColony = resourceAmount("protein");
 
@@ -265,8 +293,6 @@ describe("gather: travel + claim", () => {
 // Stage 2: group commands are just the same per-worker command issued to
 // several ids — there is no batch-aware code in simulation.ts itself (the
 // batch error contract lives in index.ts, covered in spec/colony.test.ts).
-// These tests use fresh synthetic ids (>= 10001) so they can't disturb any
-// test above, same reasoning as the gather block's ids >= 9001.
 describe("group commands", () => {
   it("H: issuing the same move target to several workers advances all of them in one tick", () => {
     const base = { x: 1000, y: 1000 };
@@ -309,7 +335,7 @@ describe("group commands", () => {
     expect(afterB.y).toBe(2000);
   });
 
-  it("J: several workers converging on an infinite node are each credited independently, no contention", () => {
+  it("J: several workers converging on an infinite node each claim a payload independently, no contention", () => {
     const [sugarNode] = findNodesByType("sugar");
     const group = [10006, 10007, 10008].map((id) => registerTestWorker(id, sugarNode.x, sugarNode.y));
     const before = resourceAmount("sugar");
@@ -317,11 +343,16 @@ describe("group commands", () => {
     for (const w of group) expect(sim.issueGatherCommand(w.id, sugarNode.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
-    expect(resourceAmount("sugar")).toBe(before + GATHER_YIELD * group.length);
-    for (const w of group) expect(sim.getWorkerCommand(w.id)).toBe("idle");
+    // Claiming doesn't credit the colony — each worker is now carrying its
+    // own payload home instead.
+    expect(resourceAmount("sugar")).toBe(before);
+    for (const w of group) {
+      expect(workerById(w.id).carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
+      expect(sim.getWorkerCommand(w.id)).toBe("return");
+    }
   });
 
-  it("K: a group gathering a finite node credits exactly one claim, the rest demote with no extra credit", () => {
+  it("K: a group gathering a finite node lets exactly one claim land, the rest demote with no carrying", () => {
     // By this point C/D/E/G above have consumed or depleted the other three
     // seeded protein nodes — whichever one is left is fine; its own amount
     // is overwritten below regardless of what it currently holds.
@@ -335,10 +366,15 @@ describe("group commands", () => {
     for (const w of group) expect(sim.issueGatherCommand(w.id, proteinNode.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
-    // The node only had GATHER_YIELD left — exactly one claim can have landed.
-    expect(resourceAmount("protein")).toBe(beforeColony + GATHER_YIELD);
+    // The node only had GATHER_YIELD left — exactly one claim can have
+    // landed, and even that claim doesn't credit the colony yet.
+    expect(resourceAmount("protein")).toBe(beforeColony);
     expect(nodeRow(proteinNode.id)).toBeUndefined();
-    for (const w of group) expect(sim.getWorkerCommand(w.id)).toBe("idle");
+    const carrying = group.map((w) => workerById(w.id).carrying);
+    expect(carrying.filter((c) => c !== null)).toEqual([{ resourceType: "protein", amount: GATHER_YIELD }]);
+    for (const w of group) {
+      expect(sim.getWorkerCommand(w.id)).toBe(workerById(w.id).carrying ? "return" : "idle");
+    }
   });
 });
 
@@ -458,21 +494,22 @@ describe("Stage 3: loose swarm movement", () => {
   });
 
   it("gathering regression: a close-together group gathering a finite node still yields exactly one claim", () => {
-    const worldRow = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number };
-    const { lastInsertRowid: nodeId } = db
-      .prepare(
-        "INSERT INTO resource_nodes (world_id, x, y, resource_type, amount, max_amount) VALUES (?, ?, ?, ?, ?, ?)",
-      )
-      .run(worldRow.id, 2000, 2800, "biomass", GATHER_YIELD, GATHER_YIELD);
+    const nodeId = insertNode(2000, 2800, "biomass", GATHER_YIELD);
     const group = [11019, 11020, 11021].map((id, i) => registerTestWorker(id, 2000 + i * 5, 2800));
     const beforeColony = resourceAmount("biomass");
 
-    for (const w of group) expect(sim.issueGatherCommand(w.id, Number(nodeId))).toBeNull();
+    for (const w of group) expect(sim.issueGatherCommand(w.id, nodeId)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
-    expect(resourceAmount("biomass")).toBe(beforeColony + GATHER_YIELD);
-    expect(nodeRow(Number(nodeId))).toBeUndefined();
-    for (const w of group) expect(sim.getWorkerCommand(w.id)).toBe("idle");
+    // Exactly one claim can have landed — and even that claim doesn't credit
+    // the colony yet, it's carried home first.
+    expect(resourceAmount("biomass")).toBe(beforeColony);
+    expect(nodeRow(nodeId)).toBeUndefined();
+    const carrying = group.map((w) => workerById(w.id).carrying);
+    expect(carrying.filter((c) => c !== null)).toEqual([{ resourceType: "biomass", amount: GATHER_YIELD }]);
+    for (const w of group) {
+      expect(sim.getWorkerCommand(w.id)).toBe(workerById(w.id).carrying ? "return" : "idle");
+    }
   });
 
   it("command-override regression: redirecting one member of a moving group changes its course while the rest continue", () => {
@@ -502,5 +539,110 @@ describe("Stage 3: loose swarm movement", () => {
     }
     expect(sim.getWorkerCommand(starts[0].id)).toBe("move");
     expect(sim.getWorkerCommand(starts[1].id)).toBe("move");
+  });
+});
+
+describe("Stage 4: carry, return, deposit economy", () => {
+  it("multiple workers claim independently from a finite node with enough for all of them", () => {
+    const [proteinNode] = findNodesByType("protein");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD * 3, proteinNode.id);
+    const group = [9102, 9103, 9104].map((id, i) => registerTestWorker(id, proteinNode.x + i * 5, proteinNode.y));
+
+    for (const w of group) expect(sim.issueGatherCommand(w.id, proteinNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    for (const w of group) {
+      expect(workerById(w.id).carrying).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
+      expect(sim.getWorkerCommand(w.id)).toBe("return");
+    }
+    expect(nodeRow(proteinNode.id)).toBeUndefined();
+    expect(resourceAmount("protein")).toBe(0); // fresh colony, and none credited yet anyway
+  });
+
+  it("a claim within deposit range of the queen still takes a second tick to deposit", () => {
+    const queen = queenPosition();
+    const nodeId = insertNode(queen.x + 20, queen.y, "sugar", null);
+    const worker = registerTestWorker(9105, queen.x + 20, queen.y);
+    const beforeColony = resourceAmount("sugar");
+
+    expect(sim.issueGatherCommand(worker.id, nodeId)).toBeNull();
+    sim.advanceSimulation(TICK_DT); // claim resolves: carrying set, command becomes "return"
+
+    expect(workerById(worker.id).carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
+    expect(sim.getWorkerCommand(worker.id)).toBe("return");
+    expect(resourceAmount("sugar")).toBe(beforeColony); // not yet deposited, even though within DEPOSIT_RANGE
+
+    sim.advanceSimulation(TICK_DT); // already in range -> deposits
+
+    expect(resourceAmount("sugar")).toBe(beforeColony + GATHER_YIELD);
+    expect(workerById(worker.id).carrying).toBeNull();
+    expect(sim.getWorkerCommand(worker.id)).toBe("idle");
+  });
+
+  it("carrying survives a reload with no checkpoint call, and the worker automatically resumes returning", () => {
+    const [worker] = sim.getWorkersForColony(colony.id);
+    const [proteinNode] = findNodesByType("protein");
+    sim.registerWorker({ id: worker.id, colonyId: colony.id, x: proteinNode.x, y: proteinNode.y });
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    const carryingBefore = workerById(worker.id).carrying;
+    expect(carryingBefore).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
+
+    sim.loadSimulation(); // no checkpointSimulation() call — proves claim-time durability alone is enough
+
+    const restored = workerById(worker.id);
+    expect(restored.carrying).toEqual(carryingBefore);
+    expect(sim.getWorkerCommand(worker.id)).toBe("return");
+  });
+
+  it("a completed deposit stays complete across a reload — no double-credit", () => {
+    const [worker] = sim.getWorkersForColony(colony.id);
+    const queen = queenPosition();
+    const nodeId = insertNode(queen.x + 20, queen.y, "sugar", null);
+    sim.registerWorker({ id: worker.id, colonyId: colony.id, x: queen.x + 20, y: queen.y });
+
+    expect(sim.issueGatherCommand(worker.id, nodeId)).toBeNull();
+    sim.advanceSimulation(TICK_DT); // claim -> carrying, command "return"
+    sim.advanceSimulation(TICK_DT); // already in deposit range -> deposits
+
+    const creditedAmount = resourceAmount("sugar");
+    expect(creditedAmount).toBeGreaterThan(0);
+    expect(workerById(worker.id).carrying).toBeNull();
+    expect(sim.getWorkerCommand(worker.id)).toBe("idle");
+
+    sim.loadSimulation();
+
+    expect(resourceAmount("sugar")).toBe(creditedAmount); // the deposit's carrying-clear was already durable
+    expect(workerById(worker.id).carrying).toBeNull();
+    expect(sim.getWorkerCommand(worker.id)).toBe("idle");
+  });
+
+  it("carried-but-undeposited protein can't be spent on reproduction", () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'protein'").run(
+      REPRODUCE_COST - GATHER_YIELD,
+      colony.id,
+    );
+    const [proteinNode] = findNodesByType("protein");
+    const worker = registerTestWorker(9100, proteinNode.x, proteinNode.y);
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+    expect(workerById(worker.id).carrying).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
+
+    expect(actions.reproduce(colony.id)).toEqual({ ok: false, error: "not enough protein" });
+  });
+
+  it("a carrying worker rejects move and gather commands, leaving its state unchanged", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    const worker = registerTestWorker(9101, sugarNode.x, sugarNode.y);
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+    const carryingState = workerById(worker.id);
+    expect(carryingState.carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
+
+    expect(sim.issueMoveCommand(worker.id, 0, 0)).toBe("worker is busy returning resources");
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBe("worker is busy returning resources");
+    expect(sim.getWorkerCommand(worker.id)).toBe("return");
+    expect(workerById(worker.id)).toEqual(carryingState);
   });
 });
