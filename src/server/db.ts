@@ -1,7 +1,14 @@
 import Database from "better-sqlite3";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { RESOURCE_NODES, RESOURCE_TYPES, STARTING_WORKERS, WORLD } from "./balance.ts";
+import {
+  APHID_SEED_POSITIONS,
+  RESOURCE_NODES,
+  RESOURCE_TYPES,
+  STARTING_WORKERS,
+  SUGAR_NODE_MAX_AMOUNT,
+  WORLD,
+} from "./balance.ts";
 
 // DB_PATH is overridable so isolated tests (spec/simulation.test.ts) can point
 // at a throwaway file instead of sharing the dev DB or the deployed volume.
@@ -13,6 +20,7 @@ db.pragma("journal_mode = WAL");
 
 dropLegacySchema();
 migrateWorkersCarrying();
+migrateSugarNodesFinite();
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS worlds (
@@ -60,9 +68,23 @@ db.exec(`
     amount REAL,
     max_amount REAL
   );
+
+  -- Stage 5: neutral, non-interactable creatures (first species: aphid).
+  -- World-scoped rather than colony-scoped — aphids aren't owned by anyone.
+  -- No HP/species-specific fields yet; see CLAUDE.md for why this stays
+  -- minimal on purpose.
+  CREATE TABLE IF NOT EXISTS creatures (
+    id INTEGER PRIMARY KEY,
+    world_id INTEGER NOT NULL REFERENCES worlds(id),
+    species TEXT NOT NULL,
+    x REAL NOT NULL,
+    y REAL NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
 
 seedIfEmpty();
+seedCreaturesIfEmpty();
 
 // Pre-Stage-1 deployments have a `colonies` table from the Crit 8/9 schema:
 // integer grid coordinates, a flat `protein` column, no `world_id`. That
@@ -98,6 +120,17 @@ function migrateWorkersCarrying(): void {
   `);
 }
 
+// Stage 5: sugar nodes change from infinite (amount: null) to finite +
+// renewable. Idempotent — after the first run no sugar row has amount IS
+// NULL left to match, so this is a no-op on every later boot.
+function migrateSugarNodesFinite(): void {
+  const columns = db.prepare("PRAGMA table_info(resource_nodes)").all() as { name: string }[];
+  if (columns.length === 0) return; // table doesn't exist yet; CREATE TABLE + seedIfEmpty seed it finite directly
+  db.prepare(
+    "UPDATE resource_nodes SET amount = ?, max_amount = ? WHERE resource_type = 'sugar' AND amount IS NULL",
+  ).run(SUGAR_NODE_MAX_AMOUNT, SUGAR_NODE_MAX_AMOUNT);
+}
+
 function seedIfEmpty(): void {
   const row = db.prepare("SELECT COUNT(*) AS n FROM colonies").get() as { n: number };
   if (row.n > 0) return;
@@ -130,6 +163,19 @@ function seedIfEmpty(): void {
   }
 }
 
+// Independent of seedIfEmpty()'s colonies-count gate: an already-deployed
+// world has colonies > 0 (seedIfEmpty no-ops) but creatures = 0 (this still
+// fires), so Stage 5 backfills aphids into existing worlds too. Called after
+// seedIfEmpty() so a brand-new world's row already exists either way.
+function seedCreaturesIfEmpty(): void {
+  const row = db.prepare("SELECT COUNT(*) AS n FROM creatures").get() as { n: number };
+  if (row.n > 0) return;
+  const world = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number } | undefined;
+  if (!world) return;
+  const insertCreature = db.prepare("INSERT INTO creatures (world_id, species, x, y) VALUES (?, 'aphid', ?, ?)");
+  for (const pos of APHID_SEED_POSITIONS) insertCreature.run(world.id, pos.x, pos.y);
+}
+
 // Test-only isolation seam (Stage 4): wipes every table, then reseeds via
 // seedIfEmpty(). None of these tables use AUTOINCREMENT, so SQLite reuses
 // the lowest free rowid — every reset reproduces the exact same ids
@@ -142,7 +188,9 @@ export function resetForTests(): void {
     DELETE FROM workers;
     DELETE FROM colony_resources;
     DELETE FROM colonies;
+    DELETE FROM creatures;
     DELETE FROM worlds;
   `);
   seedIfEmpty();
+  seedCreaturesIfEmpty();
 }
