@@ -276,3 +276,95 @@ not a bug (see "multi-user semantics" below).
   workers can occupy the same point (e.g. a group gather command all
   converging on one node's centre) — Stage 2 has no collision or spacing
   logic, per the brief's explicit exclusions. Stage 3 may revisit this.
+
+## Stage 3: loose swarm movement
+
+Stage 2 left workers free to stack exactly on top of one another. Stage 3
+adds a loose destination area for group moves plus continuous worker-worker
+separation, both computed entirely in `simulation.ts` — the client only
+gained a `WORKER_RADIUS` import so its circles match the server's idea of a
+worker's footprint.
+
+- **`MIN_SEPARATION` is exactly `2 * WORKER_RADIUS`, and the trigger is a
+  strict `<`, not `<=`.** That's the natural "circles just touching"
+  threshold, and it's also what keeps the pre-existing `"arrival"` test in
+  `spec/simulation.test.ts` passing unmodified — that test's fixed-seed
+  geometry happens to place a worker exactly `MIN_SEPARATION` units from its
+  target, and a strict `<` means separation never fires exactly at the
+  boundary. If `MIN_SEPARATION` or the comparison operator ever changes,
+  re-check that test's geometry by hand before trusting it.
+- **Separation runs for every worker, every tick, idle or not, from one
+  pre-tick snapshot.** `advanceSimulation` builds a uniform spatial grid
+  (cell size `MIN_SEPARATION`) once per tick from wherever every worker
+  started that tick (Jacobi-style, not Gauss-Seidel) — so the result doesn't
+  depend on Map iteration order, only `separationDelta`'s own math does. A
+  worker queries its own cell plus its 8 neighbours, never the whole worker
+  set — this is the "no permanent O(n²) scan" requirement; it's a plain
+  `Map<string, SimWorker[]>` rebuilt from scratch each tick, not a
+  persisted structure, and not exported outside `simulation.ts`.
+- **Separation is additive, not a replacement for the attraction step.** An
+  idle worker gets the separation delta applied directly; a moving/
+  gathering worker gets its existing toward-target step plus the separation
+  delta, then the combined result is clamped into world bounds. The
+  separation vector itself is also capped at `WORKER_SPEED * dt` per tick,
+  so it can slow or delay progress but can never out-run or reverse it
+  outright, and it can never push a worker outside `[0,width]x[0,height]`.
+- **Arrival is decided from the attraction-only step, before separation is
+  added — not from the combined post-movement position.** A worker's target
+  is frequently exactly where a neighbour stands (a shared gather node, the
+  spot another worker just vacated), so separation there often points
+  straight against attraction; letting it participate on an arriving tick
+  could cancel or reverse the final approach step and stall a claim
+  indefinitely. The sequence per tick is: compute the attraction-only
+  landing position; if that alone is within `arrivalRange`, snap to it,
+  claim, go idle, and skip separation entirely for that tick; only
+  otherwise is separation added on top. This was a real bug found during
+  Stage 3 verification, not a hypothetical: the original "add both, then
+  check" ordering broke two pre-existing contested-claim tests (workers 5
+  units apart) and a new Stage 3 gathering-regression test, all for the same
+  reason. Separation can still delay an arrival on a tick that doesn't reach
+  it, but never blocks one that does, and the result is still clamped into
+  world bounds either way.
+- **A second, independent bug surfaced only against the real server, not the
+  fixed-`dt` unit tests: a worker could get stuck forever a hair outside
+  `arrivalRange`.** Both arrival checks compare a `Math.hypot`-derived
+  distance against `arrivalRange`; a tick's step is deliberately sized to
+  close the remaining distance to exactly `arrivalRange`, but `hypot`'s
+  rounding can land a sliver *above* it instead of on or under it. Observed
+  live: a worker parked at `dist = 30.00000000000002` against
+  `GATHER_RANGE = 30`, where the resulting step (~2e-14) was smaller than a
+  coordinate of that magnitude's own floating-point precision and so never
+  actually moved it — permanently stuck outside range, claim never
+  attempted, `protein` stuck at 0. Fixed with a fixed `ARRIVAL_EPSILON =
+  1e-6` tolerance added to both arrival comparisons in `advanceSimulation`.
+  This is a pre-existing class of bug (the exact-equality arrival check
+  predates Stage 3), just one Stage 3's exact-landing step math happened to
+  expose and that the black-box `colony.test.ts`/`realtime.test.ts` suites
+  (real geometry, real timers) hit where the unit tests' round-number
+  geometry never did.
+- **`computeGroupDestinations(workerIds, centerX, centerY)` turns one
+  clicked point into one destination per worker.** A single-worker array
+  maps to the exact, unclamped centre — no offset at all, so solo moves
+  (and their existing out-of-bounds rejection in `issueMoveCommand`) are
+  untouched. For more than one worker, ids are sorted ascending for a
+  deterministic index and placed on a golden-angle phyllotaxis spiral
+  around the centre (`radius = GROUP_DESTINATION_SPACING * sqrt(i)`,
+  `angle = i * GOLDEN_ANGLE`) — chosen over a grid/rows layout specifically
+  because the brief asked for an organic-looking spread, and a spiral never
+  produces the same point twice for two different indices. Each point is
+  then clamped into world bounds. The function is pure (ids + centre only,
+  no worker lookup), so it's trivially unit-testable and so that a group's
+  on-screen spread doesn't depend on what the workers were doing before the
+  command.
+- **Gather commands are never offset.** Only `POST /api/command/move` calls
+  `computeGroupDestinations`; `POST /api/command/gather` still passes every
+  worker straight at `issueGatherCommand(workerId, resourceId)`, so a group
+  gather always targets the resource's real centre. `GATHER_RANGE` (30) is
+  larger than `MIN_SEPARATION` (20) on purpose — several workers can be
+  within claim range of the same node while still keeping separation
+  distance from each other, so claiming (Stage 1c's travel/claim/deplete/
+  demote semantics) is structurally unaffected by separation.
+- **Redirecting a group needs no special-case code.** A redirect is just
+  another `POST /api/command/move` with a new centre; a fresh call to
+  `computeGroupDestinations` naturally produces fresh offsets, so Stage 2's
+  "new command replaces the old, per worker" semantics fall out for free.
