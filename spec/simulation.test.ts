@@ -83,6 +83,16 @@ describe("gradual movement", () => {
     expect(after.x).toBeLessThan(target.x);
     expect(after.y).toBe(start.y);
     expect(sim.getWorkerCommand(worker.id)).toBe("move");
+
+    // Stage 3: left as "move", this worker would drift indefinitely through
+    // every later describe block — harmless pre-Stage-3 (workers never
+    // affected each other), but Stage 3's separation makes a passing-by
+    // worker observable to anyone it nears. Send it back home and let it
+    // settle so later tests' own geometry is the only thing in play.
+    expect(sim.issueMoveCommand(worker.id, start.x, start.y)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+    expect(workerById(worker.id)).toEqual({ id: worker.id, x: start.x, y: start.y });
+    expect(sim.getWorkerCommand(worker.id)).toBe("idle");
   });
 });
 
@@ -329,5 +339,168 @@ describe("group commands", () => {
     expect(resourceAmount("protein")).toBe(beforeColony + GATHER_YIELD);
     expect(nodeRow(proteinNode.id)).toBeUndefined();
     for (const w of group) expect(sim.getWorkerCommand(w.id)).toBe("idle");
+  });
+});
+
+// Stage 3: loose swarm movement — group destination offsets, worker-worker
+// separation, and the spatial grid they run on. Fresh ids (>= 11001) and
+// coordinates in quiet corners of the world, none shared with any test
+// above, so this block needs no reset/reload seam of its own.
+describe("Stage 3: loose swarm movement", () => {
+  it("computeGroupDestinations spreads a group onto distinct destinations near the centre, within world bounds", () => {
+    const ids = [11001, 11002, 11003, 11004, 11005];
+    const center = { x: 2900, y: 200 };
+    const destinations = sim.computeGroupDestinations(ids, center.x, center.y);
+
+    expect(destinations.size).toBe(ids.length);
+    const points = ids.map((id) => destinations.get(id)!);
+    const keys = new Set(points.map((p) => `${p.x}:${p.y}`));
+    expect(keys.size).toBe(ids.length);
+    for (const p of points) {
+      expect(p.x).toBeGreaterThanOrEqual(0);
+      expect(p.x).toBeLessThanOrEqual(world.width);
+      expect(p.y).toBeGreaterThanOrEqual(0);
+      expect(p.y).toBeLessThanOrEqual(world.height);
+      expect(Math.hypot(p.x - center.x, p.y - center.y)).toBeLessThan(100);
+    }
+  });
+
+  it("computeGroupDestinations returns the exact centre for a single worker, and a solo move still arrives exactly", () => {
+    const center = { x: 2900, y: 200 };
+    const destinations = sim.computeGroupDestinations([11006], center.x, center.y);
+    expect(destinations.get(11006)).toEqual(center);
+
+    const worker = registerTestWorker(11006, center.x - 30, center.y);
+    expect(sim.issueMoveCommand(worker.id, center.x, center.y)).toBeNull();
+    for (let i = 0; i < 10; i++) sim.advanceSimulation(TICK_DT);
+
+    const after = workerById(worker.id);
+    expect(after.x).toBe(center.x);
+    expect(after.y).toBe(center.y);
+    expect(sim.getWorkerCommand(worker.id)).toBe("idle");
+  });
+
+  it("separation moves two workers stacked on the same point apart", () => {
+    const a = registerTestWorker(11007, 100, 100);
+    const b = registerTestWorker(11008, 100, 100);
+    expect(Math.hypot(a.x - b.x, a.y - b.y)).toBe(0);
+
+    sim.advanceSimulation(TICK_DT);
+
+    const afterA = workerById(a.id);
+    const afterB = workerById(b.id);
+    expect(Math.hypot(afterA.x - afterB.x, afterA.y - afterB.y)).toBeGreaterThan(0);
+  });
+
+  it("a group move spread onto distinct destinations settles with no two workers on the exact same point", () => {
+    const ids = [11009, 11010, 11011, 11012];
+    for (const id of ids) registerTestWorker(id, 150, 150);
+    const target = { x: 400, y: 150 };
+    const destinations = sim.computeGroupDestinations(ids, target.x, target.y);
+    for (const id of ids) {
+      const dest = destinations.get(id)!;
+      expect(sim.issueMoveCommand(id, dest.x, dest.y)).toBeNull();
+    }
+    for (let i = 0; i < 50; i++) sim.advanceSimulation(TICK_DT);
+
+    const positions = ids.map((id) => workerById(id));
+    for (let i = 0; i < positions.length; i++) {
+      for (let j = i + 1; j < positions.length; j++) {
+        expect(positions[i].x === positions[j].x && positions[i].y === positions[j].y).toBe(false);
+      }
+    }
+  });
+
+  it("a worker with a close neighbour still makes net progress toward a distant target", () => {
+    const mover = registerTestWorker(11013, 500, 500);
+    // Idle neighbour sitting directly in the mover's path, 10 units away
+    // (< MIN_SEPARATION). It isn't actually stationary — separation pushes
+    // it too, so as the mover closes in the neighbour keeps retreating along
+    // the same line, settling into a pursuit equilibrium where the mover's
+    // net speed is roughly half of WORKER_SPEED rather than the near-full
+    // speed a truly fixed obstacle would allow. 50 ticks at that half-rate
+    // reproducibly lands at 879.375, well short of a naive >900 expectation
+    // for unobstructed travel — the assertion only needs to confirm real
+    // progress is still being made, not match unobstructed speed.
+    registerTestWorker(11014, 510, 500);
+    const target = { x: 1000, y: 500 };
+
+    expect(sim.issueMoveCommand(mover.id, target.x, target.y)).toBeNull();
+    for (let i = 0; i < 50; i++) sim.advanceSimulation(TICK_DT);
+
+    expect(workerById(mover.id).x).toBeGreaterThan(800);
+  });
+
+  it("once workers are arrived and spaced apart, further ticks cause no further movement", () => {
+    const a = registerTestWorker(11015, 700, 500);
+    const b = registerTestWorker(11016, 750, 500); // 50 units apart, >= MIN_SEPARATION
+    sim.advanceSimulation(TICK_DT);
+
+    const afterA = workerById(a.id);
+    const afterB = workerById(b.id);
+    sim.advanceSimulation(TICK_DT);
+
+    expect(workerById(a.id)).toEqual(afterA);
+    expect(workerById(b.id)).toEqual(afterB);
+  });
+
+  it("separation near a world edge never pushes a worker out of bounds", () => {
+    const a = registerTestWorker(11017, 5, 5);
+    const b = registerTestWorker(11018, 5, 5);
+    for (let i = 0; i < 10; i++) sim.advanceSimulation(TICK_DT);
+
+    for (const w of [workerById(a.id), workerById(b.id)]) {
+      expect(w.x).toBeGreaterThanOrEqual(0);
+      expect(w.x).toBeLessThanOrEqual(world.width);
+      expect(w.y).toBeGreaterThanOrEqual(0);
+      expect(w.y).toBeLessThanOrEqual(world.height);
+    }
+  });
+
+  it("gathering regression: a close-together group gathering a finite node still yields exactly one claim", () => {
+    const worldRow = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number };
+    const { lastInsertRowid: nodeId } = db
+      .prepare(
+        "INSERT INTO resource_nodes (world_id, x, y, resource_type, amount, max_amount) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(worldRow.id, 2000, 2800, "biomass", GATHER_YIELD, GATHER_YIELD);
+    const group = [11019, 11020, 11021].map((id, i) => registerTestWorker(id, 2000 + i * 5, 2800));
+    const beforeColony = resourceAmount("biomass");
+
+    for (const w of group) expect(sim.issueGatherCommand(w.id, Number(nodeId))).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    expect(resourceAmount("biomass")).toBe(beforeColony + GATHER_YIELD);
+    expect(nodeRow(Number(nodeId))).toBeUndefined();
+    for (const w of group) expect(sim.getWorkerCommand(w.id)).toBe("idle");
+  });
+
+  it("command-override regression: redirecting one member of a moving group changes its course while the rest continue", () => {
+    const ids = [11022, 11023, 11024];
+    const starts = ids.map((id, i) => registerTestWorker(id, 2000, 50 + i * 2));
+    const firstTarget = { x: 2500, y: 50 };
+
+    for (const w of starts) expect(sim.issueMoveCommand(w.id, firstTarget.x, firstTarget.y)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    // Baseline is taken right before the redirect, not at registration — the
+    // group's own tight initial spacing (2 units, well under MIN_SEPARATION)
+    // means separation visibly reshuffles everyone within that first tick,
+    // same as it would for any crowd this close. What this test checks is
+    // that the *second* command changes course from there, not that it
+    // somehow erases that first tick's spacing adjustment.
+    const beforeRedirect = workerById(starts[0].id);
+    const secondTarget = { x: 2000, y: 500 };
+    expect(sim.issueMoveCommand(starts[0].id, secondTarget.x, secondTarget.y)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    const redirected = workerById(starts[0].id);
+    expect(redirected.y).toBeGreaterThan(beforeRedirect.y);
+
+    for (const w of starts.slice(1)) {
+      expect(workerById(w.id).x).toBeGreaterThan(w.x);
+    }
+    expect(sim.getWorkerCommand(starts[0].id)).toBe("move");
+    expect(sim.getWorkerCommand(starts[1].id)).toBe("move");
   });
 });
