@@ -1,5 +1,6 @@
 import { RESOURCE_TYPES } from "./balance.ts";
 import { db } from "./db.ts";
+import { getWorkersForColony } from "./simulation.ts";
 
 export interface ColonyState {
   world: { width: number; height: number };
@@ -37,9 +38,9 @@ export function getState(): ColonyState {
   const resources: Record<string, number> = Object.fromEntries(RESOURCE_TYPES.map((type) => [type, 0]));
   for (const row of resourceRows) resources[row.resourceType] = row.amount;
 
-  const workers = db
-    .prepare("SELECT id, x, y FROM workers WHERE colony_id = ? ORDER BY id")
-    .all(colonyRow.id) as ColonyState["workers"];
+  // Live positions come from in-memory simulation state, not straight from
+  // SQLite — the table only ever holds the last checkpoint. See simulation.ts.
+  const workers = getWorkersForColony(colonyRow.id);
 
   const resourceNodes = db
     .prepare(

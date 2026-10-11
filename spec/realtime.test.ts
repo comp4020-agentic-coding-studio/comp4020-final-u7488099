@@ -78,6 +78,36 @@ it("broadcasts to every open connection, not just the one that caused the change
   }
 });
 
+it("worker movement is broadcast to open WebSocket clients without a reload", async () => {
+  const before = await getState();
+  const worker = before.workers[0];
+  const target = { x: Math.min(before.world.width - 10, worker.x + 500), y: worker.y };
+
+  const ws = await connect();
+  try {
+    const res = await fetch(new URL("/api/command/move", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerIds: [worker.id], x: target.x, y: target.y }),
+    });
+    expect(res.status).toBe(200);
+
+    // Movement is continuous and server-driven, not something the client can
+    // compute — wait for a broadcast frame showing the worker somewhere
+    // other than where it started.
+    const deadline = Date.now() + 3000;
+    let moved = false;
+    while (!moved && Date.now() < deadline) {
+      const message = await nextMessage(ws, 3000);
+      const current = message.workers.find((w: any) => w.id === worker.id);
+      if (current && (current.x !== worker.x || current.y !== worker.y)) moved = true;
+    }
+    expect(moved).toBe(true);
+  } finally {
+    ws.close();
+  }
+});
+
 async function gatherProteinUntil(targetProtein: number): Promise<void> {
   let state = await getState();
   const proteinNode = state.resourceNodes.find((n: any) => n.resourceType === "protein");

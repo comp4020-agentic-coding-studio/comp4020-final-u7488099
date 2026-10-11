@@ -1,5 +1,6 @@
 import { GATHER_YIELD, REPRODUCE_COST } from "./balance.ts";
 import { db } from "./db.ts";
+import { registerWorker } from "./simulation.ts";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
 
@@ -38,12 +39,20 @@ export function reproduce(colonyId: number): ActionResult {
     .get(colonyId) as { amount: number } | undefined;
   if (!protein || protein.amount < REPRODUCE_COST) return { ok: false, error: "not enough protein" };
 
+  let newWorkerId = 0;
   const tx = db.transaction(() => {
     db.prepare(
       "UPDATE colony_resources SET amount = amount - ? WHERE colony_id = ? AND resource_type = 'protein'",
     ).run(REPRODUCE_COST, colonyId);
-    db.prepare("INSERT INTO workers (colony_id, x, y) VALUES (?, ?, ?)").run(colonyId, colony.queenX, colony.queenY);
+    const info = db
+      .prepare("INSERT INTO workers (colony_id, x, y) VALUES (?, ?, ?)")
+      .run(colonyId, colony.queenX, colony.queenY);
+    newWorkerId = Number(info.lastInsertRowid);
   });
   tx();
+  // Synchronous, immediately after the transaction commits — the sim cache
+  // must never lag SQLite by so much as one tick, or a freshly reproduced
+  // worker would be invisible until the next full reload. See simulation.ts.
+  registerWorker({ id: newWorkerId, colonyId, x: colony.queenX, y: colony.queenY });
   return { ok: true };
 }

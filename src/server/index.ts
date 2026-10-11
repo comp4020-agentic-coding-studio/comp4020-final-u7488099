@@ -2,6 +2,8 @@ import express from "express";
 import { readFileSync } from "node:fs";
 import { WebSocket, WebSocketServer } from "ws";
 import { gather, reproduce } from "./actions.ts";
+import { SIMULATION } from "./balance.ts";
+import { advanceSimulation, checkpointSimulation, consumeDirty, issueMoveCommand } from "./simulation.ts";
 import { getState } from "./state.ts";
 
 const app = express();
@@ -63,6 +65,30 @@ app.post("/api/reproduce", (_req, res) => {
   res.json(state);
 });
 
+// Stage 1b: single-worker-only in the UI, but the array shape is kept so
+// Stage 2 (group selection) can reuse this route unchanged.
+app.post("/api/command/move", (req, res) => {
+  const { workerIds, x, y } = req.body ?? {};
+  if (!Array.isArray(workerIds) || workerIds.length === 0 || !workerIds.every((id) => typeof id === "number")) {
+    res.status(400).json({ error: "workerIds must be a non-empty array of numbers" });
+    return;
+  }
+  if (typeof x !== "number" || typeof y !== "number") {
+    res.status(400).json({ error: "x and y are required" });
+    return;
+  }
+  for (const workerId of workerIds) {
+    const error = issueMoveCommand(workerId, x, y);
+    if (error) {
+      res.status(400).json({ error });
+      return;
+    }
+  }
+  const state = getState();
+  broadcastState(state);
+  res.json(state);
+});
+
 const port = Number(process.env.PORT ?? 8080);
 const server = app.listen(port, "0.0.0.0", () => {
   console.log(`listening on http://0.0.0.0:${port}`);
@@ -78,3 +104,29 @@ function broadcastState(state: ReturnType<typeof getState>): void {
     }
   }
 }
+
+// Tick faster than broadcast: positions update smoothly in memory even
+// though clients only see a new frame at SIMULATION.broadcastHz. Both run
+// as plain setIntervals in the single server process — advanceSimulation is
+// fully synchronous, so it can never interleave with an HTTP handler's own
+// mutation. See simulation.ts / CLAUDE.md.
+setInterval(() => advanceSimulation(1 / SIMULATION.tickHz), 1000 / SIMULATION.tickHz);
+
+// Only pushes a frame when something actually moved, so an idle world
+// doesn't broadcast identical state forever.
+setInterval(() => {
+  if (consumeDirty()) broadcastState(getState());
+}, 1000 / SIMULATION.broadcastHz);
+
+// Positions live in memory and are only periodically flushed to SQLite —
+// writing every tick would turn continuous movement into a continuous write
+// load. SIGTERM/SIGINT also checkpoint so a graceful restart never loses
+// more than one interval's worth of movement.
+setInterval(() => checkpointSimulation(), SIMULATION.checkpointIntervalMs);
+
+function shutdown(): void {
+  checkpointSimulation();
+  process.exit(0);
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
