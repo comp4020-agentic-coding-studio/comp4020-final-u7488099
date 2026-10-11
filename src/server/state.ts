@@ -1,6 +1,6 @@
 import { RESOURCE_TYPES } from "./balance.ts";
 import { db } from "./db.ts";
-import { getWorkersForColony } from "./simulation.ts";
+import { getWorkersForColony, type Carrying } from "./simulation.ts";
 
 export interface ColonyState {
   world: { width: number; height: number };
@@ -10,7 +10,7 @@ export interface ColonyState {
     queenY: number;
     resources: Record<string, number>;
   };
-  workers: { id: number; x: number; y: number }[];
+  workers: { id: number; x: number; y: number; carrying: Carrying }[];
   resourceNodes: {
     id: number;
     x: number;
