@@ -269,3 +269,46 @@ it(
     }
   },
 );
+
+// Stage 5: I — aphid state rides the same broadcast channel as every other
+// mutation, with no separate creature protocol.
+it("I: creature state is broadcast identically to every open connection, matching GET /api/state", async () => {
+  const state = await getState();
+  expect(Array.isArray(state.creatures)).toBe(true);
+  expect(state.creatures.length).toBeGreaterThanOrEqual(10);
+
+  const [wsA, wsB] = await Promise.all([connect(), connect()]);
+  try {
+    const [msgA, msgB] = await Promise.all([nextMessage(wsA, 3000), nextMessage(wsB, 3000)]);
+    expect(Array.isArray(msgA.creatures)).toBe(true);
+    expect(msgA.creatures).toHaveLength(state.creatures.length);
+    const sortById = (list: any[]) => list.slice().sort((a, b) => a.id - b.id);
+    expect(sortById(msgA.creatures)).toEqual(sortById(msgB.creatures));
+  } finally {
+    wsA.close();
+    wsB.close();
+  }
+});
+
+// Stage 5: I — aphid wandering is nobody-issued movement; it must still reach
+// an open connection without a reload, proving creature advancement marks
+// simulation state dirty for the broadcast loop same as worker movement does.
+it("I: aphid wandering is visible over an open WebSocket connection without a reload", async () => {
+  const before = await getState();
+
+  const ws = await connect();
+  try {
+    const deadline = Date.now() + 20000;
+    let moved = false;
+    while (!moved && Date.now() < deadline) {
+      const message = await nextMessage(ws, 20000);
+      moved = message.creatures.some((c: any) => {
+        const start = before.creatures.find((b: any) => b.id === c.id);
+        return start !== undefined && (c.x !== start.x || c.y !== start.y);
+      });
+    }
+    expect(moved).toBe(true);
+  } finally {
+    ws.close();
+  }
+});

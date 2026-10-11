@@ -21,12 +21,25 @@ process.env.DB_PATH = DB_PATH;
 const { db, resetForTests } = await import("../src/server/db.ts");
 const sim = await import("../src/server/simulation.ts");
 const actions = await import("../src/server/actions.ts");
-const { SIMULATION, GATHER_YIELD, REPRODUCE_COST } = await import("../src/server/balance.ts");
+const {
+  SIMULATION,
+  GATHER_YIELD,
+  REPRODUCE_COST,
+  SUGAR_NODE_MAX_AMOUNT,
+  SUGAR_REGEN_RATE,
+  BIOMASS_REGEN_RATE,
+  APHID_SEED_POSITIONS,
+  APHID_IDLE_MAX,
+} = await import("../src/server/balance.ts");
 
 const TICK_DT = 1 / SIMULATION.tickHz;
 
 const colony = db.prepare("SELECT id FROM colonies LIMIT 1").get() as { id: number };
-const world = db.prepare("SELECT width, height FROM worlds LIMIT 1").get() as { width: number; height: number };
+const world = db.prepare("SELECT id, width, height FROM worlds LIMIT 1").get() as {
+  id: number;
+  width: number;
+  height: number;
+};
 
 function workerById(id: number) {
   const found = sim.getWorkersForColony(colony.id).find((w) => w.id === id);
@@ -56,6 +69,14 @@ function nodeRow(id: number): { id: number; x: number; y: number; amount: number
   return db.prepare("SELECT id, x, y, amount FROM resource_nodes WHERE id = ?").get(id) as
     | { id: number; x: number; y: number; amount: number | null }
     | undefined;
+}
+
+function fullNodeRow(
+  id: number,
+): { id: number; resourceType: string; amount: number | null; maxAmount: number | null } | undefined {
+  return db
+    .prepare("SELECT id, resource_type AS resourceType, amount, max_amount AS maxAmount FROM resource_nodes WHERE id = ?")
+    .get(id) as { id: number; resourceType: string; amount: number | null; maxAmount: number | null } | undefined;
 }
 
 function findNodesByType(resourceType: string): { id: number; x: number; y: number; amount: number | null }[] {
@@ -196,8 +217,9 @@ describe("gather: travel + claim", () => {
     expect(resourceAmount("sugar")).toBe(before);
   });
 
-  it("B: arriving at an infinite node claims GATHER_YIELD into carrying without crediting the colony, and leaves its amount at null", () => {
+  it("B: arriving at a renewable node claims GATHER_YIELD into carrying without crediting the colony, and decrements its amount", () => {
     const [sugarNode] = findNodesByType("sugar");
+    const beforeNodeAmount = nodeRow(sugarNode.id)!.amount!;
     const worker = registerTestWorker(9002, sugarNode.x, sugarNode.y);
     const before = resourceAmount("sugar");
 
@@ -207,7 +229,10 @@ describe("gather: travel + claim", () => {
     expect(resourceAmount("sugar")).toBe(before); // not credited yet — only deposit credits the colony
     expect(workerById(worker.id).carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
     expect(sim.getWorkerCommand(worker.id)).toBe("return"); // auto-issued, no client command involved
-    expect(nodeRow(sugarNode.id)?.amount).toBeNull(); // infinite node's payload doesn't deplete it
+    // Stage 5: sugar is now finite + renewable, same as biomass — a claim
+    // depletes it like any finite node (see "Stage 5: renewable resource
+    // regeneration" below for the regeneration half of that behaviour).
+    expect(nodeRow(sugarNode.id)?.amount).toBe(beforeNodeAmount - GATHER_YIELD);
   });
 
   it("C: arriving at a finite node claims GATHER_YIELD into carrying, decrements the node, and still doesn't credit the colony", () => {
@@ -335,8 +360,9 @@ describe("group commands", () => {
     expect(afterB.y).toBe(2000);
   });
 
-  it("J: several workers converging on an infinite node each claim a payload independently, no contention", () => {
+  it("J: several workers converging on a renewable node each claim a payload independently, no contention", () => {
     const [sugarNode] = findNodesByType("sugar");
+    const beforeNodeAmount = nodeRow(sugarNode.id)!.amount!;
     const group = [10006, 10007, 10008].map((id) => registerTestWorker(id, sugarNode.x, sugarNode.y));
     const before = resourceAmount("sugar");
 
@@ -350,6 +376,9 @@ describe("group commands", () => {
       expect(workerById(w.id).carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
       expect(sim.getWorkerCommand(w.id)).toBe("return");
     }
+    // Stage 5: each claim independently decrements the shared renewable
+    // node — no contention, same as it would for a finite biomass node.
+    expect(nodeRow(sugarNode.id)?.amount).toBe(beforeNodeAmount - 3 * GATHER_YIELD);
   });
 
   it("K: a group gathering a finite node lets exactly one claim land, the rest demote with no carrying", () => {
@@ -504,7 +533,10 @@ describe("Stage 3: loose swarm movement", () => {
     // Exactly one claim can have landed — and even that claim doesn't credit
     // the colony yet, it's carried home first.
     expect(resourceAmount("biomass")).toBe(beforeColony);
-    expect(nodeRow(nodeId)).toBeUndefined();
+    // Stage 5: biomass is renewable, so the now-empty node persists at 0
+    // instead of being deleted (contrast with protein's delete-on-depletion,
+    // exercised elsewhere).
+    expect(nodeRow(nodeId)?.amount).toBe(0);
     const carrying = group.map((w) => workerById(w.id).carrying);
     expect(carrying.filter((c) => c !== null)).toEqual([{ resourceType: "biomass", amount: GATHER_YIELD }]);
     for (const w of group) {
@@ -644,5 +676,121 @@ describe("Stage 4: carry, return, deposit economy", () => {
     expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBe("worker is busy returning resources");
     expect(sim.getWorkerCommand(worker.id)).toBe("return");
     expect(workerById(worker.id)).toEqual(carryingState);
+  });
+});
+
+describe("Stage 5: renewable resource regeneration", () => {
+  it("A: a depleted sugar node regenerates over time", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(10, sugarNode.id);
+
+    sim.advanceSimulation(10);
+
+    expect(fullNodeRow(sugarNode.id)?.amount).toBe(10 + SUGAR_REGEN_RATE * 10);
+  });
+
+  it("B: a depleted biomass node regenerates over time", () => {
+    const [biomassNode] = findNodesByType("biomass");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(100, biomassNode.id);
+
+    sim.advanceSimulation(10);
+
+    expect(fullNodeRow(biomassNode.id)?.amount).toBe(100 + BIOMASS_REGEN_RATE * 10);
+  });
+
+  it("regeneration never exceeds a node's maxAmount, however large the dt", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(1, sugarNode.id);
+
+    sim.advanceSimulation(1000); // comfortably enough to overshoot maxAmount if the cap were missing
+
+    expect(fullNodeRow(sugarNode.id)?.amount).toBe(SUGAR_NODE_MAX_AMOUNT);
+  });
+
+  it("C: protein does not regenerate", () => {
+    const [proteinNode] = findNodesByType("protein");
+    const depleted = fullNodeRow(proteinNode.id)!.amount! - 50;
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(depleted, proteinNode.id);
+
+    sim.advanceSimulation(1000);
+
+    expect(fullNodeRow(proteinNode.id)?.amount).toBe(depleted);
+  });
+
+  it("D: a renewable node driven to exactly zero persists (not deleted) and later regenerates above zero", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(1, sugarNode.id);
+    const worker = registerTestWorker(9200, sugarNode.x, sugarNode.y);
+
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT); // regen (node still below GATHER_YIELD) then claim drains it exactly to 0
+
+    expect(fullNodeRow(sugarNode.id)?.amount).toBe(0);
+
+    sim.advanceSimulation(10);
+
+    expect(fullNodeRow(sugarNode.id)!.amount!).toBeGreaterThan(0);
+  });
+});
+
+describe("Stage 5: aphid seed + wandering", () => {
+  it("E: aphids seed deterministically and the same population survives a reset", () => {
+    const creatures = sim.getCreaturesForWorld(world.id);
+    expect(creatures).toHaveLength(APHID_SEED_POSITIONS.length);
+    for (const c of creatures) {
+      expect(c.species).toBe("aphid");
+      expect(c.x).toBeGreaterThanOrEqual(0);
+      expect(c.x).toBeLessThanOrEqual(world.width);
+      expect(c.y).toBeGreaterThanOrEqual(0);
+      expect(c.y).toBeLessThanOrEqual(world.height);
+    }
+
+    resetForTests();
+    sim.loadSimulation();
+
+    expect(sim.getCreaturesForWorld(world.id)).toEqual(creatures);
+  });
+
+  it("F: an aphid moves toward its wander target over time, staying within world bounds throughout", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    const start = { x: creature.x, y: creature.y };
+
+    let moved = false;
+    const ticks = Math.ceil((APHID_IDLE_MAX + 10) / TICK_DT);
+    for (let i = 0; i < ticks; i++) {
+      sim.advanceSimulation(TICK_DT);
+      const current = sim.getCreaturesForWorld(world.id).find((c) => c.id === creature.id)!;
+      expect(current.x).toBeGreaterThanOrEqual(0);
+      expect(current.x).toBeLessThanOrEqual(world.width);
+      expect(current.y).toBeGreaterThanOrEqual(0);
+      expect(current.y).toBeLessThanOrEqual(world.height);
+      if (current.x !== start.x || current.y !== start.y) moved = true;
+    }
+
+    expect(moved).toBe(true);
+  });
+
+  it("G: aphid position persists across a checkpoint + reload, and wandering resumes afterward", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+
+    for (let i = 0; i < 20; i++) sim.advanceSimulation(TICK_DT); // partway through a wander leg
+    const beforeReload = sim.getCreaturesForWorld(world.id).find((c) => c.id === creature.id)!;
+
+    sim.checkpointSimulation();
+    sim.loadSimulation(); // simulates a restart
+
+    const afterReload = sim.getCreaturesForWorld(world.id).find((c) => c.id === creature.id)!;
+    expect(afterReload.id).toBe(creature.id);
+    expect(afterReload.x).toBeCloseTo(beforeReload.x, 6);
+    expect(afterReload.y).toBeCloseTo(beforeReload.y, 6);
+
+    let moved = false;
+    const ticks = Math.ceil((APHID_IDLE_MAX + 10) / TICK_DT);
+    for (let i = 0; i < ticks; i++) {
+      sim.advanceSimulation(TICK_DT);
+      const current = sim.getCreaturesForWorld(world.id).find((c) => c.id === creature.id)!;
+      if (current.x !== afterReload.x || current.y !== afterReload.y) moved = true;
+    }
+    expect(moved).toBe(true);
   });
 });
