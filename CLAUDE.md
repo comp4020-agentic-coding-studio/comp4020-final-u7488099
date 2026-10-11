@@ -220,3 +220,59 @@ synchronous "gather now" code path left anywhere.
   worker (`closestNode`) to keep real travel time bounded, and poll
   `GET /api/state` / wait on WebSocket frames for the resulting credit
   rather than asserting on an immediate response.
+
+## Stage 2: RTS selection and group commands
+
+Multi-selection is a purely client-side concept — `selectedWorkerIds` lives
+only in `src/client/main.ts`'s browser state, is never sent to the server
+except as the `workerIds` array on a command, and is never synced between
+browser tabs or persisted anywhere. Two tabs can have entirely different
+selections of the same colony's workers at the same time; that's expected,
+not a bug (see "multi-user semantics" below).
+
+- **Batch commands never let one bad id block the rest (brief 8B).**
+  `POST /api/command/move` and `/gather` used to loop over `workerIds` and
+  `return` on the first per-id error, so one bad id blocked every id after
+  it in the array. `runBatchCommand` in `index.ts` now attempts every id
+  unconditionally and collects failures into `errors: { [workerId]: reason
+  }`. The request only 400s if *every* id failed (preserving the old
+  all-invalid behaviour); if at least one succeeded, the response is `200`
+  with the resulting state plus `errors` naming exactly which ids didn't go
+  through. Whole-request validation (shape, missing coordinates/resourceId)
+  still 400s before touching any worker — those failures apply identically
+  regardless of which ids are valid, so there's nothing per-id to report.
+- **Selection replaces, it doesn't toggle or add.** Clicking a worker sets
+  the selection to exactly that one worker. The only way to select more than
+  one is a left-drag box. There's no shift-click-to-add and no click-to-
+  deselect — simpler, and the brief doesn't ask for either.
+- **Control scheme: button, not modifier, picks the gesture.** Left button
+  drags a selection box (or, without crossing the drag threshold, clicks);
+  middle or right button drags to pan. One button always means one thing, so
+  there's never a question of what a given drag does. `canvas`'s
+  `contextmenu` is suppressed so right-drag-to-pan doesn't pop the browser
+  menu afterward. This is stated explicitly in `public/index.html`'s hint
+  text — the brief's "document the controls somewhere visible" requirement.
+- **The selection box is computed in world space, not screen space.**
+  `screenToWorld` runs at drag-start and on every `mousemove`, and the box's
+  two corners are only converted back to screen coordinates for drawing.
+  WASD panning runs independently every animation frame regardless of
+  mouse state, so a world-space box is what keeps the box correct if the
+  camera pans *during* a drag, not just before one. Selection is by centre
+  point only (`worker.x/y` inside the box's bounds) — no partial-circle
+  intersection test.
+- **Commands never clear the selection.** Issuing a move or gather leaves
+  `selectedWorkerIds` as-is, so a group can be issued several commands in a
+  row, or stay selected to watch them arrive.
+- **Multi-user semantics: last command wins, per worker.** Two browser tabs
+  (or two players) can each select and command the same worker; whichever
+  command's HTTP request reaches `issueMoveCommand`/`issueGatherCommand`
+  last simply overwrites that worker's `command` field (see test I in
+  `spec/simulation.test.ts`, which exercises one worker's command being
+  replaced while a sibling's is untouched). There's no ownership, locking,
+  or conflict resolution — the server is already the sole authority over
+  worker state (Stage 1b), so "last write wins" falls out of that for free,
+  the same way `reproduce`'s single-process guarantee does.
+- **Overlap/stacking on arrival is deliberately out of scope.** Several
+  workers can occupy the same point (e.g. a group gather command all
+  converging on one node's centre) — Stage 2 has no collision or spacing
+  logic, per the brief's explicit exclusions. Stage 3 may revisit this.
