@@ -10,8 +10,8 @@ export type ResourceType = (typeof RESOURCE_TYPES)[number];
 
 // Stage 1 seed: fixed, deterministic positions spread across the world so it
 // visibly exceeds any one viewport. Not randomised — a fresh seed, and a
-// test run, must be reproducible. `amount`/`maxAmount` are stored now but
-// unused by today's transitional `gather()`; Stage 4 adds real depletion.
+// test run, must be reproducible. `amount`/`maxAmount` now drive real
+// depletion via Stage 1c's travel + claim gather (see simulation.ts).
 export const RESOURCE_NODES: {
   x: number;
   y: number;
@@ -37,7 +37,14 @@ export const RESOURCE_NODES: {
   { x: 2700, y: 2700, resourceType: "biomass", amount: 500, maxAmount: 500 },
 ];
 
+// How much a single successful claim credits, and how much it decrements a
+// finite node's remaining amount (capped at whatever's left — see
+// attemptGatherClaim in simulation.ts).
 export const GATHER_YIELD = 10;
+// How close a gathering worker must get to a resource's centre before a
+// claim is attempted. Bigger than any NODE_RADIUS so workers visibly stop at
+// the node's edge rather than overlapping its centre.
+export const GATHER_RANGE = 30;
 export const REPRODUCE_COST = 50;
 
 export const WORKER_SPEED = 150; // world units per second

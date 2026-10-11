@@ -1,9 +1,15 @@
 import express from "express";
 import { readFileSync } from "node:fs";
 import { WebSocket, WebSocketServer } from "ws";
-import { gather, reproduce } from "./actions.ts";
+import { reproduce } from "./actions.ts";
 import { SIMULATION } from "./balance.ts";
-import { advanceSimulation, checkpointSimulation, consumeDirty, issueMoveCommand } from "./simulation.ts";
+import {
+  advanceSimulation,
+  checkpointSimulation,
+  consumeDirty,
+  issueGatherCommand,
+  issueMoveCommand,
+} from "./simulation.ts";
 import { getState } from "./state.ts";
 
 const app = express();
@@ -37,22 +43,6 @@ app.get("/api/state", (_req, res) => {
   res.json(getState());
 });
 
-app.post("/api/gather", (req, res) => {
-  const { workerId, nodeId } = req.body ?? {};
-  if (typeof workerId !== "number" || typeof nodeId !== "number") {
-    res.status(400).json({ error: "workerId and nodeId are required" });
-    return;
-  }
-  const result = gather(workerId, nodeId);
-  if (!result.ok) {
-    res.status(400).json(result);
-    return;
-  }
-  const state = getState();
-  broadcastState(state);
-  res.json(state);
-});
-
 app.post("/api/reproduce", (_req, res) => {
   const { colony } = getState();
   const result = reproduce(colony.id);
@@ -79,6 +69,31 @@ app.post("/api/command/move", (req, res) => {
   }
   for (const workerId of workerIds) {
     const error = issueMoveCommand(workerId, x, y);
+    if (error) {
+      res.status(400).json({ error });
+      return;
+    }
+  }
+  const state = getState();
+  broadcastState(state);
+  res.json(state);
+});
+
+// Preferred, and now only, gather entry point: issues a gather command that
+// travels toward the resource and claims it on arrival (see
+// simulation.ts). Replaces Stage 1's instant, transitional POST /api/gather.
+app.post("/api/command/gather", (req, res) => {
+  const { workerIds, resourceId } = req.body ?? {};
+  if (!Array.isArray(workerIds) || workerIds.length === 0 || !workerIds.every((id) => typeof id === "number")) {
+    res.status(400).json({ error: "workerIds must be a non-empty array of numbers" });
+    return;
+  }
+  if (typeof resourceId !== "number") {
+    res.status(400).json({ error: "resourceId is required" });
+    return;
+  }
+  for (const workerId of workerIds) {
+    const error = issueGatherCommand(workerId, resourceId);
     if (error) {
       res.status(400).json({ error });
       return;

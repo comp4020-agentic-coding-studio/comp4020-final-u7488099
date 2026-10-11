@@ -212,17 +212,18 @@ async function onNodeClick(nodeId: number): Promise<void> {
     statusEl.textContent = "Select a worker first.";
     return;
   }
-  const res = await fetch("/api/gather", {
+  const workerId = selectedWorkerId;
+  const res = await fetch("/api/command/gather", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ workerId: selectedWorkerId, nodeId }),
+    body: JSON.stringify({ workerIds: [workerId], resourceId: nodeId }),
   });
   const body = await res.json();
   if (!res.ok) {
     statusEl.textContent = body.error ?? "gather failed";
     return;
   }
-  statusEl.textContent = "Gathered!";
+  statusEl.textContent = `Worker #${workerId} is heading to the resource.`;
   setState(body);
 }
 
