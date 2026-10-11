@@ -49,6 +49,16 @@ export const REPRODUCE_COST = 50;
 
 export const WORKER_SPEED = 150; // world units per second
 
+// Stage 3: loose swarm spacing. MIN_SEPARATION is deliberately exactly
+// 2 * WORKER_RADIUS ("circles just touching") — the natural threshold for
+// "don't visually overlap", and also what keeps separation from firing at
+// the fixed 20-unit gap baked into spec/simulation.test.ts's "arrival" test
+// (separationDelta uses a strict `<` comparison). See CLAUDE.md.
+export const WORKER_RADIUS = 10;
+export const MIN_SEPARATION = WORKER_RADIUS * 2;
+export const SEPARATION_STRENGTH = 80; // world units/sec of push at full overlap, well under WORKER_SPEED
+export const GROUP_DESTINATION_SPACING = WORKER_RADIUS * 2;
+
 // Simulation cadence: ticking faster than it broadcasts is deliberate — the
 // authoritative position updates smoothly in memory even though clients only
 // see a new frame every BROADCAST_HZ. See CLAUDE.md.
