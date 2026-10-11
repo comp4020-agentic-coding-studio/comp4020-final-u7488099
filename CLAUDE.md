@@ -168,3 +168,55 @@ toward a commanded target. This changes where "the current state" lives.
   harness. `spec/realtime.test.ts` still uses real (short) wall-clock waits
   for its one movement-broadcast test, since that test's job is to confirm
   the production timer loop actually fires, not to check the movement math.
+
+## Stage 1c: gather is real travel, not an instant RPC
+
+`actions.ts`'s transitional `gather()` is gone. Gathering is now a command
+like move, issued via `POST /api/command/gather { workerIds, resourceId }`
+and resolved entirely inside `simulation.ts`'s tick loop — there is no
+synchronous "gather now" code path left anywhere.
+
+- **One movement implementation, not two.** A `gather` command steps toward
+  its target with the exact same per-tick code a `move` command uses; the
+  only differences are the arrival distance (`GATHER_RANGE` instead of
+  exactly zero) and what happens on arrival (`attemptGatherClaim` instead
+  of just going idle). Don't fork a separate "gather movement" function —
+  if gather ever needs to move differently from move, that's a deliberate
+  design change to call out, not something to drift into.
+- **Issuing a gather command never credits anything.** `issueGatherCommand`
+  only records the worker's intent and the resource's position at that
+  instant (`lastKnownX`/`lastKnownY`). The only place a claim is ever
+  attempted is `attemptGatherClaim`, called from `advanceSimulation` on
+  arrival. `spec/colony.test.ts` and `spec/realtime.test.ts` assert the
+  negative explicitly (no credit in the command's own HTTP response) as
+  well as the eventual credit.
+- **A claim re-reads the node, it never trusts a cached amount.** Another
+  worker's claim earlier in the very same tick may have just reduced or
+  deleted the row `attemptGatherClaim` is about to act on — see the
+  contested-claim test (E) in `spec/simulation.test.ts`. A claim is capped
+  at whatever's actually left, and a node is deleted once its amount hits
+  zero (`amount: null` nodes, like sugar, never deplete).
+- **A resource that vanishes before a worker arrives demotes the command to
+  a plain move toward its last-known position.** `advanceSimulation` checks
+  `findResourceNode` once per worker per tick, before moving it; if the
+  targeted row is gone, the command becomes `{ type: "move", ... }` at the
+  same coordinates and no further claim is attempted when it gets there —
+  see test G. This is what keeps a worker from getting stuck chasing a node
+  another worker just finished off.
+- **Processing order inside a tick is deterministic and load-bearing.**
+  `advanceSimulation` iterates the `workers` Map in insertion order, and
+  `loadSimulation` inserts rows `ORDER BY id` — so "whoever's processed
+  first wins a contested claim" is a real, reproducible rule, not a race.
+  Don't change the Map to something unordered, and don't parallelize this
+  loop.
+- **`spec/simulation.test.ts`'s gather tests register throwaway synthetic
+  workers** (ids well above the 3 seeded ones, via `registerWorker`)
+  positioned exactly on top of whichever node they're exercising, so a
+  claim can be forced in a single tick instead of waiting out real travel
+  time. These workers have no `workers` SQL row — harmless, since nothing
+  but `checkpointSimulation()` reads that table and these tests never call
+  it. `spec/colony.test.ts` and `spec/realtime.test.ts`, being black-box
+  HTTP tests, instead pick the *nearest* node of a type to a real seeded
+  worker (`closestNode`) to keep real travel time bounded, and poll
+  `GET /api/state` / wait on WebSocket frames for the resulting credit
+  rather than asserting on an immediate response.
