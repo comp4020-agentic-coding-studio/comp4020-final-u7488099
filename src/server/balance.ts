@@ -132,3 +132,26 @@ export const APHID_SEED_POSITIONS: { x: number; y: number }[] = [
   { x: WORLD.width * 0.5, y: WORLD.height * 0.33 },
   { x: WORLD.width * 0.33, y: WORLD.height * 0.63 },
 ];
+
+// Stage 6: creature health. Keyed by species so a future species needs only
+// a new map entry, not a schema change (health/maxHealth columns are
+// already species-agnostic). Placeholder value: a single worker kills an
+// aphid in 3 hits (~3s at WORKER_ATTACK_COOLDOWN=1s), fast enough that
+// realtime/death tests stay quick. Balancing isn't a priority this stage.
+export const APHID_MAX_HEALTH = 30;
+export const SPECIES_MAX_HEALTH: Record<string, number> = {
+  aphid: APHID_MAX_HEALTH,
+};
+
+// Protein credited to the colony's economy once a carcass is fully
+// harvested (split across however many gather claims it takes at
+// GATHER_YIELD per claim).
+export const APHID_PROTEIN_VALUE = 30;
+
+// Chosen comfortably above MIN_SEPARATION (20) so the separation force can
+// never prevent a worker reaching attack range — same scale as GATHER_RANGE
+// (30). Damage/cooldown are placeholders: APHID_MAX_HEALTH / WORKER_ATTACK_DAMAGE
+// hits to kill, WORKER_ATTACK_COOLDOWN seconds apart.
+export const WORKER_ATTACK_RANGE = 30;
+export const WORKER_ATTACK_DAMAGE = 10;
+export const WORKER_ATTACK_COOLDOWN = 1;
