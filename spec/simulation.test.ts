@@ -251,3 +251,83 @@ describe("gather: travel + claim", () => {
     expect(after.y).toBeCloseTo(proteinNode.y, 6);
   });
 });
+
+// Stage 2: group commands are just the same per-worker command issued to
+// several ids — there is no batch-aware code in simulation.ts itself (the
+// batch error contract lives in index.ts, covered in spec/colony.test.ts).
+// These tests use fresh synthetic ids (>= 10001) so they can't disturb any
+// test above, same reasoning as the gather block's ids >= 9001.
+describe("group commands", () => {
+  it("H: issuing the same move target to several workers advances all of them in one tick", () => {
+    const base = { x: 1000, y: 1000 };
+    const workers3 = [10001, 10002, 10003].map((id) => registerTestWorker(id, base.x, base.y + id));
+    const target = { x: base.x + 1000, y: base.y };
+
+    for (const w of workers3) expect(sim.issueMoveCommand(w.id, target.x, target.y)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    for (const w of workers3) {
+      const after = workerById(w.id);
+      expect(after.x).toBeGreaterThan(base.x);
+      expect(after.x).toBeLessThan(target.x);
+      expect(sim.getWorkerCommand(w.id)).toBe("move");
+    }
+  });
+
+  it("I: a second move command replaces the first — the retargeted worker changes course, others continue", () => {
+    // Both start on y=2000, same as firstTarget's y, so `b`'s motion is pure
+    // +x with exactly zero y drift for the whole test — a precise baseline
+    // to show `a` alone changed course.
+    const a = registerTestWorker(10004, 2000, 2000);
+    const b = registerTestWorker(10005, 2010, 2000);
+    const firstTarget = { x: 2500, y: 2000 };
+    const secondTarget = { x: 2000, y: 2500 };
+
+    expect(sim.issueMoveCommand(a.id, firstTarget.x, firstTarget.y)).toBeNull();
+    expect(sim.issueMoveCommand(b.id, firstTarget.x, firstTarget.y)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    // Retarget `a` mid-flight before it arrives; `b` keeps heading to firstTarget.
+    expect(sim.issueMoveCommand(a.id, secondTarget.x, secondTarget.y)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    const afterA = workerById(a.id);
+    const afterB = workerById(b.id);
+    // `a` moved toward secondTarget (y increased), not firstTarget (x increased further).
+    expect(afterA.y).toBeGreaterThan(2000);
+    expect(afterB.x).toBeGreaterThan(2010);
+    expect(afterB.y).toBe(2000);
+  });
+
+  it("J: several workers converging on an infinite node are each credited independently, no contention", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    const group = [10006, 10007, 10008].map((id) => registerTestWorker(id, sugarNode.x, sugarNode.y));
+    const before = resourceAmount("sugar");
+
+    for (const w of group) expect(sim.issueGatherCommand(w.id, sugarNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    expect(resourceAmount("sugar")).toBe(before + GATHER_YIELD * group.length);
+    for (const w of group) expect(sim.getWorkerCommand(w.id)).toBe("idle");
+  });
+
+  it("K: a group gathering a finite node credits exactly one claim, the rest demote with no extra credit", () => {
+    // By this point C/D/E/G above have consumed or depleted the other three
+    // seeded protein nodes — whichever one is left is fine; its own amount
+    // is overwritten below regardless of what it currently holds.
+    const [proteinNode] = findNodesByType("protein");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD, proteinNode.id);
+    const group = [10009, 10010, 10011].map((id, i) =>
+      registerTestWorker(id, proteinNode.x + i * 5, proteinNode.y),
+    );
+    const beforeColony = resourceAmount("protein");
+
+    for (const w of group) expect(sim.issueGatherCommand(w.id, proteinNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    // The node only had GATHER_YIELD left — exactly one claim can have landed.
+    expect(resourceAmount("protein")).toBe(beforeColony + GATHER_YIELD);
+    expect(nodeRow(proteinNode.id)).toBeUndefined();
+    for (const w of group) expect(sim.getWorkerCommand(w.id)).toBe("idle");
+  });
+});
