@@ -61,3 +61,54 @@ colony, gather, reproduce, SQLite persistence.
   stripping — see `tsconfig.json`'s comments). Only the client needs a
   build step (`pnpm build:client`, esbuild). Don't add a server build step
   or a `dist/server/` output; `CMD` runs `src/server/index.ts` directly.
+
+## Stage 1: continuous world, typed resources (post-Crit-9 game direction)
+
+Crit 8/9 shipped a 10x10 grid with one resource type ("food") and instant,
+non-spatial gather/reproduce. The project is moving toward an RTS-like
+persistent colony game, staged deliberately rather than rewritten in one
+pass. Stage 1 only replaces the *world and data model*: a continuous
+~3000x3000 world, three real resource types (`sugar`, `protein`, `biomass`)
+as rows in `resource_nodes` with their own `amount`/`max_amount`, and a
+`colony_resources` ledger keyed by type instead of one flat `protein`
+column. No movement, simulation tick, selection box, or carry/deposit
+economy yet — those are later stages.
+
+- **Worker commands are never persisted.** A worker's command (idle/move/
+  gather, added in a later stage) belongs only to in-memory simulation
+  state, never a SQLite column. In-flight commands are not meant to survive
+  a restart — only position (and, once a later stage adds it, carrying) is
+  durable. Don't add `command_type`/`command_target_*` columns to `workers`
+  without first revisiting this decision explicitly.
+- **`gather()` is still transitional.** `actions.ts`'s `gather()` is the
+  same instant, non-spatial Crit 8/9 RPC — it just now credits whichever
+  `colony_resources` bucket matches the clicked node's type instead of
+  always incrementing a single `protein` column. It doesn't move the
+  worker, claim the node, or touch the node's `amount`. A later stage
+  replaces this with real travel + claim + carry + deposit; don't read
+  more into today's `gather()` than "the old mechanic, type-aware."
+- **Seeding is deterministic, not random.** World size, starting worker
+  offsets, and every resource node's position/type/amount are fixed
+  constants in `balance.ts`, not randomised — a fresh seed is reproducible,
+  and so is a test run.
+- **The world renderer is Canvas 2D, not DOM-per-entity.** `public/
+  index.html` hosts one `<canvas>` for the queen/workers/resource nodes;
+  ordinary HTML still handles counters, the reproduce button, and
+  `/readme/`. Hit-testing (click-to-select, click-to-gather) happens in
+  world coordinates via the camera transform in `main.ts`, not per-entity
+  DOM listeners.
+- **Camera, no zoom.** `main.ts` keeps one `{ x, y }` camera panned by
+  WASD/arrow keys and mouse drag, clamped to the world bounds. Zoom is
+  explicitly deferred; don't add it without a specific reason to.
+- **Rendering snaps to the latest known state.** No client-side
+  interpolation between updates. If a future stage adds movement and the
+  resulting snap feels too choppy, interpolation is a deliberate separate
+  rendering change, not something to fold in quietly alongside it.
+- **Deployed-DB migration is a deliberate drop, not an ALTER TABLE.**
+  `db.ts` detects the pre-Stage-1 schema (a `colonies` table with no
+  `world_id` column) and drops `colonies`/`workers`/`resource_nodes` before
+  recreating and reseeding them. The Crit 8/9 demo colony's protein/worker
+  count is not preserved — it's throwaway demo state, not user data, and
+  wasn't worth an ALTER TABLE migration. This is a one-time transition;
+  don't repeat this drop-and-reseed pattern for later schema changes
+  without the same justification.
