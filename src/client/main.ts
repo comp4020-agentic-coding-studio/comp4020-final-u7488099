@@ -11,8 +11,9 @@ interface ColonyState {
     resourceType: string;
     amount: number | null;
     maxAmount: number | null;
+    kind: "source" | "item";
   }[];
-  creatures: { id: number; species: string; x: number; y: number }[];
+  creatures: { id: number; species: string; x: number; y: number; health: number; maxHealth: number }[];
 }
 
 const canvas = document.querySelector<HTMLCanvasElement>("#world")!;
@@ -85,6 +86,45 @@ function diamond(wx: number, wy: number, r: number, fill: string, stroke: string
   ctx.stroke();
 }
 
+// Stage 6: a carcass (resourceNodes entry with kind === "item") is drawn as
+// a dashed, differently-coloured circle instead of a node's usual solid
+// NODE_COLOR fill — distinct at a glance without a new drawing primitive.
+function drawResourceNode(node: ColonyState["resourceNodes"][number]): void {
+  const radius = NODE_RADIUS[node.resourceType] ?? 10;
+  if (node.kind !== "item") {
+    circle(node.x, node.y, radius, NODE_COLOR[node.resourceType] ?? "#a5d6a7", "#2e7d32");
+    return;
+  }
+  const [sx, sy] = worldToScreen(node.x, node.y);
+  if (sx < -radius || sy < -radius || sx > canvas.width + radius || sy > canvas.height + radius) return;
+  ctx.save();
+  ctx.setLineDash([4, 3]);
+  ctx.beginPath();
+  ctx.arc(sx, sy, radius, 0, Math.PI * 2);
+  ctx.fillStyle = "#6d4c41";
+  ctx.fill();
+  ctx.strokeStyle = "#3e2723";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Stage 6: shown only while a creature is damaged, so a world full of
+// full-health aphids stays visually quiet — placeholder graphics only, per
+// the brief (no art investment).
+function drawHealthBar(wx: number, wy: number, r: number, health: number, maxHealth: number): void {
+  if (health >= maxHealth) return;
+  const [sx, sy] = worldToScreen(wx, wy - r - 8);
+  const width = r * 2;
+  const height = 3;
+  ctx.save();
+  ctx.fillStyle = "rgba(0, 0, 0, 0.3)";
+  ctx.fillRect(sx - width / 2, sy, width, height);
+  ctx.fillStyle = "#e53935";
+  ctx.fillRect(sx - width / 2, sy, width * Math.max(0, health / maxHealth), height);
+  ctx.restore();
+}
+
 // Dashed ring, drawn on top of (not instead of) the worker's own circle, so
 // selection never changes a worker's actual rendered colour.
 function drawSelectionRing(wx: number, wy: number, r: number): void {
@@ -140,10 +180,11 @@ function draw(): void {
   if (!state) return;
 
   for (const node of state.resourceNodes) {
-    circle(node.x, node.y, NODE_RADIUS[node.resourceType] ?? 10, NODE_COLOR[node.resourceType] ?? "#a5d6a7", "#2e7d32");
+    drawResourceNode(node);
   }
   for (const creature of state.creatures) {
     diamond(creature.x, creature.y, APHID_RADIUS, "#7cb342", "#33691e");
+    drawHealthBar(creature.x, creature.y, APHID_RADIUS, creature.health, creature.maxHealth);
   }
   circle(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS, "#ffd54d", "#b8860b");
   for (const worker of state.workers) {
@@ -286,10 +327,16 @@ function selectWorkersInBox(a: [number, number], b: [number, number]): void {
       : "";
 }
 
-function hitTest(wx: number, wy: number): { kind: "worker" | "node"; id: number } | null {
+function hitTest(wx: number, wy: number): { kind: "worker" | "creature" | "node"; id: number } | null {
   if (!state) return null;
   for (const worker of state.workers) {
     if (Math.hypot(worker.x - wx, worker.y - wy) <= WORKER_RADIUS) return { kind: "worker", id: worker.id };
+  }
+  // Stage 6: creatures are clickable (not selectable) — checked before nodes
+  // so a click on an aphid standing over/near a resource node always hits
+  // the creature, never falls through to the node underneath it.
+  for (const creature of state.creatures) {
+    if (Math.hypot(creature.x - wx, creature.y - wy) <= APHID_RADIUS + 4) return { kind: "creature", id: creature.id };
   }
   for (const node of state.resourceNodes) {
     const r = NODE_RADIUS[node.resourceType] ?? 10;
@@ -315,6 +362,10 @@ function onCanvasClick(sx: number, sy: number): void {
     const worker = state?.workers.find((w) => w.id === hit.id);
     const carryingSuffix = worker?.carrying ? ` (carrying ${worker.carrying.amount} ${worker.carrying.resourceType})` : "";
     statusEl.textContent = `Worker #${hit.id} selected${carryingSuffix} — click a resource node to gather, or empty ground to move.`;
+    return;
+  }
+  if (hit.kind === "creature") {
+    onCreatureClick(hit.id);
     return;
   }
   onNodeClick(hit.id);
@@ -356,6 +407,29 @@ async function onNodeClick(nodeId: number): Promise<void> {
     return;
   }
   statusEl.textContent = describeBatchOutcome(workerIds.length, body.errors, "heading to the resource");
+  setState(body);
+}
+
+// Stage 6: mirrors onNodeClick's gather-dispatch shape exactly — same
+// selected-workers precondition, same describeBatchOutcome() call for
+// errors — just targeting a creature instead of a resource node.
+async function onCreatureClick(creatureId: number): Promise<void> {
+  const workerIds = [...selectedWorkerIds];
+  if (workerIds.length === 0) {
+    statusEl.textContent = "Select a worker first.";
+    return;
+  }
+  const res = await fetch("/api/command/attack", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds, creatureId }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    statusEl.textContent = body.error ?? "attack failed";
+    return;
+  }
+  statusEl.textContent = describeBatchOutcome(workerIds.length, body.errors, "attacking");
   setState(body);
 }
 
