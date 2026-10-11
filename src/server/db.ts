@@ -3,7 +3,9 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { RESOURCE_NODES, RESOURCE_TYPES, STARTING_WORKERS, WORLD } from "./balance.ts";
 
-const DB_PATH = existsSync("/data") ? "/data/colony.db" : "./.data/colony.db";
+// DB_PATH is overridable so isolated tests (spec/simulation.test.ts) can point
+// at a throwaway file instead of sharing the dev DB or the deployed volume.
+const DB_PATH = process.env.DB_PATH ?? (existsSync("/data") ? "/data/colony.db" : "./.data/colony.db");
 mkdirSync(dirname(DB_PATH), { recursive: true });
 
 export const db = new Database(DB_PATH);

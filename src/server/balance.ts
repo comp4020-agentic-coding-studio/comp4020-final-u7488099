@@ -39,3 +39,14 @@ export const RESOURCE_NODES: {
 
 export const GATHER_YIELD = 10;
 export const REPRODUCE_COST = 50;
+
+export const WORKER_SPEED = 150; // world units per second
+
+// Simulation cadence: ticking faster than it broadcasts is deliberate — the
+// authoritative position updates smoothly in memory even though clients only
+// see a new frame every BROADCAST_HZ. See CLAUDE.md.
+export const SIMULATION = {
+  tickHz: 10,
+  broadcastHz: 5,
+  checkpointIntervalMs: 5000,
+};
