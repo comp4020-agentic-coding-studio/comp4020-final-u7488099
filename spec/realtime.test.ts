@@ -46,7 +46,7 @@ it("pushes the updated state to an open connection when gather happens, with no 
     const mutated = await res.json();
 
     const message = await pushed;
-    expect(message.colony.protein).toBe(mutated.colony.protein);
+    expect(message.colony.resources[node.resourceType]).toBe(mutated.colony.resources[node.resourceType]);
   } finally {
     ws.close();
   }
@@ -70,28 +70,29 @@ it("broadcasts to every open connection, not just the one that caused the change
     ]);
     const mutated = await res.json();
 
-    expect(msgA.colony.protein).toBe(mutated.colony.protein);
-    expect(msgB.colony.protein).toBe(mutated.colony.protein);
+    expect(msgA.colony.resources[node.resourceType]).toBe(mutated.colony.resources[node.resourceType]);
+    expect(msgB.colony.resources[node.resourceType]).toBe(mutated.colony.resources[node.resourceType]);
   } finally {
     wsA.close();
     wsB.close();
   }
 });
 
-async function gatherUntil(targetProtein: number): Promise<void> {
+async function gatherProteinUntil(targetProtein: number): Promise<void> {
   let state = await getState();
-  while (state.colony.protein < targetProtein) {
+  const proteinNode = state.resourceNodes.find((n: any) => n.resourceType === "protein");
+  while (state.colony.resources.protein < targetProtein) {
     const res = await fetch(new URL("/api/gather", baseUrl), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workerId: state.workers[0].id, nodeId: state.resourceNodes[0].id }),
+      body: JSON.stringify({ workerId: state.workers[0].id, nodeId: proteinNode.id }),
     });
     state = await res.json();
   }
 }
 
 it("two simultaneous reproduce calls racing for the same protein: exactly one succeeds", async () => {
-  await gatherUntil(50);
+  await gatherProteinUntil(50);
   const before = await getState();
 
   const [resA, resB] = await Promise.all([
