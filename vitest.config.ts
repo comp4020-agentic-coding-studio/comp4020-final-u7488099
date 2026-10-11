@@ -25,5 +25,9 @@ export default defineConfig({
     // parallel workers would make both flaky, so files run one at a time.
     fileParallelism: false,
     sequence: { sequencer: PathOrderSequencer },
+    // Stage 1c's gather is real travel over real wall-clock time (black-box
+    // tests can't fast-forward the production timer loop) — the 5s default
+    // isn't enough for a worker to walk to a resource and claim it.
+    testTimeout: 30000,
   },
 });

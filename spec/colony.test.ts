@@ -13,10 +13,24 @@ async function getState() {
   return res.json();
 }
 
-function findNode(state: any, resourceType: string) {
-  const node = state.resourceNodes.find((n: any) => n.resourceType === resourceType);
-  if (!node) throw new Error(`seed has no ${resourceType} node`);
-  return node;
+// Picks the nearest node of a type to a given worker, so travel-based tests
+// don't wait on a trip across the whole 3000x3000 world.
+function closestNode(state: any, worker: any, resourceType: string) {
+  const nodes = state.resourceNodes.filter((n: any) => n.resourceType === resourceType);
+  if (nodes.length === 0) throw new Error(`seed has no ${resourceType} node`);
+  return nodes.reduce((best: any, n: any) =>
+    Math.hypot(n.x - worker.x, n.y - worker.y) < Math.hypot(best.x - worker.x, best.y - worker.y) ? n : best,
+  );
+}
+
+async function waitForResourceIncrease(resourceType: string, baseline: number, timeoutMs = 15000): Promise<any> {
+  const deadline = Date.now() + timeoutMs;
+  let state = await getState();
+  while (state.colony.resources[resourceType] <= baseline && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 200));
+    state = await getState();
+  }
+  return state;
 }
 
 it("seeds a large continuous world with one colony, 3 workers near the queen, and several resource types", async () => {
@@ -54,46 +68,60 @@ it("seeds a large continuous world with one colony, 3 workers near the queen, an
   }
 });
 
-it("gathering credits the colony's bucket matching the clicked node's resource type (transitional, pre-travel)", async () => {
+it("gathering requires travel: no instant credit on issue, then the clicked node's resource type is credited on arrival", async () => {
   const before = await getState();
   const worker = before.workers[0];
-  const node = findNode(before, "biomass");
+  const node = closestNode(before, worker, "sugar");
 
-  const res = await fetch(new URL("/api/gather", baseUrl), {
+  const res = await fetch(new URL("/api/command/gather", baseUrl), {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ workerId: worker.id, nodeId: node.id }),
+    body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
   });
   expect(res.status).toBe(200);
-  const after = await res.json();
+  const justIssued = await res.json();
+  // Issuing the command only starts travel — it must not credit anything yet.
+  expect(justIssued.colony.resources.sugar).toBe(before.colony.resources.sugar);
 
-  expect(after.colony.resources.biomass).toBeGreaterThan(before.colony.resources.biomass);
-  expect(after.colony.resources.sugar).toBe(before.colony.resources.sugar);
+  const after = await waitForResourceIncrease("sugar", before.colony.resources.sugar);
+  expect(after.colony.resources.sugar).toBeGreaterThan(before.colony.resources.sugar);
   expect(after.colony.resources.protein).toBe(before.colony.resources.protein);
+  expect(after.colony.resources.biomass).toBe(before.colony.resources.biomass);
 
   const refetched = await getState();
-  expect(refetched.colony.resources.biomass).toBe(after.colony.resources.biomass);
+  expect(refetched.colony.resources.sugar).toBe(after.colony.resources.sugar);
 });
 
-it("rejects gather from a worker or node that doesn't exist", async () => {
-  const res = await fetch(new URL("/api/gather", baseUrl), {
+it("rejects a gather command for a worker or resource that doesn't exist, with no instant credit either way", async () => {
+  const before = await getState();
+  const res = await fetch(new URL("/api/command/gather", baseUrl), {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ workerId: 999999, nodeId: 999999 }),
+    body: JSON.stringify({ workerIds: [999999], resourceId: 999999 }),
   });
   expect(res.status).toBe(400);
+
+  const after = await getState();
+  expect(after.colony.resources).toEqual(before.colony.resources);
 });
 
 async function gatherProteinUntil(targetProtein: number): Promise<void> {
   let state = await getState();
-  const proteinNode = findNode(state, "protein");
-  while (state.colony.resources.protein < targetProtein) {
-    const res = await fetch(new URL("/api/gather", baseUrl), {
+  const workerId = state.workers[0].id;
+  const deadline = Date.now() + 30000;
+  while (state.colony.resources.protein < targetProtein && Date.now() < deadline) {
+    const worker = state.workers.find((w: any) => w.id === workerId);
+    const node = closestNode(state, worker, "protein");
+    await fetch(new URL("/api/command/gather", baseUrl), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workerId: state.workers[0].id, nodeId: proteinNode.id }),
+      body: JSON.stringify({ workerIds: [workerId], resourceId: node.id }),
     });
-    state = await res.json();
+    await new Promise((r) => setTimeout(r, 250));
+    state = await getState();
+  }
+  if (state.colony.resources.protein < targetProtein) {
+    throw new Error(`gatherProteinUntil(${targetProtein}) timed out at ${state.colony.resources.protein}`);
   }
 }
 

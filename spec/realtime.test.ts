@@ -29,24 +29,50 @@ function nextMessage(ws: WebSocket, timeoutMs = 2000): Promise<any> {
   });
 }
 
-it("pushes the updated state to an open connection when gather happens, with no reload", async () => {
+// Picks the nearest node of a type to a given worker, so travel-based tests
+// don't wait on a trip across the whole 3000x3000 world.
+function closestNode(state: any, worker: any, resourceType: string) {
+  const nodes = state.resourceNodes.filter((n: any) => n.resourceType === resourceType);
+  if (nodes.length === 0) throw new Error(`seed has no ${resourceType} node`);
+  return nodes.reduce((best: any, n: any) =>
+    Math.hypot(n.x - worker.x, n.y - worker.y) < Math.hypot(best.x - worker.x, best.y - worker.y) ? n : best,
+  );
+}
+
+// Waits on a sequence of broadcast frames until one shows the given resource
+// above its baseline — a gather command only credits on arrival, so the
+// immediate post-command frame(s) won't show it yet.
+async function waitForResourceIncreaseOnSocket(
+  ws: WebSocket,
+  resourceType: string,
+  baseline: number,
+  timeoutMs = 15000,
+): Promise<any> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const message = await nextMessage(ws, Math.max(timeoutMs, 1));
+    if (message.colony.resources[resourceType] > baseline) return message;
+  }
+  throw new Error(`no broadcast showed ${resourceType} above ${baseline} within ${timeoutMs}ms`);
+}
+
+it("pushes the updated resources to an open connection when a gather command completes, with no reload", async () => {
   const before = await getState();
   const worker = before.workers[0];
-  const node = before.resourceNodes[0];
+  const node = closestNode(before, worker, "sugar");
 
   const ws = await connect();
   try {
-    const pushed = nextMessage(ws);
-    const res = await fetch(new URL("/api/gather", baseUrl), {
+    const res = await fetch(new URL("/api/command/gather", baseUrl), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workerId: worker.id, nodeId: node.id }),
+      body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
     });
     expect(res.status).toBe(200);
-    const mutated = await res.json();
 
-    const message = await pushed;
-    expect(message.colony.resources[node.resourceType]).toBe(mutated.colony.resources[node.resourceType]);
+    const message = await waitForResourceIncreaseOnSocket(ws, "sugar", before.colony.resources.sugar);
+    const after = await getState();
+    expect(message.colony.resources.sugar).toBe(after.colony.resources.sugar);
   } finally {
     ws.close();
   }
@@ -56,22 +82,22 @@ it("broadcasts to every open connection, not just the one that caused the change
   const [wsA, wsB] = await Promise.all([connect(), connect()]);
   try {
     const before = await getState();
-    const worker = before.workers[0];
-    const node = before.resourceNodes[0];
+    const worker = before.workers[1];
+    const node = closestNode(before, worker, "sugar");
 
-    const [msgA, msgB, res] = await Promise.all([
-      nextMessage(wsA),
-      nextMessage(wsB),
-      fetch(new URL("/api/gather", baseUrl), {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ workerId: worker.id, nodeId: node.id }),
-      }),
+    const res = await fetch(new URL("/api/command/gather", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
+    });
+    expect(res.status).toBe(200);
+
+    const [msgA, msgB] = await Promise.all([
+      waitForResourceIncreaseOnSocket(wsA, "sugar", before.colony.resources.sugar),
+      waitForResourceIncreaseOnSocket(wsB, "sugar", before.colony.resources.sugar),
     ]);
-    const mutated = await res.json();
 
-    expect(msgA.colony.resources[node.resourceType]).toBe(mutated.colony.resources[node.resourceType]);
-    expect(msgB.colony.resources[node.resourceType]).toBe(mutated.colony.resources[node.resourceType]);
+    expect(msgA.colony.resources.sugar).toBe(msgB.colony.resources.sugar);
   } finally {
     wsA.close();
     wsB.close();
@@ -110,14 +136,21 @@ it("worker movement is broadcast to open WebSocket clients without a reload", as
 
 async function gatherProteinUntil(targetProtein: number): Promise<void> {
   let state = await getState();
-  const proteinNode = state.resourceNodes.find((n: any) => n.resourceType === "protein");
-  while (state.colony.resources.protein < targetProtein) {
-    const res = await fetch(new URL("/api/gather", baseUrl), {
+  const workerId = state.workers[0].id;
+  const deadline = Date.now() + 30000;
+  while (state.colony.resources.protein < targetProtein && Date.now() < deadline) {
+    const worker = state.workers.find((w: any) => w.id === workerId);
+    const node = closestNode(state, worker, "protein");
+    await fetch(new URL("/api/command/gather", baseUrl), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workerId: state.workers[0].id, nodeId: proteinNode.id }),
+      body: JSON.stringify({ workerIds: [workerId], resourceId: node.id }),
     });
-    state = await res.json();
+    await new Promise((r) => setTimeout(r, 250));
+    state = await getState();
+  }
+  if (state.colony.resources.protein < targetProtein) {
+    throw new Error(`gatherProteinUntil(${targetProtein}) timed out at ${state.colony.resources.protein}`);
   }
 }
 

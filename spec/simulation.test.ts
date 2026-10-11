@@ -20,7 +20,7 @@ process.env.DB_PATH = DB_PATH;
 // before db.ts's module-level `new Database(DB_PATH)` runs.
 const { db } = await import("../src/server/db.ts");
 const sim = await import("../src/server/simulation.ts");
-const { SIMULATION } = await import("../src/server/balance.ts");
+const { SIMULATION, GATHER_YIELD } = await import("../src/server/balance.ts");
 
 const TICK_DT = 1 / SIMULATION.tickHz;
 
@@ -31,6 +31,36 @@ function workerById(id: number) {
   const found = sim.getWorkersForColony(colony.id).find((w) => w.id === id);
   if (!found) throw new Error(`no such worker in sim state: ${id}`);
   return found;
+}
+
+// Stage 1c gather tests register their own synthetic workers (ids well above
+// the 3 seeded ones) positioned right on top of whichever node they're
+// exercising — that's what lets a test force an arrival in a single tick
+// instead of waiting out real travel time. These never get a `workers` SQL
+// row, which is fine: nothing but checkpointSimulation() reads that table,
+// and these tests never call it.
+function registerTestWorker(id: number, x: number, y: number) {
+  sim.registerWorker({ id, colonyId: colony.id, x, y });
+  return workerById(id);
+}
+
+function resourceAmount(resourceType: string): number {
+  const row = db
+    .prepare("SELECT amount FROM colony_resources WHERE colony_id = ? AND resource_type = ?")
+    .get(colony.id, resourceType) as { amount: number };
+  return row.amount;
+}
+
+function nodeRow(id: number): { id: number; x: number; y: number; amount: number | null } | undefined {
+  return db.prepare("SELECT id, x, y, amount FROM resource_nodes WHERE id = ?").get(id) as
+    | { id: number; x: number; y: number; amount: number | null }
+    | undefined;
+}
+
+function findNodesByType(resourceType: string): { id: number; x: number; y: number; amount: number | null }[] {
+  return db.prepare("SELECT id, x, y, amount FROM resource_nodes WHERE resource_type = ? ORDER BY id").all(
+    resourceType,
+  ) as { id: number; x: number; y: number; amount: number | null }[];
 }
 
 beforeAll(() => {
@@ -112,5 +142,112 @@ describe("checkpoint persistence", () => {
     expect(restored.x).toBeCloseTo(midFlight.x, 6);
     expect(restored.y).toBeCloseTo(midFlight.y, 6);
     expect(sim.getWorkerCommand(worker.id)).toBe("idle");
+  });
+});
+
+// Stage 1c: runs last, deliberately. loadSimulation() above already reset
+// every worker to idle from a checkpoint, but these tests register their own
+// synthetic workers anyway (see registerTestWorker) — placing this block
+// after every other describe() means its many extra advanceSimulation calls
+// (test G alone advances 200 ticks) can never finish off some *other* test's
+// still-in-flight real worker out from under it, the way inserting this
+// block earlier once did to the checkpoint-persistence test above.
+describe("gather: travel + claim", () => {
+  it("A: issuing a gather command starts travel without crediting anything instantly", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    const worker = registerTestWorker(9001, sugarNode.x - 500, sugarNode.y);
+    const before = resourceAmount("sugar");
+
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBeNull();
+
+    expect(sim.getWorkerCommand(worker.id)).toBe("gather");
+    expect(resourceAmount("sugar")).toBe(before);
+  });
+
+  it("B: arriving at an infinite node credits GATHER_YIELD and leaves its amount at null", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    const worker = registerTestWorker(9002, sugarNode.x, sugarNode.y);
+    const before = resourceAmount("sugar");
+
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    expect(resourceAmount("sugar")).toBe(before + GATHER_YIELD);
+    expect(sim.getWorkerCommand(worker.id)).toBe("idle");
+    expect(nodeRow(sugarNode.id)?.amount).toBeNull();
+  });
+
+  it("C: arriving at a finite node credits GATHER_YIELD and decrements its remaining amount", () => {
+    const [proteinNode] = findNodesByType("protein");
+    const worker = registerTestWorker(9003, proteinNode.x, proteinNode.y);
+    const beforeColony = resourceAmount("protein");
+    const beforeNode = nodeRow(proteinNode.id)!.amount!;
+
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    expect(resourceAmount("protein")).toBe(beforeColony + GATHER_YIELD);
+    expect(nodeRow(proteinNode.id)?.amount).toBe(beforeNode - GATHER_YIELD);
+  });
+
+  it("D: a claim is capped at whatever's left, and the node is deleted once exhausted", () => {
+    const [, proteinNode] = findNodesByType("protein");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(4, proteinNode.id);
+    const worker = registerTestWorker(9004, proteinNode.x, proteinNode.y);
+    const beforeColony = resourceAmount("protein");
+
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    expect(resourceAmount("protein")).toBe(beforeColony + 4);
+    expect(nodeRow(proteinNode.id)).toBeUndefined();
+  });
+
+  it("E: a node claimed by another worker earlier in the same tick isn't double-credited", () => {
+    const [, , proteinNode] = findNodesByType("protein");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD, proteinNode.id);
+    // Registered (and so processed by advanceSimulation) in this order, so
+    // `first`'s claim always lands before `second` is even considered.
+    const first = registerTestWorker(9005, proteinNode.x, proteinNode.y);
+    const second = registerTestWorker(9006, proteinNode.x + 5, proteinNode.y);
+    const beforeColony = resourceAmount("protein");
+
+    expect(sim.issueGatherCommand(first.id, proteinNode.id)).toBeNull();
+    expect(sim.issueGatherCommand(second.id, proteinNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    // The node only had GATHER_YIELD left — exactly one claim can have landed.
+    expect(resourceAmount("protein")).toBe(beforeColony + GATHER_YIELD);
+    expect(nodeRow(proteinNode.id)).toBeUndefined();
+    expect(sim.getWorkerCommand(second.id)).toBe("idle");
+  });
+
+  it("F: rejects a gather command for a worker or resource node that doesn't exist", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    expect(sim.issueGatherCommand(999999, sugarNode.id)).toBe("no such worker");
+
+    const worker = registerTestWorker(9007, 0, 0);
+    expect(sim.issueGatherCommand(worker.id, 999999)).toBe("no such resource node");
+  });
+
+  it("G: a node that disappears mid-flight redirects the worker to its last-known position instead of crediting anything", () => {
+    // Pick one of the two full-amount protein nodes the D/E tests above
+    // haven't touched yet (those deplete/delete whichever nodes they pick).
+    const proteinNode = findNodesByType("protein").find((n) => n.amount === 200)!;
+    const worker = registerTestWorker(9008, proteinNode.x - 1000, proteinNode.y);
+    const beforeColony = resourceAmount("protein");
+
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT); // mid-flight, resource still exists
+
+    db.prepare("DELETE FROM resource_nodes WHERE id = ?").run(proteinNode.id);
+
+    for (let i = 0; i < 200; i++) sim.advanceSimulation(TICK_DT); // plenty to cover ~1000 units at WORKER_SPEED
+
+    expect(sim.getWorkerCommand(worker.id)).toBe("idle");
+    expect(resourceAmount("protein")).toBe(beforeColony);
+    const after = workerById(worker.id);
+    expect(after.x).toBeCloseTo(proteinNode.x, 6);
+    expect(after.y).toBeCloseTo(proteinNode.y, 6);
   });
 });
