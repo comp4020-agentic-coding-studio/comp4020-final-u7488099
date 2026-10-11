@@ -6,6 +6,7 @@ import { SIMULATION } from "./balance.ts";
 import {
   advanceSimulation,
   checkpointSimulation,
+  computeGroupDestinations,
   consumeDirty,
   issueGatherCommand,
   issueMoveCommand,
@@ -92,7 +93,15 @@ app.post("/api/command/move", (req, res) => {
     res.status(400).json({ error: "x and y are required" });
     return;
   }
-  runBatchCommand(res, workerIds, (workerId) => issueMoveCommand(workerId, x, y));
+  // Stage 3: the clicked point is the centre of a loose destination area,
+  // not a shared exact target — each worker gets its own nearby slot (a
+  // lone worker's slot is the exact centre, unchanged from Stage 2). See
+  // simulation.ts.
+  const destinations = computeGroupDestinations(workerIds, x, y);
+  runBatchCommand(res, workerIds, (workerId) => {
+    const destination = destinations.get(workerId)!;
+    return issueMoveCommand(workerId, destination.x, destination.y);
+  });
 });
 
 // Preferred, and now only, gather entry point: issues a gather command that
