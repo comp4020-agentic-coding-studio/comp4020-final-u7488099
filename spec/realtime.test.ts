@@ -134,6 +134,45 @@ it("worker movement is broadcast to open WebSocket clients without a reload", as
   }
 });
 
+it("a group move command broadcasts one frame reflecting every moved worker to every open connection", async () => {
+  const before = await getState();
+  const movers = before.workers.slice(0, 2);
+  const target = { x: Math.min(before.world.width - 10, before.colony.queenX + 400), y: before.colony.queenY };
+
+  const [wsA, wsB] = await Promise.all([connect(), connect()]);
+  try {
+    const res = await fetch(new URL("/api/command/move", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerIds: movers.map((w: any) => w.id), x: target.x, y: target.y }),
+    });
+    expect(res.status).toBe(200);
+
+    async function waitForBothMoved(ws: WebSocket): Promise<any> {
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        const message = await nextMessage(ws, 3000);
+        const stillMoved = movers.every((w: any) => {
+          const current = message.workers.find((c: any) => c.id === w.id);
+          return current && (current.x !== w.x || current.y !== w.y);
+        });
+        if (stillMoved) return message;
+      }
+      throw new Error("no broadcast frame showed both movers having moved");
+    }
+
+    const [msgA, msgB] = await Promise.all([waitForBothMoved(wsA), waitForBothMoved(wsB)]);
+    for (const w of movers) {
+      const a = msgA.workers.find((c: any) => c.id === w.id);
+      const b = msgB.workers.find((c: any) => c.id === w.id);
+      expect(a).toEqual(b);
+    }
+  } finally {
+    wsA.close();
+    wsB.close();
+  }
+});
+
 async function gatherProteinUntil(targetProtein: number): Promise<void> {
   let state = await getState();
   const workerId = state.workers[0].id;
