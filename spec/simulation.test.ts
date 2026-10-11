@@ -30,6 +30,11 @@ const {
   BIOMASS_REGEN_RATE,
   APHID_SEED_POSITIONS,
   APHID_IDLE_MAX,
+  APHID_MAX_HEALTH,
+  APHID_PROTEIN_VALUE,
+  WORKER_ATTACK_RANGE,
+  WORKER_ATTACK_DAMAGE,
+  WORKER_ATTACK_COOLDOWN,
 } = await import("../src/server/balance.ts");
 
 const TICK_DT = 1 / SIMULATION.tickHz;
@@ -73,10 +78,14 @@ function nodeRow(id: number): { id: number; x: number; y: number; amount: number
 
 function fullNodeRow(
   id: number,
-): { id: number; resourceType: string; amount: number | null; maxAmount: number | null } | undefined {
+): { id: number; resourceType: string; amount: number | null; maxAmount: number | null; kind: string } | undefined {
   return db
-    .prepare("SELECT id, resource_type AS resourceType, amount, max_amount AS maxAmount FROM resource_nodes WHERE id = ?")
-    .get(id) as { id: number; resourceType: string; amount: number | null; maxAmount: number | null } | undefined;
+    .prepare(
+      "SELECT id, resource_type AS resourceType, amount, max_amount AS maxAmount, kind FROM resource_nodes WHERE id = ?",
+    )
+    .get(id) as
+    | { id: number; resourceType: string; amount: number | null; maxAmount: number | null; kind: string }
+    | undefined;
 }
 
 function findNodesByType(resourceType: string): { id: number; x: number; y: number; amount: number | null }[] {
@@ -97,6 +106,33 @@ function insertNode(x: number, y: number, resourceType: string, amount: number |
   const { lastInsertRowid } = db
     .prepare("INSERT INTO resource_nodes (world_id, x, y, resource_type, amount, max_amount) VALUES (?, ?, ?, ?, ?, ?)")
     .run(worldRow.id, x, y, resourceType, amount, amount);
+  return Number(lastInsertRowid);
+}
+
+function creatureById(id: number) {
+  const found = sim.getCreaturesForWorld(world.id).find((c) => c.id === id);
+  if (!found) throw new Error(`no such creature in sim state: ${id}`);
+  return found;
+}
+
+// Directly mutates durable health then reloads so the in-memory creatures Map
+// picks it up — loadSimulation() is the only way to refresh that cache. Must
+// be called before registerTestWorker() in a test, never after: a synthetic
+// worker only exists in-memory and loadSimulation() would silently erase it
+// (see Stage 4's note in CLAUDE.md).
+function setCreatureHealth(id: number, health: number): void {
+  db.prepare("UPDATE creatures SET health = ? WHERE id = ?").run(health, id);
+  sim.loadSimulation();
+}
+
+// Inserts a creature row directly (for tests that need two creatures at
+// specific, controlled positions rather than relying on seeded aphid
+// geometry). Same ordering caveat as setCreatureHealth: call before
+// registering any synthetic test workers.
+function insertCreature(x: number, y: number, health = APHID_MAX_HEALTH): number {
+  const { lastInsertRowid } = db
+    .prepare("INSERT INTO creatures (world_id, species, x, y, health, max_health) VALUES (?, 'aphid', ?, ?, ?, ?)")
+    .run(world.id, x, y, health, health);
   return Number(lastInsertRowid);
 }
 
@@ -792,5 +828,313 @@ describe("Stage 5: aphid seed + wandering", () => {
       if (current.x !== afterReload.x || current.y !== afterReload.y) moved = true;
     }
     expect(moved).toBe(true);
+  });
+});
+
+describe("Stage 6: hunting, combat, carcasses", () => {
+  it("A: issueAttackCommand validates the worker and the creature independently", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    const worker = registerTestWorker(13001, creature.x, creature.y);
+
+    expect(sim.issueAttackCommand(999999, creature.id)).toBe("no such worker");
+    expect(sim.issueAttackCommand(worker.id, 999999)).toBe("no such creature");
+    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    expect(sim.getWorkerCommand(worker.id)).toBe("attack");
+  });
+
+  it("B: a carrying worker rejects an attack command and keeps returning", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    const worker = registerTestWorker(13002, sugarNode.x, sugarNode.y);
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+    expect(workerById(worker.id).carrying).not.toBeNull();
+
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    expect(sim.issueAttackCommand(worker.id, creature.id)).toBe("worker is busy returning resources");
+    expect(sim.getWorkerCommand(worker.id)).toBe("return");
+  });
+
+  it("C: chases the creature's live position every tick, not where it was when the command was issued", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    const startX = creature.x;
+    const startY = creature.y;
+    const worker = registerTestWorker(13003, creature.x + 2000, creature.y);
+    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+
+    // Stop as soon as the worker first reaches attack range, rather than
+    // running a fixed number of ticks — once in range, cooldown-gated hits
+    // start landing and a long-enough fixed loop would let the (only 30 HP)
+    // aphid die before we ever assert on it.
+    let inRange = false;
+    for (let i = 0; i < 300 && !inRange; i++) {
+      sim.advanceSimulation(TICK_DT);
+      const live = creatureById(creature.id);
+      const w = workerById(worker.id);
+      inRange = Math.hypot(w.x - live.x, w.y - live.y) <= WORKER_ATTACK_RANGE + 1e-6;
+    }
+    expect(inRange).toBe(true);
+
+    const liveCreature = creatureById(creature.id);
+    const after = workerById(worker.id);
+    const dist = Math.hypot(after.x - liveCreature.x, after.y - liveCreature.y);
+    expect(dist).toBeLessThanOrEqual(WORKER_ATTACK_RANGE + 1e-6);
+    // The aphid actually moved from its start — otherwise this would pass
+    // trivially even with stale (command-issue-time) targeting.
+    expect(liveCreature.x !== startX || liveCreature.y !== startY).toBe(true);
+  });
+
+  it("D: closes to within attack range without overshooting past the creature", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    const worker = registerTestWorker(13004, creature.x - (WORKER_ATTACK_RANGE + 50), creature.y);
+    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+
+    // Exactly 10 ticks = 1 second = the aphid's idle period, so it hasn't
+    // started wandering yet and this geometry stays exact.
+    for (let i = 0; i < 10; i++) sim.advanceSimulation(TICK_DT);
+
+    const after = workerById(worker.id);
+    const dist = Math.hypot(after.x - creature.x, after.y - creature.y);
+    expect(dist).toBeLessThanOrEqual(WORKER_ATTACK_RANGE + 1e-6);
+    expect(dist).toBeGreaterThan(WORKER_ATTACK_RANGE - 5);
+  });
+
+  it("E: cooldown gates how often damage lands", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    const worker = registerTestWorker(13005, creature.x, creature.y);
+    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+
+    sim.advanceSimulation(TICK_DT); // first hit lands immediately — cooldownRemaining starts at 0
+    const afterFirstHit = creatureById(creature.id).health;
+    expect(afterFirstHit).toBe(creature.health - WORKER_ATTACK_DAMAGE);
+
+    sim.advanceSimulation(TICK_DT); // well within the 1s cooldown
+    expect(creatureById(creature.id).health).toBe(afterFirstHit);
+
+    for (let i = 0; i < 15; i++) sim.advanceSimulation(TICK_DT); // clears the cooldown, lands exactly one more hit
+    expect(creatureById(creature.id).health).toBe(afterFirstHit - WORKER_ATTACK_DAMAGE);
+  });
+
+  it("F: two workers attacking the same creature both land hits in the same tick", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    const a = registerTestWorker(13006, creature.x, creature.y);
+    const b = registerTestWorker(13007, creature.x + 5, creature.y);
+    expect(sim.issueAttackCommand(a.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(b.id, creature.id)).toBeNull();
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(creatureById(creature.id).health).toBe(creature.health - 2 * WORKER_ATTACK_DAMAGE);
+  });
+
+  it("G: damaged health persists through loadSimulation", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    const worker = registerTestWorker(13008, creature.x, creature.y);
+    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+    const damagedHealth = creatureById(creature.id).health;
+    expect(damagedHealth).toBeLessThan(creature.maxHealth);
+
+    sim.loadSimulation(); // health is written synchronously on hit — no checkpoint needed
+
+    const reloaded = creatureById(creature.id);
+    expect(reloaded.health).toBe(damagedHealth);
+    expect(reloaded.maxHealth).toBe(creature.maxHealth);
+  });
+
+  it("H: death removes the creature and creates exactly one carcass at its position", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    setCreatureHealth(creature.id, WORKER_ATTACK_DAMAGE); // dies in exactly one hit
+    const worker = registerTestWorker(13009, creature.x, creature.y);
+    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreaturesForWorld(world.id).some((c) => c.id === creature.id)).toBe(false);
+    const carcasses = db
+      .prepare(
+        "SELECT id, x, y, resource_type AS resourceType, amount, max_amount AS maxAmount, kind " +
+          "FROM resource_nodes WHERE kind = 'item'",
+      )
+      .all() as { id: number; x: number; y: number; resourceType: string; amount: number; maxAmount: number; kind: string }[];
+    expect(carcasses).toHaveLength(1);
+    expect(carcasses[0]).toMatchObject({
+      x: creature.x,
+      y: creature.y,
+      resourceType: "protein",
+      amount: APHID_PROTEIN_VALUE,
+      maxAmount: APHID_PROTEIN_VALUE,
+      kind: "item",
+    });
+  });
+
+  it("I: the death transaction leaves no partial state in the DB — creature gone, carcass exactly once", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    setCreatureHealth(creature.id, WORKER_ATTACK_DAMAGE);
+    const worker = registerTestWorker(13010, creature.x, creature.y);
+    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect((db.prepare("SELECT COUNT(*) AS n FROM creatures WHERE id = ?").get(creature.id) as { n: number }).n).toBe(
+      0,
+    );
+    expect((db.prepare("SELECT COUNT(*) AS n FROM resource_nodes WHERE kind = 'item'").get() as { n: number }).n).toBe(
+      1,
+    );
+  });
+
+  it("J: a carcass depletes like any finite node, never regenerates, and deletes once fully claimed", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    setCreatureHealth(creature.id, WORKER_ATTACK_DAMAGE);
+    const worker = registerTestWorker(13011, creature.x, creature.y);
+    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT); // kill lands, carcass created
+
+    const carcass = db.prepare("SELECT id FROM resource_nodes WHERE kind = 'item'").get() as { id: number };
+    expect(fullNodeRow(carcass.id)?.amount).toBe(APHID_PROTEIN_VALUE);
+
+    sim.advanceSimulation(1000); // plenty of time — protein is not in RESOURCE_REGEN_RATES
+    expect(fullNodeRow(carcass.id)?.amount).toBe(APHID_PROTEIN_VALUE);
+
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD, carcass.id);
+    const gatherer = registerTestWorker(13012, creature.x, creature.y);
+    expect(sim.issueGatherCommand(gatherer.id, carcass.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    expect(nodeRow(carcass.id)).toBeUndefined(); // deleted once fully claimed, same as any finite node
+  });
+
+  it("K: harvesting a carcass credits protein only after deposit, exactly like any protein node", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    setCreatureHealth(creature.id, WORKER_ATTACK_DAMAGE);
+    const queen = queenPosition();
+    db.prepare("UPDATE creatures SET x = ?, y = ? WHERE id = ?").run(queen.x + 20, queen.y, creature.id);
+    sim.loadSimulation();
+    const liveCreature = creatureById(creature.id);
+    const worker = registerTestWorker(13013, liveCreature.x, liveCreature.y);
+    expect(sim.issueAttackCommand(worker.id, liveCreature.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT); // kill lands; worker goes idle; carcass appears next to the queen
+
+    const beforeColony = resourceAmount("protein");
+    const carcass = db.prepare("SELECT id FROM resource_nodes WHERE kind = 'item'").get() as { id: number };
+    expect(sim.issueGatherCommand(worker.id, carcass.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT); // claim resolves: carrying set, command becomes return
+    expect(resourceAmount("protein")).toBe(beforeColony); // claiming alone never credits
+
+    sim.advanceSimulation(TICK_DT); // already in deposit range of the queen -> deposits
+    expect(resourceAmount("protein")).toBe(beforeColony + GATHER_YIELD);
+    expect(workerById(worker.id).carrying).toBeNull();
+  });
+
+  it("L: every attacker goes idle in place after a kill — no auto-gather, no auto-retarget", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    setCreatureHealth(creature.id, WORKER_ATTACK_DAMAGE);
+    const a = registerTestWorker(13014, creature.x, creature.y);
+    // Far enough from `a` that the separation system (which runs for every
+    // worker every tick, idle or not) has no effect on either once they go
+    // idle — otherwise two idle workers standing within MIN_SEPARATION of
+    // each other legitimately drift apart, which isn't what this test is
+    // checking for. Still within WORKER_ATTACK_RANGE of the creature.
+    const b = registerTestWorker(13015, creature.x, creature.y + 25);
+    expect(sim.issueAttackCommand(a.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(b.id, creature.id)).toBeNull();
+
+    sim.advanceSimulation(TICK_DT); // kill lands
+
+    expect(sim.getWorkerCommand(a.id)).toBe("idle");
+    expect(sim.getWorkerCommand(b.id)).toBe("idle");
+    const posA = workerById(a.id);
+    const posB = workerById(b.id);
+
+    sim.advanceSimulation(TICK_DT); // must not auto-gather the new carcass or move the now-idle workers
+    expect(workerById(a.id).carrying).toBeNull();
+    expect(workerById(b.id).carrying).toBeNull();
+    expect(sim.getWorkerCommand(a.id)).toBe("idle");
+    expect(sim.getWorkerCommand(b.id)).toBe("idle");
+    expect(workerById(a.id).x).toBe(posA.x);
+    expect(workerById(a.id).y).toBe(posA.y);
+    expect(workerById(b.id).x).toBe(posB.x);
+    expect(workerById(b.id).y).toBe(posB.y);
+  });
+
+  it("a worker whose target dies mid-chase (killed by another attacker) degrades to idle without throwing", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    setCreatureHealth(creature.id, WORKER_ATTACK_DAMAGE);
+    const killer = registerTestWorker(13016, creature.x, creature.y); // in range immediately
+    const approacher = registerTestWorker(13017, creature.x - 500, creature.y); // still far away
+
+    expect(sim.issueAttackCommand(killer.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(approacher.id, creature.id)).toBeNull();
+
+    expect(() => sim.advanceSimulation(TICK_DT)).not.toThrow(); // killer's hit lands and kills it this same tick
+
+    expect(sim.getWorkerCommand(killer.id)).toBe("idle");
+    expect(sim.getWorkerCommand(approacher.id)).toBe("idle");
+  });
+
+  it("M: a kind='source' protein node still deletes at zero, unaffected by the new kind column", () => {
+    const [proteinNode] = findNodesByType("protein");
+    expect(fullNodeRow(proteinNode.id)?.kind).toBe("source");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD, proteinNode.id);
+    const worker = registerTestWorker(13018, proteinNode.x, proteinNode.y);
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+    expect(nodeRow(proteinNode.id)).toBeUndefined();
+  });
+
+  it("command override: a second attack retargets the worker, and a move command replaces an attack outright", () => {
+    const farCreatureId = insertCreature(100, 100);
+    const nearCreatureId = insertCreature(2000, 2000);
+    sim.loadSimulation();
+    const worker = registerTestWorker(13019, 2000, 2000); // starts on top of the "near" creature
+
+    expect(sim.issueAttackCommand(worker.id, farCreatureId)).toBeNull();
+    sim.advanceSimulation(TICK_DT); // chasing the far creature, not in range of either yet
+    expect(creatureById(farCreatureId).health).toBe(APHID_MAX_HEALTH);
+    expect(creatureById(nearCreatureId).health).toBe(APHID_MAX_HEALTH);
+
+    expect(sim.issueAttackCommand(worker.id, nearCreatureId)).toBeNull(); // retarget
+    sim.advanceSimulation(TICK_DT); // still within range of the near creature -> hits it, not the far one
+    expect(creatureById(nearCreatureId).health).toBe(APHID_MAX_HEALTH - WORKER_ATTACK_DAMAGE);
+    expect(creatureById(farCreatureId).health).toBe(APHID_MAX_HEALTH); // untouched — override abandoned it
+
+    expect(sim.issueMoveCommand(worker.id, 2500, 2500)).toBeNull(); // move replaces attack outright
+    sim.advanceSimulation(TICK_DT);
+    expect(sim.getWorkerCommand(worker.id)).toBe("move");
+  });
+
+  it("restart: health persists but an in-progress attack command does not", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    const [worker] = sim.getWorkersForColony(colony.id); // a real seeded worker — survives reload
+    sim.registerWorker({ id: worker.id, colonyId: colony.id, x: creature.x, y: creature.y });
+    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    const damagedHealth = creatureById(creature.id).health;
+    expect(damagedHealth).toBeLessThan(creature.maxHealth);
+    expect(sim.getWorkerCommand(worker.id)).toBe("attack");
+
+    sim.checkpointSimulation();
+    sim.loadSimulation(); // simulates a restart
+
+    expect(sim.getWorkerCommand(worker.id)).toBe("idle"); // ephemeral attack command does not survive
+    expect(creatureById(creature.id).health).toBe(damagedHealth); // durable health does survive
+  });
+
+  it("restart: an unclaimed carcass persists across a reload", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    setCreatureHealth(creature.id, WORKER_ATTACK_DAMAGE);
+    const worker = registerTestWorker(13020, creature.x, creature.y);
+    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT); // kill lands, carcass created
+
+    const carcass = db.prepare("SELECT id, amount FROM resource_nodes WHERE kind = 'item'").get() as {
+      id: number;
+      amount: number;
+    };
+
+    sim.loadSimulation(); // resource nodes aren't cached in memory — nothing here should change them
+
+    expect(nodeRow(carcass.id)?.amount).toBe(carcass.amount);
   });
 });

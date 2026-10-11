@@ -280,3 +280,116 @@ it("H: state includes the seeded aphid population, each shaped {id, species, x, 
   const again = await getState();
   expect(again.creatures.map((c: any) => c.id).sort()).toEqual(state.creatures.map((c: any) => c.id).sort());
 });
+
+// Stage 6: a valid attack dispatches like any other batch command (200,
+// per-id error shape for bad ids); the worker then visibly chases the
+// creature, same as a move/gather command's follow-up GET pattern above.
+it("dispatches an attack command: valid ids succeed and the worker chases the aphid; invalid ids report per-id errors", async () => {
+  const before = await getState();
+  const worker = before.workers.find((w: any) => !w.carrying) ?? before.workers[0];
+  const creature = before.creatures[0];
+
+  const badRes = await fetch(new URL("/api/command/attack", baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: [worker.id, 999999], creatureId: creature.id }),
+  });
+  expect(badRes.status).toBe(200);
+  const badBody = await badRes.json();
+  expect(badBody.errors).toEqual({ 999999: "no such worker" });
+
+  const allBadRes = await fetch(new URL("/api/command/attack", baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: [999999], creatureId: creature.id }),
+  });
+  expect(allBadRes.status).toBe(400);
+
+  // Confirm the dispatch actually started a chase: poll until the worker has
+  // moved toward the creature's last known position (or already attacked it
+  // if it started nearby), rather than asserting exact distance decrease —
+  // the aphid itself may wander during the poll.
+  const deadline = Date.now() + 10000;
+  let moved = false;
+  let state = before;
+  while (!moved && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 200));
+    state = await getState();
+    const current = state.workers.find((w: any) => w.id === worker.id);
+    if (current.x !== worker.x || current.y !== worker.y) moved = true;
+  }
+  expect(moved).toBe(true);
+});
+
+// Stage 6: the full hunt -> kill -> carcass -> gather -> deposit flow, driven
+// entirely over HTTP — no direct simulation access, matching the rest of
+// this file's black-box style.
+it(
+  "killing an aphid leaves a carcass that can be gathered and deposited like any other resource",
+  { timeout: 60000 },
+  async () => {
+    const before = await getState();
+    const worker = before.workers.find((w: any) => !w.carrying) ?? before.workers[0];
+    const creature = before.creatures[0];
+    const baselineProtein = before.colony.resources.protein;
+    // The creature wanders (and is chased) before it dies, so its death
+    // position won't match where it started — identify the new carcass by
+    // which item-node id is new, not by position.
+    const existingItemIds = new Set(
+      before.resourceNodes.filter((n: any) => n.kind === "item").map((n: any) => n.id),
+    );
+
+    const attackRes = await fetch(new URL("/api/command/attack", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerIds: [worker.id], creatureId: creature.id }),
+    });
+    expect(attackRes.status).toBe(200);
+
+    const deadline = Date.now() + 45000;
+    let state = await getState();
+    while (state.creatures.some((c: any) => c.id === creature.id) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 300));
+      state = await getState();
+    }
+    expect(state.creatures.some((c: any) => c.id === creature.id)).toBe(false);
+
+    const carcass = state.resourceNodes.find(
+      (n: any) => n.kind === "item" && n.resourceType === "protein" && !existingItemIds.has(n.id),
+    );
+    expect(carcass).toBeDefined();
+
+    // The attacking worker went idle right at the kill site (Stage 6 §10) —
+    // use it directly rather than the generic gatherProteinUntil helper,
+    // which would pick whichever protein node is nearest to an idle worker
+    // and might find an ordinary source node instead of this specific carcass.
+    const killerId = worker.id;
+    const gatherRes = await fetch(new URL("/api/command/gather", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerIds: [killerId], resourceId: carcass.id }),
+    });
+    expect(gatherRes.status).toBe(200);
+
+    // Wait for this specific worker to finish its carry-and-deposit round
+    // trip AND for protein to actually rise — checking only "not carrying"
+    // would pass trivially on the very first poll (right after issuing the
+    // command, before travel to the carcass has even begun), and checking
+    // only "protein increased" could be satisfied early by another worker's
+    // unrelated, already-in-flight deposit while the killer is still walking
+    // home, leaving it falsely "busy" for whatever test runs next.
+    const depositDeadline = Date.now() + 30000;
+    let after = await getState();
+    let killer = after.workers.find((w: any) => w.id === killerId);
+    while (
+      (after.colony.resources.protein <= baselineProtein || killer.carrying) &&
+      Date.now() < depositDeadline
+    ) {
+      await new Promise((r) => setTimeout(r, 200));
+      after = await getState();
+      killer = after.workers.find((w: any) => w.id === killerId);
+    }
+    expect(killer.carrying).toBeNull();
+    expect(after.colony.resources.protein).toBeGreaterThan(baselineProtein);
+  },
+);

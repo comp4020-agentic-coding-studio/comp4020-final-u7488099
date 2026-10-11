@@ -312,3 +312,67 @@ it("I: aphid wandering is visible over an open WebSocket connection without a re
     ws.close();
   }
 });
+
+// Stage 6: N -- combat rides the same broadcast channel as everything else.
+// Health dropping, death, and the resulting carcass all arrive identically
+// on every open connection, with no separate combat protocol.
+it(
+  "N: an attack's health drop, the creature's death, and its carcass are broadcast identically to every open connection",
+  { timeout: 60000 },
+  async () => {
+    const before = await getState();
+    const worker = before.workers.find((w: any) => !w.carrying) ?? before.workers[0];
+    const creature = before.creatures[0];
+    // The creature wanders (and is chased) before it dies, so its death
+    // position won't match where it started — identify the new carcass by
+    // which item-node id is new, not by position.
+    const existingItemIds = new Set(
+      before.resourceNodes.filter((n: any) => n.kind === "item").map((n: any) => n.id),
+    );
+
+    const [wsA, wsB] = await Promise.all([connect(), connect()]);
+    try {
+      const res = await fetch(new URL("/api/command/attack", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workerIds: [worker.id], creatureId: creature.id }),
+      });
+      expect(res.status).toBe(200);
+
+      async function waitForDamaged(ws: WebSocket): Promise<any> {
+        const deadline = Date.now() + 20000;
+        while (Date.now() < deadline) {
+          const message = await nextMessage(ws, 20000);
+          const current = message.creatures.find((c: any) => c.id === creature.id);
+          if (current && current.health < creature.maxHealth) return message;
+          if (!current) return message; // died before we caught a damaged-but-alive frame
+        }
+        throw new Error("no broadcast frame showed the creature damaged or dead");
+      }
+      const [damagedA, damagedB] = await Promise.all([waitForDamaged(wsA), waitForDamaged(wsB)]);
+      const liveA = damagedA.creatures.find((c: any) => c.id === creature.id);
+      const liveB = damagedB.creatures.find((c: any) => c.id === creature.id);
+      expect(liveA).toEqual(liveB);
+
+      async function waitForDeathAndCarcass(ws: WebSocket): Promise<any> {
+        const deadline = Date.now() + 40000;
+        while (Date.now() < deadline) {
+          const message = await nextMessage(ws, 40000);
+          const stillAlive = message.creatures.some((c: any) => c.id === creature.id);
+          const carcass = message.resourceNodes.find(
+            (n: any) => n.kind === "item" && n.resourceType === "protein" && !existingItemIds.has(n.id),
+          );
+          if (!stillAlive && carcass) return { message, carcass };
+        }
+        throw new Error("no broadcast frame showed the creature dead with its carcass present");
+      }
+      const [deathA, deathB] = await Promise.all([waitForDeathAndCarcass(wsA), waitForDeathAndCarcass(wsB)]);
+      expect(deathA.carcass).toEqual(deathB.carcass);
+      expect(deathA.message.creatures.some((c: any) => c.id === creature.id)).toBe(false);
+      expect(deathB.message.creatures.some((c: any) => c.id === creature.id)).toBe(false);
+    } finally {
+      wsA.close();
+      wsB.close();
+    }
+  },
+);
