@@ -1,24 +1,56 @@
+import { RESOURCE_TYPES } from "./balance.ts";
 import { db } from "./db.ts";
 
 export interface ColonyState {
-  colony: { id: number; protein: number; queenX: number; queenY: number };
+  world: { width: number; height: number };
+  colony: {
+    id: number;
+    queenX: number;
+    queenY: number;
+    resources: Record<string, number>;
+  };
   workers: { id: number; x: number; y: number }[];
-  resourceNodes: { id: number; x: number; y: number; resourceType: string }[];
+  resourceNodes: {
+    id: number;
+    x: number;
+    y: number;
+    resourceType: string;
+    amount: number | null;
+    maxAmount: number | null;
+  }[];
 }
 
 export function getState(): ColonyState {
-  const colony = db
-    .prepare("SELECT id, protein, queen_x AS queenX, queen_y AS queenY FROM colonies LIMIT 1")
-    .get() as ColonyState["colony"] | undefined;
-  if (!colony) throw new Error("no colony seeded");
+  const world = db.prepare("SELECT id, width, height FROM worlds LIMIT 1").get() as
+    | { id: number; width: number; height: number }
+    | undefined;
+  if (!world) throw new Error("no world seeded");
+
+  const colonyRow = db
+    .prepare("SELECT id, queen_x AS queenX, queen_y AS queenY FROM colonies LIMIT 1")
+    .get() as { id: number; queenX: number; queenY: number } | undefined;
+  if (!colonyRow) throw new Error("no colony seeded");
+
+  const resourceRows = db
+    .prepare("SELECT resource_type AS resourceType, amount FROM colony_resources WHERE colony_id = ?")
+    .all(colonyRow.id) as { resourceType: string; amount: number }[];
+  const resources: Record<string, number> = Object.fromEntries(RESOURCE_TYPES.map((type) => [type, 0]));
+  for (const row of resourceRows) resources[row.resourceType] = row.amount;
 
   const workers = db
     .prepare("SELECT id, x, y FROM workers WHERE colony_id = ? ORDER BY id")
-    .all(colony.id) as ColonyState["workers"];
+    .all(colonyRow.id) as ColonyState["workers"];
 
   const resourceNodes = db
-    .prepare("SELECT id, x, y, resource_type AS resourceType FROM resource_nodes ORDER BY id")
-    .all() as ColonyState["resourceNodes"];
+    .prepare(
+      "SELECT id, x, y, resource_type AS resourceType, amount, max_amount AS maxAmount FROM resource_nodes WHERE world_id = ? ORDER BY id",
+    )
+    .all(world.id) as ColonyState["resourceNodes"];
 
-  return { colony, workers, resourceNodes };
+  return {
+    world: { width: world.width, height: world.height },
+    colony: { id: colonyRow.id, queenX: colonyRow.queenX, queenY: colonyRow.queenY, resources },
+    workers,
+    resourceNodes,
+  };
 }
