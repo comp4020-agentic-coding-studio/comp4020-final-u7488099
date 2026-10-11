@@ -554,3 +554,116 @@ neutral, non-interactable creature (the aphid) that wanders on its own.
   with no second real case to validate the design against, so this stays
   one table. Revisit this the moment Stage 6 actually introduces something
   that fits "item" better than "source."
+
+## Stage 6: hunting, combat, and carcasses
+
+Stage 5 made aphids move on their own but left them inert — nothing a
+player did touched them. Stage 6 connects creature combat to the existing
+spatial/carrying economy: a player selects worker(s), clicks an aphid, the
+worker(s) chase and attack it on a range+cooldown, the aphid dies when its
+health reaches zero and leaves behind a finite carcass, and the player must
+then explicitly command a gather on that carcass exactly like any other
+resource node. There is still no predation of workers, no worker HP, no
+aphid fleeing/retaliation, no auto-gather after a kill, and no respawning —
+those remain explicitly out of scope.
+
+- **Combat is fully server-authoritative, same as every other mutation
+  since Stage 1b.** Damage, cooldown, and death are computed only inside
+  `advanceSimulation`'s per-tick loop; the client never simulates a hit or
+  a death locally — it only renders whatever the latest broadcast or
+  `GET /api/state` response says. There is no client-side prediction of
+  combat outcomes, matching the existing "snap to latest known state"
+  rendering convention.
+- **Attack is an ephemeral `WorkerCommand`, in the same category as
+  move/gather/return.** `{ type: "attack", creatureId, cooldownRemaining }`
+  is never written to the `workers` table and always resets to `idle` on
+  `loadSimulation()` — a restart never resumes an attack, by design. Unlike
+  `gather`'s `lastKnownX/Y`, an attack command carries no cached position:
+  every tick re-reads the creature's live position straight from the
+  `creatures` Map, so a worker chases where the target actually is, not
+  where it was when the command was issued. If the creature no longer
+  exists (killed, or removed for any other reason) the worker degrades
+  straight to idle — the same safe-degrade shape `gather` already uses when
+  its target resource vanishes (Stage 1c).
+- **`issueAttackCommand` follows the exact single-id convention
+  `issueMoveCommand`/`issueGatherCommand` already use**, so it slots into
+  `index.ts`'s existing `runBatchCommand` helper with zero new batch-error
+  plumbing: `POST /api/command/attack { workerIds, creatureId }` attempts
+  every id unconditionally, 400s only if every id fails, and otherwise
+  returns 200 with per-id `errors` for whichever ids didn't go through
+  (`"no such worker"`, `"no such creature"`, or — reusing Stage 4's exact
+  wording — `"worker is busy returning resources"` for a carrying worker).
+  A carrying worker cannot be redirected into combat, same as it can't be
+  redirected into a new move/gather.
+- **Creature `health`/`maxHealth` are durable, written synchronously to
+  SQLite on every hit — not batched into the periodic checkpoint.** This
+  mirrors Stage 4's precedent that `carrying` is made durable the instant
+  it changes inside its own transaction, rather than waiting on the
+  position checkpoint timer. The columns are nullable (`creatures.health`,
+  `creatures.max_health`), added via a guarded `ALTER TABLE`
+  (`migrateCreatureHealth()`, mirroring `migrateWorkersCarrying()`'s guard
+  pattern) and immediately backfilled per species via a `SPECIES_MAX_HEALTH`
+  map (`backfillCreatureHealth()`) so "health IS NULL" never persists past
+  one boot, and a species added to that map later also backfills
+  automatically. Health is species-keyed rather than hardcoded so a future
+  species needs only a new map entry, not a schema change.
+- **A creature's death and its carcass's creation happen in one SQLite
+  transaction.** `killCreature` deletes the `creatures` row and inserts the
+  carcass `resource_nodes` row inside a single `db.transaction()` — no code
+  path can produce an orphaned creature or a missing/duplicate carcass, even
+  across a crash mid-kill. In-memory state (the `creatures` Map, and every
+  attacking worker's command) is only updated after the transaction commits,
+  keeping the in-memory cache synced to the committed result exactly like
+  every other durable mutation in this codebase.
+- **`resource_nodes.kind` (`'source' | 'item'`) distinguishes a renewable,
+  fixed-location producer from a finite dropped item.** This was chosen
+  over splitting `resource_nodes` into two tables: it's the smallest clean
+  change that gives an explicit, queryable concept of "this row is a
+  dropped/finite item, not a renewable source," without a speculative
+  schema rewrite before a second item type exists to validate the design
+  against. The column defaults to `'source'`, so every pre-Stage-6 row
+  (sugar, biomass, the original finite protein nodes) is correctly
+  classified with no backfill `UPDATE` needed — only the guarded `ALTER
+  TABLE` itself. A carcass is inserted as `kind: 'item'`, `resourceType:
+  'protein'`, `amount = maxAmount = APHID_PROTEIN_VALUE`. Because protein
+  was already absent from `RESOURCE_REGEN_RATES` (Stage 5), a carcass
+  automatically inherits correct non-regenerating, delete-at-zero behaviour
+  from `attemptGatherClaim`'s existing renewable/non-renewable branch —
+  **no change was needed there at all.** Gather/carry/return/deposit in
+  `simulation.ts` needed zero changes either, since that machinery has only
+  ever operated on `resourceType` + `amount`/`maxAmount`, never on how a row
+  was created; multiple workers can harvest a carcass via the same
+  contested-claim semantics any other node already has. The client uses
+  `kind === 'item'` only to draw a visually distinct carcass marker.
+- **Chase closes to `WORKER_ATTACK_RANGE`, never past it, and the step is
+  capped so a fast worker can't overshoot the target on a single tick** —
+  the same `ARRIVAL_EPSILON`-guarded step-capping idiom Stage 3's move/
+  gather arrival logic already uses. `WORKER_ATTACK_RANGE` (30) is chosen
+  comfortably above `MIN_SEPARATION` (20, i.e. `2 * WORKER_RADIUS`) so the
+  separation force computed every tick (Stage 3) can never prevent a worker
+  from reaching attack range — same scale reasoning as `GATHER_RANGE`.
+  Separation is still applied on every attack tick, including while in
+  range, so several workers attacking the same creature keep spacing from
+  each other instead of stacking.
+- **Cooldown is a plain per-command countdown, decremented every tick
+  regardless of whether a hit lands.** A freshly issued attack starts at
+  `cooldownRemaining: 0`, so it can land a hit the instant it's in range
+  rather than being forced to wait out a full cooldown first. Multiple
+  workers attacking the same creature each track their own independent
+  cooldown, so simultaneous hits from several attackers in the same tick
+  are expected and intentional — that's the mechanism by which adding more
+  workers to a fight visibly speeds up a kill.
+- **On a kill, every worker that was attacking that creature goes idle in
+  place.** Nothing auto-gathers the new carcass and nothing auto-retargets
+  another creature — the player must explicitly issue a new command for
+  both, per the brief. This is enforced inside `killCreature` itself (an
+  attacker-idle sweep over every worker whose command still references the
+  dead creature's id), not left to each attacking worker's own next-tick
+  logic, so it holds even for a worker still mid-chase toward the target
+  the instant another attacker's hit kills it.
+- **No aphid respawning exists yet.** Killing every aphid in a world
+  permanently empties it of prey until a future stage adds respawning —
+  acceptable in tests, but production manual verification should kill only
+  one or two aphids rather than exterminating the seeded population.
+
+
