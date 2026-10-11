@@ -466,3 +466,91 @@ is where distance actually costs something.
   blindly re-posting to one fixed worker id that might now be busy; the
   tests that call it with a target of 50 (one full `REPRODUCE_COST`) carry
   an explicit longer `it()` timeout rather than raising the global one.
+
+## Stage 5: living world — renewable resources + aphids
+
+Stage 1–4 built a world where nothing happens unless a player issues a
+command. Stage 5 is explicitly not the combat stage — it's the one that
+makes the world visibly continue without input, via exactly two pieces of
+autonomous behaviour: renewable sugar/biomass regeneration, and a first
+neutral, non-interactable creature (the aphid) that wanders on its own.
+
+- **Sugar nodes are now finite + renewable, not genuinely infinite.** Every
+  seeded sugar node used to be `amount: null, maxAmount: null`. "Renewable"
+  is meaningless for a node that never depletes, so Stage 5 changes seeded
+  sugar to `amount: SUGAR_NODE_MAX_AMOUNT, maxAmount: SUGAR_NODE_MAX_AMOUNT`
+  and ships `migrateSugarNodesFinite()` in `db.ts` to convert an
+  already-deployed world's sugar rows the same way on next boot. True
+  infinite nodes (`amount: null`) are still fully supported — Stage 4's
+  deposit-range tests still insert their own explicit `amount: null` sugar
+  node and are untouched by anything in this stage, which is the proof that
+  infinite nodes keep behaving exactly as before.
+- **Renewability has exactly one source of truth: `RESOURCE_REGEN_RATES` in
+  `balance.ts`.** A resource type's presence as a key there drives both the
+  regen tick (`advanceResourceRegen`) and `attemptGatherClaim`'s
+  no-delete-at-zero branch. Sugar and biomass are renewable; protein has no
+  entry, so it's unaffected and keeps its original delete-on-depletion
+  behaviour unchanged.
+- **A renewable node can reach `amount === 0` without its row being
+  deleted — only non-renewable types are deleted on depletion.**
+  `attemptGatherClaim` floors a renewable node's amount at 0 and leaves the
+  row in place; a non-renewable node (protein) is still `DELETE`d the
+  moment its amount hits zero, exactly as before Stage 5.
+- **Regen is a direct SQL `UPDATE` per tick, with no in-memory cache for
+  resource nodes — same as every claim before this stage.** Resource nodes
+  have never lived in a `Map`; `advanceResourceRegen` keeps that precedent
+  rather than introducing a second kind of node state. It's not wrapped in
+  the same transaction as a claim, so a crash mid-tick can lose at most one
+  tick's worth of regen on one node — acceptable per the brief, since regen
+  doesn't need to be crash-perfect.
+- **Renewable resources regenerate only while the simulation is actively
+  ticking — there is no offline/elapsed-time catch-up on boot.** A server
+  that's down for an hour does not credit an hour of regen on `loadSimulation()`;
+  regen only ever advances inside `advanceSimulation(dt)`, called from the
+  live 10Hz tick. This is a deliberate exclusion per the brief, not an
+  oversight — don't add boot-time catch-up without revisiting this.
+- **Creatures follow the worker pattern, not the resource-node pattern.**
+  Aphid positions change continuously at 10Hz exactly like worker
+  positions, so they get their own in-memory `creatures` Map in
+  `simulation.ts` — loaded in `loadSimulation()`, advanced every tick in
+  `advanceCreatures(dt)`, flushed to SQLite on the existing periodic
+  checkpoint alongside worker positions, never written to SQL every tick.
+- **Creature *existence* (id, species, position) is durable; creature
+  *command* (idle/wander, remaining time, target) is ephemeral — same
+  durability split Stage 1b/4 already draws for workers.** The `creatures`
+  table and periodic checkpoint persist id/species/x/y across a restart.
+  `loadSimulation()` always brings every creature back into a brief `idle`
+  state with a fresh deterministic RNG seeded from its id — the in-flight
+  wander target does not survive a restart, deliberately, per the brief.
+  Wandering resumes on its own within `APHID_IDLE_MAX` seconds either way,
+  so a restart reads as "it paused briefly," not as a frozen aphid.
+- **Aphid wander destinations are deterministic per creature, not
+  `Math.random()`-driven.** Each creature carries its own xorshift32 state
+  seeded from `(id * 0x9E3779B1) >>> 0`, so a given creature's sequence of
+  wander targets is reproducible across a process restart for a fixed tick
+  sequence — chosen specifically so `spec/simulation.test.ts` can assert on
+  movement without flaking.
+- **Aphids are neutral and non-interactable this stage — no selection, no
+  commands, no HP, no collision/separation with workers or each other, no
+  UI panel.** The client renders them as a simple diamond marker (distinct
+  shape and colour from every circular marker) but never considers them in
+  `hitTest()`/`onCanvasClick()`. The existing worker spatial grid
+  (Stage 3's separation system) is not extended to include aphids — nothing
+  in Stage 5 needs it, and the brief explicitly says it doesn't have to be.
+- **Creature state rides the existing realtime channel — there is no
+  separate creature WebSocket protocol.** `creatures: [{id, species, x, y}]`
+  is just one more field on the same `ColonyState` object `GET /api/state`
+  and every broadcast frame already return. Aphid movement sets `dirty =
+  true` in `advanceCreatures` exactly like worker movement does, so the
+  existing dirty-gated 5Hz broadcast loop picks it up for free.
+- **Resource sources vs. resource items: deliberately not split this
+  stage.** The brief asks whether Stage 5 is the point to separate
+  renewable "sources" (regenerating, tied to a fixed map location — what
+  `resource_nodes` already models) from ephemeral "items" (material
+  instantiated by an event, e.g. a future aphid carcass). There is no
+  concrete item concept to build yet — no carcasses, no drops, nothing
+  Stage 5 creates on a creature's death, because creatures can't die yet.
+  Splitting the schema now would mean guessing at Stage 6's carcass shape
+  with no second real case to validate the design against, so this stays
+  one table. Revisit this the moment Stage 6 actually introduces something
+  that fits "item" better than "source."
