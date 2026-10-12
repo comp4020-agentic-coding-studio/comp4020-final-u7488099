@@ -63,6 +63,13 @@ co-presence.
   it dies after enough hits and leaves behind a carcass worth protein, which
   must then be explicitly gathered like any other node.
 - **Reproduction**: spend 50 protein to hatch a new worker at your queen.
+- **Predators and worker survival.** Spiders roam the world as a hostile
+  species, distinct from the neutral aphids: they detect a nearby worker on
+  their own, chase it down, and attack. Workers have real, permanent health
+  — injury and death are visible and final, with no revive — but can fight
+  back (select and click a spider, same as hunting an aphid) or be moved to
+  safety. A killed spider leaves a protein carcass just like an aphid. Your
+  queen is never at risk, and there's still no player-vs-player combat.
 - **Realtime and durable.** Every mutation is computed server-side and
   pushed to every open tab over WebSocket within about a second; everything
   that matters after a restart — colonies, workers, resources, creatures,
@@ -73,11 +80,13 @@ co-presence.
 
 ## What's deliberately not here yet
 
-No predators, no worker death, no aphid respawning, no PvP, no evolution, no
-buildings or territory, no formal biomes or runtime procedural spawning
-(the world's content is seeded once, deterministically, not generated live).
-No art pass beyond simple shape/colour readability. Each of these is a layer
-to add on top of what's here, not a rewrite of it.
+No queen damage or death, no PvP, no worker corpses (a dead worker is simply
+removed), no multiple predator species, no aphid respawning, no evolution, no
+buildings or territory, no automated colony defenses, no formal biomes or
+runtime procedural spawning (the world's content is seeded once,
+deterministically, not generated live). No art pass beyond simple
+shape/colour readability. Each of these is a layer to add on top of what's
+here, not a rewrite of it.
 
 ## Stack
 

@@ -939,4 +939,191 @@ session→colony model.
   `spec/invariants.test.ts`'s `inject("baseUrl")` + `fetch` + `JSDOM`
   pattern instead.
 
+## Stage 7: predators & worker survival
+
+Every stage through 6b made the world richer but added no risk: more
+workers was pure upside. Stage 7 adds exactly one hostile species
+("spider") plus real worker health/death, closing the loop into gather →
+risk → flee/fight → injury/death → carcass → reproduce. Queens are never
+touched — no HP, no death, no PvP — and there's still only one predator
+species, no worker corpses, and no automated colony defenses.
+
+- **Worker health follows creature health's exact two-part durability
+  contract, not a new one.** `workers` gained `health`/`max_health` columns
+  the same way `creatures` did in Stage 6: an inline `CREATE TABLE IF NOT
+  EXISTS` declaration for a genuinely fresh DB, plus a guarded
+  `migrateWorkerHealth()` (`ALTER TABLE`, PRAGMA-checked, no-op if already
+  present) for an existing deployed DB, plus `backfillWorkerHealth()`
+  (`UPDATE ... WHERE max_health IS NULL`, using `WORKER_MAX_HEALTH = 30`)
+  so "health IS NULL" never persists past one boot. Fresh workers (initial
+  seed, `reproduce()`, and `createColony()`'s starting-worker spawn) all set
+  `health = max_health = WORKER_MAX_HEALTH` explicitly rather than relying
+  on backfill alone. Health/maxHealth are written synchronously to SQLite on
+  every hit (`applyDamageToWorker`), same as creature health — not batched
+  into the periodic position checkpoint.
+- **Worker death is a single `DELETE`, no transaction, and that's the
+  entire carried-resource-on-death rule.** `killWorker` deletes the
+  `workers` row outright. There's no separate worker-carcass concept and no
+  special-case code for "what happens to the payload" — deleting the row
+  deletes `carrying_type`/`carrying_amount` with it, and because the row no
+  longer exists, nothing can ever later run `attemptDeposit` for that
+  worker id. A dead worker can't be commanded either, for the same
+  structural reason: `issueMoveCommand`/`issueGatherCommand`/
+  `issueAttackCommand` already treat a missing id as `"no such worker"` —
+  no new guard was needed. A carrying worker that's under attack keeps
+  auto-returning regardless of taking damage; spider AI never touches
+  `worker.command`, so there's no code path where it would auto-fight-back
+  or auto-flee — verified by test, not by new guard code.
+- **Spider AI is a third `CreatureCommand` variant (`chase`), reusing every
+  durability/live-lookup idiom Stage 5/6 already established** — never
+  persisted, always dropped back to idle on `loadSimulation()`, and its
+  target is looked up live via `workers.get(targetWorkerId)` every tick
+  (never a captured position), mirroring how a worker's own `attack`
+  command re-reads its creature target live. When idle/wandering, a spider
+  scans the full shared `workers` Map — deliberately ownership-blind, same
+  as a worker's own attack can target any colony's creature — for the
+  nearest worker within `SPIDER_AGGRO_RANGE` (200), tie-broken by ascending
+  worker id for determinism, and switches to `chase`. While chasing, it
+  disengages back to idle once its target is dead or beyond
+  `SPIDER_DISENGAGE_RANGE` (300, deliberately larger than the aggro range so
+  a chase doesn't immediately re-trigger at the boundary), otherwise closes
+  to `SPIDER_ATTACK_RANGE` (30) and attacks on a `SPIDER_ATTACK_COOLDOWN`
+  (1s) once there, dealing `SPIDER_ATTACK_DAMAGE` (10 — three hits kill an
+  isolated worker, mirroring the existing "three worker hits kill an aphid"
+  balance note). Idle/wander behavior itself (the non-chase branches) was
+  refactored out of the aphid-only code into a shared, species-parameterized
+  `advanceWander()`/`WANDER_PARAMS` lookup, so spiders reuse the exact same
+  deterministic per-creature xorshift wander cycle aphids already had —
+  no second wander implementation.
+- **Queen immunity is structural, not a guard clause.** Queens live only in
+  the `colonies` table and are never inserted into the `workers` Map, so a
+  spider's aggro scan (which only ever iterates `workers.values()`) can
+  never select one — there is no `if (target is queen) skip` anywhere
+  because there's no code path that could reach a queen in the first place.
+- **No-PvP is also structural, not a guard clause.** `issueAttackCommand`
+  only ever resolves `creatureId` against the `creatures` Map; it has no
+  code path that could resolve to a `SimWorker`. Passing another colony's
+  worker id as a `creatureId` can only ever produce `"no such creature"` —
+  or, in the single unlikely edge case of a numeric id coincidentally
+  matching a row in the *other* table, a real, unrelated creature, never the
+  targeted worker. (`workers` and `creatures` are separate SQLite tables
+  with independent autoincrement counters, so a `workers.id` and a
+  `creatures.id` can legitimately collide — `spec/multiplayer.test.ts`'s
+  no-PvP regression test deliberately provokes exactly this by passing
+  `creatureId: otherColonysWorker.id`, and explicitly cancels whatever
+  command that accidentally started before the test ends, so it can't leak
+  a live background attack into a later test's assertions.)
+- **Two-layered nest exclusion keeps ambient spider wander/aggro away from
+  a colony's spawn, because one layer alone proved insufficient.**
+  `nestPositions` (populated at boot and kept current via `registerColony()`
+  for every colony ever minted, not just the original world-gen anchors) is
+  the shared reference both layers check against:
+  1. `pickWanderTarget` rejects (or, if already inside one, escapes out of)
+     any spider wander *endpoint* within `SPIDER_CLEAR_RADIUS` (400) of any
+     nest — the first fix, and the one the initial implementation shipped
+     with.
+  2. That alone was insufficient: a straight-line wander step between two
+     endpoints that are each individually clear of every nest can still
+     *pass through* a nest's clear zone partway along the path, and because
+     `SPIDER_AGGRO_RANGE` (200) is smaller than `SPIDER_CLEAR_RADIUS` (400),
+     a transiting spider could still end up close enough to aggro a
+     stationary, unclaimed colony's motionless starting workers — who never
+     move until a session claims and commands them — reproducing the exact
+     "colony elimination" symptom the first fix was meant to prevent, via a
+     different mechanism. This was found empirically (full black-box suite
+     runs, not by inspection), via dev-log causal correlation on a
+     `colony_claimed {"workerCount":0}` entry. The actual fix gates the
+     aggro *trigger*, not the spider's possible paths: `advanceSpider`'s
+     idle/wander aggro scan skips any candidate worker who is themselves
+     standing inside a nest's clear zone, reusing the same
+     `isClearOfNests()` helper. This is simpler and more robust than trying
+     to constrain every path a spider's position could take, and has the
+     accepted (even desirable) side effect of making the area right around
+     any colony's queen a small permanent safe zone from ambient spider
+     aggro. A chase already in progress is deliberately left unconstrained
+     by both layers — a worker that strayed out and is now fleeing home
+     being legitimately caught is predation, not ambient camping.
+- **Spider death reuses `killCreature`'s existing one-transaction
+  death+carcass mechanism unchanged** — `CREATURE_PROTEIN_VALUE` was
+  generalized from a hardcoded `APHID_PROTEIN_VALUE` lookup into a
+  species-keyed map (`SPIDER_PROTEIN_VALUE = 100`), and `killCreature` now
+  returns the new carcass's resource-node id so a lethal hit on a spider can
+  log `spider_died { creatureId, carcassId }` — the one new log line this
+  stage adds (an aphid kill still logs nothing extra, gated on
+  `species === "spider"`, so existing aphid-combat assertions are
+  untouched). A carcass worth `SPIDER_PROTEIN_VALUE` (100) must still be
+  gathered explicitly like any other node — no auto-harvest, same as an
+  aphid's.
+- **Spider population is seeded via the same idempotent, boot-time
+  mechanism as every other migration/seed function — no reset, no manual
+  script.** `seedCreaturesIfEmpty()` was generalized from a single
+  hardcoded `'aphid'` INSERT into a loop over every species' seed positions
+  (`{ aphid: APHID_SEED_POSITIONS, spider: SPIDER_SEED_POSITIONS }`), so a
+  genuinely fresh world seeds both species in one pass under the same
+  `COUNT(*) FROM creatures == 0` gate. A second, independently-gated
+  `seedSpidersIfMissing()` (`COUNT(*) FROM creatures WHERE species='spider'`)
+  runs unconditionally right after it: on a fresh DB it's a no-op (the first
+  pass already seeded spiders, so the count is already nonzero); on an
+  *existing* production DB that already has aphids (and so never triggers
+  the first function's empty-table gate), it adds the full
+  `SPIDER_SEED_POSITIONS` population automatically on the very next boot —
+  exactly once, with no risk of duplication on any later restart, since the
+  gate is a live count, not a one-time flag. This is race-free specifically
+  because the app runs as a single `shared-cpu-1x` Fly machine with
+  `--ha=false` (confirmed via `fly.toml`) — there is never a second OS
+  process racing the same DB file at boot. `SPIDER_SEED_POSITIONS` itself is
+  generated by `buildWorldPopulation()` the same deterministic way
+  `APHID_SEED_POSITIONS` is (fixed `mulberry32(WORLD_SEED)` seed, scattered
+  rather than anchor-clustered, kept `SPIDER_CLEAR_RADIUS` from every spawn
+  anchor). `resetProductionWorld()` needed no code change at all — it
+  already calls `seedCreaturesIfEmpty()` after wiping `creatures`, so once
+  that function seeds every species on an empty table, a full reset
+  produces spiders for free.
+- **Simultaneous/concurrent kill safety is the existing code, not new
+  logic, in both directions.** Two spiders attacking the same worker in one
+  tick: `killWorker`'s sweep (any spider whose `command.type === "chase"`
+  targets the now-dead worker drops to idle) runs before `advanceCreatures`
+  reaches a later spider in the same single-threaded pass over
+  `creatures.values()` (itself ordered deterministically — `loadSimulation`
+  queries `ORDER BY id`), so a second spider reaching the same dead target
+  later in that pass already sees the sweep's effect. Two workers attacking
+  the same spider: `handleAttackCommand`'s existing `if (!creature) { ...
+  idle ...}` guard (Stage 6) makes a second hit on an already-dead creature
+  a no-op, true for spiders with zero new code. Both are covered by explicit
+  regression tests rather than relying on the general argument alone. One
+  harmless, documented asymmetry: because `advanceCreatures(dt)` runs before
+  the worker command loop each tick, a spider's chase step is computed
+  against a worker's *previous*-tick position, while a worker chasing a
+  creature uses the creature's *current*-tick position (creatures already
+  moved earlier in the same tick) — a ~100ms lag with no practical effect at
+  this scale.
+- **Client/Help changes are additive, not a redesign.** Spiders get a
+  distinct danger-red marker (`drawSpider`, six radiating "leg" strokes) and
+  their own click radius (`SPIDER_RADIUS`), never the aphid's green diamond.
+  Both `workers` and `otherWorkers` render loops gained a
+  `drawHealthBar(...)` call, reusing the exact same no-op-above-full-health
+  helper creature health already used — no new conditional logic needed. The
+  in-game Help overlay (the primary player-facing guide — see Stage 6b)
+  gained a "Danger" section and two legend rows; `spec/world.test.ts`'s
+  Section 16H test was extended with matching `toMatch` assertions so the
+  two can't silently drift apart, same discipline as every other Help-copy
+  change.
+- **Performance was measured, not assumed.** A full-population timing check
+  (52 seeded aphids + 10 seeded spiders + 93 workers across 31 colonies, all
+  given live attack commands so every tick does real movement/combat work,
+  not idle wander) measured `advanceSimulation()` at ~0.11ms/tick average
+  over 500 ticks — roughly 900x headroom under the 100ms (10Hz) tick
+  budget. The spider aggro scan is O(spiders × workers) with no spatial
+  index, which this confirms is trivial at the target scale; revisit if
+  either population grows by orders of magnitude.
+- **Restart/persistence needed no new worker-health-specific test
+  infrastructure.** `killWorker`/`loadSimulation()` are the same
+  species-agnostic mechanisms already exercised by Stage 6's generic
+  creature-restart tests (ephemeral command resets to idle, durable
+  health/carcass state survives a reload) plus a dedicated worker-health
+  restart test added this stage — none of it branches on species, so
+  existing coverage was judged sufficient without a spider-specific
+  duplicate, consistent with this project's standing preference against
+  mechanically-generated, redundant test coverage.
+
 
