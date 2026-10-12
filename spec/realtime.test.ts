@@ -460,3 +460,48 @@ it(
     }
   },
 );
+
+it(
+  "a worker injured or killed by a spider is visible, as an otherWorkers health/presence change, to another colony's own open WebSocket connection",
+  { timeout: 60000 },
+  async () => {
+    const colonyA = createOtherSession();
+    const colonyB = createOtherSession();
+
+    const aState = await colonyA.request("/api/state").then((r) => r.json());
+    await colonyB.request("/api/state").then((r) => r.json()); // ensure colony B's session/colony exists first
+
+    const aWorker = aState.workers.find((w: any) => !w.carrying) ?? aState.workers[0];
+    const spider = aState.creatures.find((c: any) => c.species === "spider");
+    expect(spider, "seed should always include at least one spider").toBeDefined();
+
+    const wsB = await colonyB.connect();
+    try {
+      // Walk colony A's worker right onto the spider's (last-known) position
+      // to force aggro quickly and deterministically — SPIDER_WANDER_RADIUS
+      // (150) is smaller than SPIDER_AGGRO_RANGE (200), so even a fully
+      // drifted spider is still well within aggro range once the worker
+      // arrives there.
+      const res = await colonyA.request("/api/command/move", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workerIds: [aWorker.id], x: spider.x, y: spider.y }),
+      });
+      expect(res.status).toBe(200);
+
+      const deadline = Date.now() + 45000;
+      let sawDamage = false;
+      let sawDeath = false;
+      while (!(sawDamage && sawDeath) && Date.now() < deadline) {
+        const message = await nextMessage(wsB, 45000);
+        const current = message.otherWorkers.find((w: any) => w.id === aWorker.id);
+        if (current && typeof current.health === "number" && current.health < current.maxHealth) sawDamage = true;
+        if (!current) sawDeath = true;
+      }
+      expect(sawDamage).toBe(true);
+      expect(sawDeath).toBe(true);
+    } finally {
+      wsB.close();
+    }
+  },
+);

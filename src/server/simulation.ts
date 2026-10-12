@@ -16,6 +16,7 @@ import {
   SPIDER_ATTACK_COOLDOWN,
   SPIDER_ATTACK_DAMAGE,
   SPIDER_ATTACK_RANGE,
+  SPIDER_CLEAR_RADIUS,
   SPIDER_DISENGAGE_RANGE,
   SPIDER_IDLE_MAX,
   SPIDER_IDLE_MIN,
@@ -222,10 +223,87 @@ const WANDER_PARAMS: Record<string, { speed: number; wanderRadius: number; idleM
   },
 };
 
+// Stage 7: a spider's ambient wander (never its chase) must not drift into a
+// colony's spawn — nestPositions already holds every colony's queen position
+// ever minted (registerColony() keeps it current, unbounded by
+// SPAWN_ANCHOR_COUNT — colony 11, 20, etc. are in here too, not just the
+// first 10 world-gen anchors), so checking against it protects every real
+// colony, not just the ones buildWorldPopulation() knew about at world-gen
+// time. Without this, an idle-wandering spider is a true unconstrained
+// random walk (bounded only by world edges) and can eventually camp next to
+// any colony's nest and kill its starting workers before they're ever
+// claimed/used — a de facto colony elimination the brief explicitly
+// excludes. Chasing is deliberately left unconstrained (advanceSpider's
+// chase branch never calls this) — a spider pulled toward a nest by a
+// worker that wandered out and is now fleeing home is legitimate predation,
+// not ambient camping.
+function isClearOfNests(x: number, y: number, clearRadius: number): boolean {
+  for (const nest of nestPositions.values()) {
+    if (Math.hypot(nest.x - x, nest.y - y) <= clearRadius) return false;
+  }
+  return true;
+}
+
+// A chase can legitimately leave a spider standing inside a nest's clear
+// zone (e.g. its target fled home and disengaged there) — closest, not just
+// any, so the escape step below always retreats from the immediate threat
+// first if more than one zone overlaps.
+function nearestViolatingNest(x: number, y: number, clearRadius: number): { x: number; y: number } | null {
+  let nearest: { x: number; y: number } | null = null;
+  let nearestDist = Infinity;
+  for (const nest of nestPositions.values()) {
+    const dist = Math.hypot(nest.x - x, nest.y - y);
+    if (dist <= clearRadius && dist < nearestDist) {
+      nearest = nest;
+      nearestDist = dist;
+    }
+  }
+  return nearest;
+}
+
 function pickWanderTarget(
   creature: SimCreature,
   params: { wanderRadius: number },
 ): { x: number; y: number } {
+  if (creature.species === "spider") {
+    // Already inside a clear zone (only reachable via a chase that just
+    // ended there — initial seeding and every prior wander step already
+    // keep spiders out). Step straight away from the nearest violator
+    // instead of drawing a random angle: a plain rejection-sample-and-give-
+    // up-to-"hold position" here would let the spider camp permanently
+    // right next to the nest (every random draw re-rejected forever), which
+    // is worse than the bug this exists to fix — a stationary spider beside
+    // a colony's spawn can still pick off every worker that starts there.
+    // This instead guarantees monotonic progress out of the zone over a
+    // bounded number of wander cycles (no RNG draw needed, so it can't fail).
+    const violator = nearestViolatingNest(creature.x, creature.y, SPIDER_CLEAR_RADIUS);
+    if (violator) {
+      const dx = creature.x - violator.x;
+      const dy = creature.y - violator.y;
+      const dist = Math.hypot(dx, dy) || 1;
+      return {
+        x: clamp(creature.x + (dx / dist) * params.wanderRadius, 0, worldBounds.width),
+        y: clamp(creature.y + (dy / dist) * params.wanderRadius, 0, worldBounds.height),
+      };
+    }
+    // Not currently inside any zone — bounded rejection sampling (same idiom
+    // as balance.ts's placeScattered()) keeps a normal wander step from
+    // drawing a target that would enter one. If every draw is rejected,
+    // hold position for this cycle; the next idle cycle tries fresh RNG
+    // state, and since the spider isn't inside a zone to begin with, holding
+    // still can't cause the camping problem the branch above exists for.
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const angle = nextRandom(creature) * Math.PI * 2;
+      const dist = nextRandom(creature) * params.wanderRadius;
+      const target = {
+        x: clamp(creature.x + Math.cos(angle) * dist, 0, worldBounds.width),
+        y: clamp(creature.y + Math.sin(angle) * dist, 0, worldBounds.height),
+      };
+      if (isClearOfNests(target.x, target.y, SPIDER_CLEAR_RADIUS)) return target;
+    }
+    return { x: creature.x, y: creature.y };
+  }
+
   const angle = nextRandom(creature) * Math.PI * 2;
   const dist = nextRandom(creature) * params.wanderRadius;
   return {

@@ -241,7 +241,80 @@ it("rejects a session's attempt to attack a worker belonging to someone else's c
   expect(bobWorkerAfter).toBeDefined();
   expect(bobWorkerAfter.health).toBe(bobWorker.health);
   expect(Math.hypot(bobWorkerAfter.x - bobWorker.x, bobWorkerAfter.y - bobWorker.y)).toBeLessThan(5);
+
+  // bobWorker.id lives in a separate autoincrement sequence from `creatures`,
+  // so it can — and in this suite's fixed run order, does — collide with a
+  // real live creature's id. That makes aliceWorker's attack command above a
+  // real, uncancelled chase/kill against whatever creature that id actually
+  // names, which would otherwise keep running in the background for the rest
+  // of the suite and could land a genuine kill (and an extra, unaccounted-for
+  // carcass) in a later test. Overwrite aliceWorker's command before this
+  // test ends so nothing it started outlives it — "last command wins" (Stage
+  // 2) makes a plain move the simplest no-op-ish way to cancel an attack.
+  await alice("/api/command/move", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: [aliceWorker.id], x: aliceWorker.x, y: aliceWorker.y }),
+  });
 });
+
+// Stage 7 §27: creatures (and their carcasses) are global, neutral map
+// content — any colony's workers can attack the same spider, so a kill is a
+// race two colonies can both be part of. handleAttackCommand's existing
+// "if (!creature) go idle, no-op" guard (Stage 6) is what prevents a double
+// kill/duplicate carcass here; this proves that holds for two different
+// colonies racing, not just two workers from the same one.
+it(
+  "two colonies attacking the same spider concurrently produce exactly one death and one carcass, visible identically to both",
+  { timeout: 60000 },
+  async () => {
+    const alice = createSession();
+    const bob = createSession();
+
+    const aliceState = await getState(alice);
+    const bobState = await getState(bob);
+    const spider = aliceState.creatures.find((c: any) => c.species === "spider");
+    expect(spider, "seed should always include at least one spider").toBeDefined();
+    const existingItemIds = new Set(
+      aliceState.resourceNodes.filter((n: any) => n.kind === "item").map((n: any) => n.id),
+    );
+
+    const aliceWorker = aliceState.workers.find((w: any) => !w.carrying) ?? aliceState.workers[0];
+    const bobWorker = bobState.workers.find((w: any) => !w.carrying) ?? bobState.workers[0];
+
+    const [resA, resB] = await Promise.all([
+      alice("/api/command/attack", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workerIds: [aliceWorker.id], creatureId: spider.id }),
+      }),
+      bob("/api/command/attack", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workerIds: [bobWorker.id], creatureId: spider.id }),
+      }),
+    ]);
+    expect(resA.status).toBe(200);
+    expect(resB.status).toBe(200);
+
+    const deadline = Date.now() + 45000;
+    let state = await getState(alice);
+    while (state.creatures.some((c: any) => c.id === spider.id) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 300));
+      state = await getState(alice);
+    }
+    expect(state.creatures.some((c: any) => c.id === spider.id)).toBe(false);
+
+    const newItemNodes = state.resourceNodes.filter((n: any) => n.kind === "item" && !existingItemIds.has(n.id));
+    expect(newItemNodes).toHaveLength(1);
+
+    // Both colonies' views of the kill are identical — the carcass is
+    // neutral/shared, not owned by whichever colony landed the final hit.
+    const bobStateAfter = await getState(bob);
+    expect(bobStateAfter.creatures.some((c: any) => c.id === spider.id)).toBe(false);
+    expect(bobStateAfter.resourceNodes.find((n: any) => n.id === newItemNodes[0].id)).toEqual(newItemNodes[0]);
+  },
+);
 
 it("logs who did what, server-side, in a form queryable over the API and attributable to the acting colony", async () => {
   const alice = createSession();
