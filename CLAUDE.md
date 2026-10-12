@@ -859,6 +859,20 @@ session→colony model.
   see `PROCESS.md` for the exact invocation and the before/after counts it
   reported. Don't invoke it again outside another deliberate, user-directed
   reset.
+- **A live server process must be restarted after `resetProductionWorld()`
+  runs against its DB_PATH out from under it.** `loadSimulation()` only
+  ever runs once, at process startup (`simulation.ts`'s top-level call) —
+  it loads workers/creatures into in-memory maps and never reloads them
+  afterwards. The reset script is a separate, short-lived process that only
+  touches SQLite directly; an already-running app server (like the live Fly
+  machine) keeps serving its stale pre-reset in-memory state over the API
+  until it restarts, and its periodic `checkpointSimulation()` can briefly
+  write that stale state's positions back over freshly-reseeded rows that
+  happen to reuse the same ids (SQLite reuses rowids; these tables aren't
+  `AUTOINCREMENT`). Discovered and fixed live during the one production
+  reset (see `PROCESS.md`) by restarting the Fly machine immediately after
+  the script ran; `scripts/reset-world.ts`'s own success output now prints
+  this reminder.
 - **The production reset preserves the session/ownership *model*, not any
   specific session.** It wipes `colonies`, `workers`, `colony_resources`,
   `resource_nodes`, `creatures`, and `sessions`, then reseeds from

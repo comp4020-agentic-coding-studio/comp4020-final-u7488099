@@ -94,12 +94,51 @@ now with a note that the "shared means more than co-presence" claim is
 something a second browser tab can actually go verify, not just a forward
 intention.
 
-With everything above green (`pnpm check`, `pnpm check:evidence`) and
-pushed, I ran the one authorized production reset against the live
-deployment via `pnpm reset:world -- --yes`, verified the post-reset counts
-and behaviour matched this stage's targets, and confirmed a subsequent
-restart did not reset the world again — exactly once, not repeated during
-debugging, per the brief's explicit constraint on that step.
+With everything above green (`pnpm check`, `pnpm check:evidence`), pushed,
+and CI's `check`+`deploy` jobs both passing, I found one more thing before
+touching production: `scripts/` was never copied into the Docker image, so
+the reset script that exists in the repo wouldn't exist on the deployed
+machine.
+([`af3640a`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/af3640a))
+is the one-line Dockerfile fix (`COPY scripts ./scripts`); a second green
+CI/deploy cycle shipped it.
+
+I then ran the one authorized production reset over `flyctl ssh console`
+(`node scripts/reset-world.ts --yes` against the live machine, `/data`
+auto-detected as `DB_PATH` exactly as it does locally with `./.data`),
+first confirming the `--yes` gate still refused without it. The script
+reported `{colonies:1, workers:3, resourceNodes:72, creatures:52,
+sessionsCleared:5, actionLogPreservedRows:6}` — the seeded colony's exact
+starting numbers, `resourceNodes` matching the generator's formula-derived
+36+28+8, and `action_log` preserved rather than cleared.
+
+Querying `/api/state` right after, though, showed a colony with 20+ workers
+and only 13 creatures — not the reset's own numbers. The live app process
+had been running the whole time the reset script (a separate, short-lived
+process) rewrote the DB underneath it: `loadSimulation()` only loads
+workers/creatures into memory once, at startup, so the already-running
+server kept serving its stale pre-reset state, and its 5-second
+`checkpointSimulation()` interval was writing that stale state's positions
+back over the freshly-reseeded rows wherever an id happened to collide
+(these tables aren't `AUTOINCREMENT`, so SQLite reuses small ids right
+away). A `flyctl machine restart` fixed it immediately — direct SQLite
+queries confirmed the underlying data had been correct all along, only the
+live process's view of it was stale — and `/api/state` then reported
+exactly the reset's own counts. I added the same explanation to
+`scripts/reset-world.ts`'s own success output and to `CLAUDE.md`, so this
+isn't a trap for whoever runs this script next.
+
+Final verification against production: an existing session cookie still
+resolved to the same colony across that restart (so the restart itself
+doesn't reset anything, and a reset doesn't orphan an existing session); a
+brand-new session claimed a different, pre-minted spare colony with its own
+nearby resources and could only see/command its own 3 workers while still
+seeing every other colony's queen; a real gather command sent a worker to
+travel to a node, claim sugar, walk home, and deposit it (colony sugar
+0 → 10); and `/api/log` kept appending new rows (`colony_claimed`, `gather`)
+after the reset on top of the preserved pre-reset history. Exactly one
+production reset was run, not repeated during debugging, per the brief's
+explicit constraint on that step.
 
 ## Crit 10: real multiplayer — sessions, ownership, and an audit log
 

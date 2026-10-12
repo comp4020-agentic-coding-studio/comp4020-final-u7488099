@@ -28,6 +28,12 @@ function main(): void {
   logAction(0, "world_reset", summary);
   console.log("World reset complete.");
   console.log(JSON.stringify(summary, null, 2));
+  console.log(
+    "\nIf a server process was already running against this DB_PATH (e.g. the\n" +
+      "live Fly machine), its in-memory simulation state predates this reset and\n" +
+      "won't reflect it until that process restarts (loadSimulation() only runs\n" +
+      "once, at startup) — restart it now, e.g. `flyctl machine restart <id>`.",
+  );
 }
 
 main();
