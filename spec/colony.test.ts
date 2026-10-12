@@ -314,17 +314,17 @@ it("a worker that's carrying resources home rejects a new move command, but a fr
   expect(movedFreeWorker.x !== freeWorker.x || movedFreeWorker.y !== freeWorker.y).toBe(true);
 });
 
-// Stage 5: H — the authoritative state surface exposes the neutral creature
-// population (currently just aphids) alongside workers/resourceNodes, with
-// no separate endpoint or protocol.
-it("H: state includes the seeded aphid population, each shaped {id, species, x, y} within world bounds", async () => {
+// Stage 5: H — the authoritative state surface exposes the neutral/hostile
+// creature population (aphids and, since Stage 7, spiders) alongside
+// workers/resourceNodes, with no separate endpoint or protocol.
+it("H: state includes the seeded creature population, each shaped {id, species, x, y} within world bounds", async () => {
   const state = await getState();
 
   expect(Array.isArray(state.creatures)).toBe(true);
   expect(state.creatures.length).toBeGreaterThanOrEqual(10);
   for (const creature of state.creatures) {
     expect(typeof creature.id).toBe("number");
-    expect(creature.species).toBe("aphid");
+    expect(["aphid", "spider"]).toContain(creature.species);
     expect(creature.x).toBeGreaterThanOrEqual(0);
     expect(creature.x).toBeLessThanOrEqual(state.world.width);
     expect(creature.y).toBeGreaterThanOrEqual(0);

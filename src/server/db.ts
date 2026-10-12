@@ -2,18 +2,31 @@ import Database from "better-sqlite3";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
-  APHID_MAX_HEALTH,
   APHID_SEED_POSITIONS,
   colonySpiralPosition,
   RESOURCE_NODES,
   RESOURCE_TYPES,
   SPECIES_MAX_HEALTH,
+  SPIDER_SEED_POSITIONS,
   STARTING_PROTEIN,
   STARTING_WORKERS,
   SUGAR_NODE_MAX_AMOUNT,
   WORKER_MAX_HEALTH,
   WORLD,
 } from "./balance.ts";
+
+// Stage 7: seedCreaturesIfEmpty() loops over every species' seed-position
+// list instead of hardcoding 'aphid', so a brand-new world seeds spiders
+// alongside aphids in the same empty-table pass. seedSpidersIfMissing() below
+// is the separate, independently-gated pass that adds spiders to an
+// already-populated (pre-Stage-7) world without touching this gate. Declared
+// here (not next to seedCreaturesIfEmpty further down) because the module-
+// level seedCreaturesIfEmpty() call below runs before a `const` declared
+// later in the file would be initialized.
+const SPECIES_SEED_POSITIONS: Record<string, { x: number; y: number }[]> = {
+  aphid: APHID_SEED_POSITIONS,
+  spider: SPIDER_SEED_POSITIONS,
+};
 
 // DB_PATH is overridable so isolated tests (spec/simulation.test.ts) can point
 // at a throwaway file instead of sharing the dev DB or the deployed volume.
@@ -130,6 +143,7 @@ db.exec(`
 
 seedIfEmpty();
 seedCreaturesIfEmpty();
+seedSpidersIfMissing();
 backfillCreatureHealth();
 backfillWorkerHealth();
 
@@ -318,16 +332,47 @@ export function getUnclaimedColonyId(): number | undefined {
 // world has colonies > 0 (seedIfEmpty no-ops) but creatures = 0 (this still
 // fires), so Stage 5 backfills aphids into existing worlds too. Called after
 // seedIfEmpty() so a brand-new world's row already exists either way.
+//
 function seedCreaturesIfEmpty(): void {
   const row = db.prepare("SELECT COUNT(*) AS n FROM creatures").get() as { n: number };
   if (row.n > 0) return;
   const world = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number } | undefined;
   if (!world) return;
   const insertCreature = db.prepare(
-    "INSERT INTO creatures (world_id, species, x, y, health, max_health) VALUES (?, 'aphid', ?, ?, ?, ?)",
+    "INSERT INTO creatures (world_id, species, x, y, health, max_health) VALUES (?, ?, ?, ?, ?, ?)",
   );
-  for (const pos of APHID_SEED_POSITIONS) {
-    insertCreature.run(world.id, pos.x, pos.y, APHID_MAX_HEALTH, APHID_MAX_HEALTH);
+  for (const [species, positions] of Object.entries(SPECIES_SEED_POSITIONS)) {
+    const maxHealth = SPECIES_MAX_HEALTH[species];
+    for (const pos of positions) {
+      insertCreature.run(world.id, species, pos.x, pos.y, maxHealth, maxHealth);
+    }
+  }
+}
+
+// Stage 7 production-safe migration: seedCreaturesIfEmpty() above only fires
+// against a genuinely empty creatures table, so an already-deployed world
+// (which already has aphids from before Stage 7 shipped) never reaches it
+// anymore. This is the independently-gated pass that adds spiders to that
+// kind of world instead — counts spiders specifically, inserts
+// SPIDER_SEED_POSITIONS only if there are none yet, else no-ops. Run
+// unconditionally at every boot, right after seedCreaturesIfEmpty(): on a
+// fresh DB this sees the spiders that pass just inserted and no-ops; on an
+// existing production DB it fires exactly once, on the first boot after
+// this code ships, and never again. Safe without a transaction or lock
+// because this app runs as a single shared-cpu-1x machine with --ha=false
+// (see fly.toml) — there is never a second process racing this same count-
+// then-insert sequence. See CLAUDE.md.
+function seedSpidersIfMissing(): void {
+  const row = db.prepare("SELECT COUNT(*) AS n FROM creatures WHERE species = 'spider'").get() as { n: number };
+  if (row.n > 0) return;
+  const world = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number } | undefined;
+  if (!world) return;
+  const insertSpider = db.prepare(
+    "INSERT INTO creatures (world_id, species, x, y, health, max_health) VALUES (?, 'spider', ?, ?, ?, ?)",
+  );
+  const maxHealth = SPECIES_MAX_HEALTH.spider;
+  for (const pos of SPIDER_SEED_POSITIONS) {
+    insertSpider.run(world.id, pos.x, pos.y, maxHealth, maxHealth);
   }
 }
 

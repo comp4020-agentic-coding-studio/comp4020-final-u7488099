@@ -120,6 +120,18 @@ export const SCATTER_BIOMASS_COUNT = 8;
 export const SCATTER_PROTEIN_COUNT = 3;
 export const SCATTER_APHID_COUNT = 12;
 
+// Stage 7: how many spiders a fresh world seeds, and how far from every
+// spawn anchor they must land. Declared here (not alongside the rest of the
+// spider constants further down) because buildWorldPopulation() below
+// closes over both at generation time — they need to exist before that
+// function runs, unlike the AI/combat spider constants, which nothing at
+// generation time reads.
+export const SPIDER_COUNT = 10;
+// Larger than ANCHOR_CLEAR_RADIUS (120) on purpose: spiders are hostile, so
+// they're kept further from spawns than resources/aphids, while still
+// landing well within world bounds at this world size.
+export const SPIDER_CLEAR_RADIUS = 400;
+
 // A cluster item lands at a random angle and this radius from its anchor —
 // far enough out that nothing sits on top of the queen or the starting
 // workers, close enough that a fresh colony doesn't have to travel far to
@@ -141,7 +153,11 @@ type GeneratedNode = {
   maxAmount: number | null;
 };
 
-function buildWorldPopulation(): { resourceNodes: GeneratedNode[]; aphidPositions: { x: number; y: number }[] } {
+function buildWorldPopulation(): {
+  resourceNodes: GeneratedNode[];
+  aphidPositions: { x: number; y: number }[];
+  spiderPositions: { x: number; y: number }[];
+} {
   const rng = mulberry32(WORLD_SEED);
   const anchors = Array.from({ length: SPAWN_ANCHOR_COUNT }, (_, i) => colonySpiralPosition(i));
 
@@ -163,11 +179,14 @@ function buildWorldPopulation(): { resourceNodes: GeneratedNode[]; aphidPosition
 
   // Bounded retries, not unbounded — this stays a pure, terminating function
   // of the fixed seed even in the pathological case every draw rejects.
-  function placeScattered(): { x: number; y: number } {
+  // clearRadius defaults to the background-scatter distance (resources/
+  // aphids); Stage 7 passes SPIDER_CLEAR_RADIUS instead, reusing this same
+  // rejection-sampling loop rather than writing a second one.
+  function placeScattered(clearRadius: number = ANCHOR_CLEAR_RADIUS): { x: number; y: number } {
     for (let attempt = 0; attempt < 20; attempt++) {
       const x = COLONY_PLACEMENT_MARGIN + rng() * (WORLD.width - 2 * COLONY_PLACEMENT_MARGIN);
       const y = COLONY_PLACEMENT_MARGIN + rng() * (WORLD.height - 2 * COLONY_PLACEMENT_MARGIN);
-      if (anchors.every((a) => Math.hypot(a.x - x, a.y - y) > ANCHOR_CLEAR_RADIUS)) return { x, y };
+      if (anchors.every((a) => Math.hypot(a.x - x, a.y - y) > clearRadius)) return { x, y };
     }
     return { x: WORLD.width / 2, y: WORLD.height / 2 };
   }
@@ -206,7 +225,15 @@ function buildWorldPopulation(): { resourceNodes: GeneratedNode[]; aphidPosition
     aphidPositions.push(placeScattered());
   }
 
-  return { resourceNodes, aphidPositions };
+  // Spiders are scattered across the whole map, never anchor-clustered —
+  // a predator shouldn't crowd every colony's spawn the way resources/aphids
+  // deliberately do.
+  const spiderPositions: { x: number; y: number }[] = [];
+  for (let i = 0; i < SPIDER_COUNT; i++) {
+    spiderPositions.push(placeScattered(SPIDER_CLEAR_RADIUS));
+  }
+
+  return { resourceNodes, aphidPositions, spiderPositions };
 }
 
 const WORLD_POPULATION = buildWorldPopulation();
@@ -219,6 +246,10 @@ export const RESOURCE_NODES: GeneratedNode[] = WORLD_POPULATION.resourceNodes;
 // Stage 6b: generated — ~52 aphids clustered around spawn points plus
 // scattered across the map (up from Stage 5's original hand-placed 14).
 export const APHID_SEED_POSITIONS: { x: number; y: number }[] = WORLD_POPULATION.aphidPositions;
+
+// Stage 7: generated — SPIDER_COUNT positions, scattered (never
+// anchor-clustered) and kept SPIDER_CLEAR_RADIUS from every spawn anchor.
+export const SPIDER_SEED_POSITIONS: { x: number; y: number }[] = WORLD_POPULATION.spiderPositions;
 
 // How much a single successful claim picks up into a worker's `carrying`,
 // and how much it decrements a finite node's remaining amount (capped at
@@ -275,14 +306,33 @@ export const APHID_IDLE_MAX = 4;
 // aphid in 3 hits (~3s at WORKER_ATTACK_COOLDOWN=1s), fast enough that
 // realtime/death tests stay quick. Balancing isn't a priority this stage.
 export const APHID_MAX_HEALTH = 30;
+
+// Stage 7: the one hostile predator species. Tuned so 3 hits from an
+// isolated worker kill it (SPIDER_MAX_HEALTH / WORKER_ATTACK_DAMAGE),
+// mirroring the aphid's own "3 worker hits" balance note above, while a
+// spider's own attack also kills an isolated worker in 3 hits
+// (WORKER_MAX_HEALTH / SPIDER_ATTACK_DAMAGE) — a fair fight, one on one.
+export const SPIDER_MAX_HEALTH = 30;
+
 export const SPECIES_MAX_HEALTH: Record<string, number> = {
   aphid: APHID_MAX_HEALTH,
+  spider: SPIDER_MAX_HEALTH,
 };
 
 // Protein credited to the colony's economy once a carcass is fully
 // harvested (split across however many gather claims it takes at
 // GATHER_YIELD per claim).
 export const APHID_PROTEIN_VALUE = 30;
+// A spider is a tougher kill than an aphid, so its carcass pays out more.
+export const SPIDER_PROTEIN_VALUE = 100;
+
+// Stage 7: generalizes the (previously hardcoded) APHID_PROTEIN_VALUE
+// lookup in killCreature so a new species needs only a new map entry, same
+// precedent as SPECIES_MAX_HEALTH above.
+export const CREATURE_PROTEIN_VALUE: Record<string, number> = {
+  aphid: APHID_PROTEIN_VALUE,
+  spider: SPIDER_PROTEIN_VALUE,
+};
 
 // Chosen comfortably above MIN_SEPARATION (20) so the separation force can
 // never prevent a worker reaching attack range — same scale as GATHER_RANGE
@@ -297,3 +347,27 @@ export const WORKER_ATTACK_COOLDOWN = 1;
 // SPIDER_ATTACK_DAMAGE is chosen so 3 hits kill an isolated worker, mirroring
 // the "aphid dies in 3 worker hits" balance note above.
 export const WORKER_MAX_HEALTH = 30;
+
+// Stage 7: spider movement/wander tuning, parallel to the APHID_* constants
+// above — shares the same idle/wander state machine (see advanceWander in
+// simulation.ts). Faster than an aphid (40) so a chase is a real threat, but
+// still under worker speed (150) so fleeing is always viable.
+export const SPIDER_RADIUS = 10; // client rendering only; larger than aphid, reads as more threatening
+export const SPIDER_SPEED = 70;
+export const SPIDER_WANDER_RADIUS = 150;
+export const SPIDER_IDLE_MIN = 1;
+export const SPIDER_IDLE_MAX = 4;
+
+// A spider notices a worker within SPIDER_AGGRO_RANGE and gives up the
+// chase once its target gets beyond SPIDER_DISENGAGE_RANGE — the gap
+// between the two means a worker that starts fleeing the instant it's
+// noticed has a real chance to break the chase, rather than aggro and
+// disengage being a single hair-trigger boundary.
+export const SPIDER_AGGRO_RANGE = 200;
+export const SPIDER_DISENGAGE_RANGE = 300;
+// Matches WORKER_ATTACK_RANGE/COOLDOWN's own scale reasoning — comfortably
+// above MIN_SEPARATION (20) so separation can never prevent a spider
+// reaching melee range.
+export const SPIDER_ATTACK_RANGE = 30;
+export const SPIDER_ATTACK_DAMAGE = 10;
+export const SPIDER_ATTACK_COOLDOWN = 1;

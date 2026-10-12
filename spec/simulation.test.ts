@@ -30,6 +30,7 @@ const {
   SUGAR_REGEN_RATE,
   BIOMASS_REGEN_RATE,
   APHID_SEED_POSITIONS,
+  SPIDER_SEED_POSITIONS,
   APHID_IDLE_MAX,
   APHID_MAX_HEALTH,
   APHID_PROTEIN_VALUE,
@@ -935,9 +936,12 @@ describe("Stage 5: renewable resource regeneration", () => {
 describe("Stage 5: aphid seed + wandering", () => {
   it("E: aphids seed deterministically and the same population survives a reset", () => {
     const creatures = sim.getCreaturesForWorld(world.id);
-    expect(creatures).toHaveLength(APHID_SEED_POSITIONS.length);
-    for (const c of creatures) {
-      expect(c.species).toBe("aphid");
+    // Stage 7: the creatures table now also seeds spiders (SPIDER_SEED_POSITIONS)
+    // in the same empty-table pass — the total is both populations combined.
+    expect(creatures).toHaveLength(APHID_SEED_POSITIONS.length + SPIDER_SEED_POSITIONS.length);
+    const aphids = creatures.filter((c) => c.species === "aphid");
+    expect(aphids).toHaveLength(APHID_SEED_POSITIONS.length);
+    for (const c of aphids) {
       expect(c.x).toBeGreaterThanOrEqual(0);
       expect(c.x).toBeLessThanOrEqual(world.width);
       expect(c.y).toBeGreaterThanOrEqual(0);

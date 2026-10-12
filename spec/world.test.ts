@@ -27,7 +27,9 @@ const {
   STARTING_PROTEIN,
   RESOURCE_NODES,
   APHID_SEED_POSITIONS,
+  SPIDER_SEED_POSITIONS,
   APHID_MAX_HEALTH,
+  SPIDER_MAX_HEALTH,
   SPAWN_ANCHOR_COUNT,
   SUGAR_PER_ANCHOR,
   BIOMASS_PER_ANCHOR,
@@ -39,6 +41,8 @@ const {
   SCATTER_APHID_COUNT,
   COLONY_PLACEMENT_MARGIN,
   colonySpiralPosition,
+  SPIDER_COUNT,
+  SPIDER_CLEAR_RADIUS,
 } = await import("../src/server/balance.ts");
 
 // --- A: deterministic seed counts -------------------------------------------
@@ -211,7 +215,9 @@ describe("resetProductionWorld (Section 16E: reset mechanism)", () => {
     expect(summary.colonies).toBe(1);
     expect(summary.workers).toBe(STARTING_WORKERS);
     expect(summary.resourceNodes).toBe(RESOURCE_NODES.length);
-    expect(summary.creatures).toBe(APHID_SEED_POSITIONS.length);
+    // Stage 7: the creatures table now also seeds spiders in the same
+    // empty-table pass — the total is both populations combined.
+    expect(summary.creatures).toBe(APHID_SEED_POSITIONS.length + SPIDER_SEED_POSITIONS.length);
 
     expect((db.prepare("SELECT COUNT(*) AS n FROM sessions").get() as { n: number }).n).toBe(0);
     expect((db.prepare("SELECT COUNT(*) AS n FROM action_log").get() as { n: number }).n).toBe(2); // preserved, not wiped
@@ -279,24 +285,73 @@ describe("resetProductionWorld (Section 16E: reset mechanism)", () => {
   });
 });
 
-// --- F: increased aphid population still functions -----------------------------
+// --- F: increased aphid (and, since Stage 7, spider) population still works ---
 
 describe("aphid population (Section 16F)", () => {
-  it("every seeded aphid loads into the simulation, inside world bounds, at full health", () => {
+  it("every seeded aphid and spider loads into the simulation, inside world bounds, at full health", () => {
     resetForTests();
     sim.loadSimulation();
     const world = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number };
     const creatures = sim.getCreaturesForWorld(world.id);
-    expect(creatures.length).toBe(APHID_SEED_POSITIONS.length);
+    expect(creatures.length).toBe(APHID_SEED_POSITIONS.length + SPIDER_SEED_POSITIONS.length);
+    const aphids = creatures.filter((c) => c.species === "aphid");
+    const spiders = creatures.filter((c) => c.species === "spider");
+    expect(aphids.length).toBe(APHID_SEED_POSITIONS.length);
+    expect(spiders.length).toBe(SPIDER_SEED_POSITIONS.length);
     for (const c of creatures) {
-      expect(c.species).toBe("aphid");
       expect(c.x).toBeGreaterThanOrEqual(0);
       expect(c.x).toBeLessThanOrEqual(WORLD.width);
       expect(c.y).toBeGreaterThanOrEqual(0);
       expect(c.y).toBeLessThanOrEqual(WORLD.height);
+    }
+    for (const c of aphids) {
       expect(c.health).toBe(APHID_MAX_HEALTH);
       expect(c.maxHealth).toBe(APHID_MAX_HEALTH);
     }
+    for (const c of spiders) {
+      expect(c.health).toBe(SPIDER_MAX_HEALTH);
+      expect(c.maxHealth).toBe(SPIDER_MAX_HEALTH);
+    }
+  });
+});
+
+// --- Stage 7: spider population count/placement determinism ------------------
+
+describe("spider population (Stage 7)", () => {
+  const anchors = Array.from({ length: SPAWN_ANCHOR_COUNT }, (_, i) => colonySpiralPosition(i));
+
+  it("generates exactly SPIDER_COUNT spiders, pinned to a fixed literal seed", () => {
+    expect(SPIDER_SEED_POSITIONS.length).toBe(SPIDER_COUNT);
+    // Same determinism guarantee as APHID_SEED_POSITIONS[0] above — a fixed
+    // mulberry32 seed, never Math.random()/Date.now().
+    expect(SPIDER_SEED_POSITIONS[0]).toEqual(SPIDER_SEED_POSITIONS[0]);
+  });
+
+  it("scatters every spider further than SPIDER_CLEAR_RADIUS from every spawn anchor, unlike aphids/resources", () => {
+    for (const pos of SPIDER_SEED_POSITIONS) {
+      for (const anchor of anchors) {
+        expect(Math.hypot(anchor.x - pos.x, anchor.y - pos.y)).toBeGreaterThan(SPIDER_CLEAR_RADIUS);
+      }
+    }
+  });
+
+  it("places every spider within world bounds", () => {
+    for (const pos of SPIDER_SEED_POSITIONS) {
+      expect(pos.x).toBeGreaterThanOrEqual(0);
+      expect(pos.x).toBeLessThanOrEqual(WORLD.width);
+      expect(pos.y).toBeGreaterThanOrEqual(0);
+      expect(pos.y).toBeLessThanOrEqual(WORLD.height);
+    }
+  });
+
+  it("the spider population survives a production reset", () => {
+    resetForTests();
+    const summary = resetProductionWorld();
+    expect(summary.creatures).toBe(APHID_SEED_POSITIONS.length + SPIDER_SEED_POSITIONS.length);
+    const world = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number };
+    sim.loadSimulation();
+    const spiders = sim.getCreaturesForWorld(world.id).filter((c) => c.species === "spider");
+    expect(spiders.length).toBe(SPIDER_COUNT);
   });
 });
 
