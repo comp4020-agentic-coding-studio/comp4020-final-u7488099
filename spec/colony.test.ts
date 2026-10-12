@@ -7,6 +7,12 @@ const baseUrl = inject("baseUrl");
 // same as the rest of this file.
 const RESOURCE_TYPES = ["sugar", "protein", "biomass"];
 
+// Stage 6b: a fresh colony starts with exactly one reproduction's worth of
+// protein already deposited (enough to test reproduction immediately,
+// without a hunt-and-carry round trip first) — see balance.ts's
+// STARTING_PROTEIN. Sugar/biomass still start at 0.
+const STARTING_PROTEIN = 50;
+
 // Crit 10: every request in this file now carries a session cookie, so the
 // whole suite exercises exactly one colony throughout (one consistent
 // browser profile), matching this file's pre-Crit-10 single-colony
@@ -69,7 +75,7 @@ it("seeds a large continuous world with one colony, 3 workers near the queen, an
   expect(state.colony.queenY).toBeLessThanOrEqual(state.world.height);
 
   for (const type of RESOURCE_TYPES) {
-    expect(state.colony.resources[type]).toBe(0);
+    expect(state.colony.resources[type]).toBe(type === "protein" ? STARTING_PROTEIN : 0);
   }
 
   expect(state.workers).toHaveLength(3);
@@ -245,9 +251,32 @@ it("still has the mutated resource count and worker count on a fresh request", a
 });
 
 it("a worker that's carrying resources home rejects a new move command, but a free worker in the same batch still moves", async () => {
-  const before = await getState();
-  const [busyCandidate, freeWorker] = before.workers;
+  // The previous two tests' gatherProteinUntil calls can leave a worker still
+  // mid-round-trip when they exit (they only wait for the protein total to
+  // rise, not for every in-flight gather to finish) — wait for at least 2
+  // genuinely idle workers before picking this test's two candidates, rather
+  // than assuming before.workers[0]/[1] are both free.
+  let before = await getState();
+  const idleDeadline = Date.now() + 15000;
+  while (before.workers.filter((w: any) => !w.carrying).length < 2 && Date.now() < idleDeadline) {
+    await new Promise((r) => setTimeout(r, 200));
+    before = await getState();
+  }
+  const [busyCandidate, freeWorker] = before.workers.filter((w: any) => !w.carrying);
   const sugarNode = closestNode(before, busyCandidate, "sugar");
+
+  // freeWorker looked idle (not carrying) in the snapshot above, but it may
+  // still have a stale in-flight gather command from an earlier test's
+  // gatherProteinUntil (carrying is null until arrival/claim, so "not
+  // carrying" alone doesn't mean "no command"). Issuing it a move to its own
+  // current position unconditionally overwrites any such command and settles
+  // it before the real assertion below, so it can't suddenly start carrying
+  // mid-test.
+  await request("/api/command/move", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: [freeWorker.id], x: freeWorker.x, y: freeWorker.y }),
+  });
 
   await request("/api/command/gather", {
     method: "POST",

@@ -25,6 +25,7 @@ const {
   SIMULATION,
   GATHER_YIELD,
   REPRODUCE_COST,
+  STARTING_PROTEIN,
   SUGAR_NODE_MAX_AMOUNT,
   SUGAR_REGEN_RATE,
   BIOMASS_REGEN_RATE,
@@ -624,7 +625,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
       expect(sim.getWorkerCommand(w.id)).toBe("return");
     }
     expect(nodeRow(proteinNode.id)).toBeUndefined();
-    expect(resourceAmount("protein")).toBe(0); // fresh colony, and none credited yet anyway
+    expect(resourceAmount("protein")).toBe(STARTING_PROTEIN); // fresh colony, and none credited yet anyway
   });
 
   it("a claim within deposit range of the queen still takes a second tick to deposit", () => {
