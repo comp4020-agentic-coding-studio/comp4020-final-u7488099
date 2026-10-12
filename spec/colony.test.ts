@@ -7,8 +7,30 @@ const baseUrl = inject("baseUrl");
 // same as the rest of this file.
 const RESOURCE_TYPES = ["sugar", "protein", "biomass"];
 
+// Crit 10: every request in this file now carries a session cookie, so the
+// whole suite exercises exactly one colony throughout (one consistent
+// browser profile), matching this file's pre-Crit-10 single-colony
+// assumptions. Duplicated from spec/multiplayer.test.ts's createSession()
+// rather than imported — that file is intentionally self-contained and
+// deliberately never touched to adapt other tests. See CLAUDE.md.
+function createSession() {
+  let cookie: string | null = null;
+  return async function request(path: string, init: RequestInit = {}) {
+    const headers = new Headers(init.headers);
+    if (cookie) headers.set("cookie", cookie);
+    const res = await fetch(new URL(path, baseUrl), { ...init, headers });
+    const setCookie = (res.headers as any).getSetCookie?.() ?? [];
+    for (const header of setCookie) {
+      cookie = cookie ? `${cookie}; ${header.split(";")[0]}` : header.split(";")[0];
+    }
+    return res;
+  };
+}
+
+const request = createSession();
+
 async function getState() {
-  const res = await fetch(new URL("/api/state", baseUrl));
+  const res = await request("/api/state");
   expect(res.status).toBe(200);
   return res.json();
 }
@@ -73,7 +95,7 @@ it("gathering requires travel: no instant credit on issue, then the clicked node
   const worker = before.workers[0];
   const node = closestNode(before, worker, "sugar");
 
-  const res = await fetch(new URL("/api/command/gather", baseUrl), {
+  const res = await request("/api/command/gather", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
@@ -97,7 +119,7 @@ it("a move command with several valid worker ids moves all of them", async () =>
   const movers = before.workers.slice(0, 2);
   const target = { x: Math.min(before.world.width - 10, before.colony.queenX + 400), y: before.colony.queenY };
 
-  const res = await fetch(new URL("/api/command/move", baseUrl), {
+  const res = await request("/api/command/move", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ workerIds: movers.map((w: any) => w.id), x: target.x, y: target.y }),
@@ -121,7 +143,7 @@ it("a move command with one valid and one invalid id still moves the valid worke
   const worker = before.workers[0];
   const target = { x: Math.min(before.world.width - 10, worker.x + 400), y: worker.y };
 
-  const res = await fetch(new URL("/api/command/move", baseUrl), {
+  const res = await request("/api/command/move", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ workerIds: [worker.id, 999999], x: target.x, y: target.y }),
@@ -138,7 +160,7 @@ it("a move command with one valid and one invalid id still moves the valid worke
 
 it("rejects a gather command for a worker or resource that doesn't exist, with no instant credit either way", async () => {
   const before = await getState();
-  const res = await fetch(new URL("/api/command/gather", baseUrl), {
+  const res = await request("/api/command/gather", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ workerIds: [999999], resourceId: 999999 }),
@@ -163,7 +185,7 @@ async function gatherProteinUntil(targetProtein: number): Promise<void> {
     const idleWorkers = state.workers.filter((w: any) => !w.carrying);
     for (const worker of idleWorkers) {
       const node = closestNode(state, worker, "protein");
-      await fetch(new URL("/api/command/gather", baseUrl), {
+      await request("/api/command/gather", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
@@ -181,7 +203,7 @@ it("reproduce spends protein and adds a worker at the queen's position", { timeo
   await gatherProteinUntil(50);
   const before = await getState();
 
-  const res = await fetch(new URL("/api/reproduce", baseUrl), { method: "POST" });
+  const res = await request("/api/reproduce", { method: "POST" });
   expect(res.status).toBe(200);
   const after = await res.json();
 
@@ -198,7 +220,7 @@ it("rejects reproduce with insufficient protein, without mutating state", async 
   const before = await getState();
   expect(before.colony.resources.protein).toBeLessThan(50);
 
-  const res = await fetch(new URL("/api/reproduce", baseUrl), { method: "POST" });
+  const res = await request("/api/reproduce", { method: "POST" });
   expect(res.status).toBe(400);
 
   const after = await getState();
@@ -227,7 +249,7 @@ it("a worker that's carrying resources home rejects a new move command, but a fr
   const [busyCandidate, freeWorker] = before.workers;
   const sugarNode = closestNode(before, busyCandidate, "sugar");
 
-  await fetch(new URL("/api/command/gather", baseUrl), {
+  await request("/api/command/gather", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ workerIds: [busyCandidate.id], resourceId: sugarNode.id }),
@@ -244,7 +266,7 @@ it("a worker that's carrying resources home rejects a new move command, but a fr
   expect(busyWorker.carrying).toBeTruthy();
 
   const target = { x: Math.min(before.world.width - 10, freeWorker.x + 400), y: freeWorker.y };
-  const res = await fetch(new URL("/api/command/move", baseUrl), {
+  const res = await request("/api/command/move", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ workerIds: [busyWorker.id, freeWorker.id], x: target.x, y: target.y }),
@@ -289,7 +311,7 @@ it("dispatches an attack command: valid ids succeed and the worker chases the ap
   const worker = before.workers.find((w: any) => !w.carrying) ?? before.workers[0];
   const creature = before.creatures[0];
 
-  const badRes = await fetch(new URL("/api/command/attack", baseUrl), {
+  const badRes = await request("/api/command/attack", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ workerIds: [worker.id, 999999], creatureId: creature.id }),
@@ -298,7 +320,7 @@ it("dispatches an attack command: valid ids succeed and the worker chases the ap
   const badBody = await badRes.json();
   expect(badBody.errors).toEqual({ 999999: "no such worker" });
 
-  const allBadRes = await fetch(new URL("/api/command/attack", baseUrl), {
+  const allBadRes = await request("/api/command/attack", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ workerIds: [999999], creatureId: creature.id }),
@@ -339,7 +361,7 @@ it(
       before.resourceNodes.filter((n: any) => n.kind === "item").map((n: any) => n.id),
     );
 
-    const attackRes = await fetch(new URL("/api/command/attack", baseUrl), {
+    const attackRes = await request("/api/command/attack", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ workerIds: [worker.id], creatureId: creature.id }),
@@ -364,7 +386,7 @@ it(
     // which would pick whichever protein node is nearest to an idle worker
     // and might find an ordinary source node instead of this specific carcass.
     const killerId = worker.id;
-    const gatherRes = await fetch(new URL("/api/command/gather", baseUrl), {
+    const gatherRes = await request("/api/command/gather", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ workerIds: [killerId], resourceId: carcass.id }),

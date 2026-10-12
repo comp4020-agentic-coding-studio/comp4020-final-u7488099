@@ -5,15 +5,38 @@ const baseUrl = inject("baseUrl");
 const wsUrl = new URL("/ws", baseUrl);
 wsUrl.protocol = wsUrl.protocol.replace("http", "ws");
 
+// Crit 10: every HTTP call and every WebSocket connection in this file now
+// belongs to the same one session/colony (one consistent browser profile),
+// matching this file's pre-Crit-10 single-colony assumptions. The cookie
+// jar itself mirrors spec/multiplayer.test.ts's createSession() (duplicated,
+// not imported — that file is deliberately self-contained), but is kept at
+// module scope here rather than per-session, since connect()'s WebSocket
+// handshake also needs to read the latest cookie value directly — a WS
+// upgrade bypasses Express entirely, so the handshake must carry the cookie
+// header itself rather than relying on a browser's cookie jar. See
+// CLAUDE.md's Crit 10 section.
+let sessionCookie: string | null = null;
+
+async function request(path: string, init: RequestInit = {}) {
+  const headers = new Headers(init.headers);
+  if (sessionCookie) headers.set("cookie", sessionCookie);
+  const res = await fetch(new URL(path, baseUrl), { ...init, headers });
+  const setCookie = (res.headers as any).getSetCookie?.() ?? [];
+  for (const header of setCookie) {
+    sessionCookie = sessionCookie ? `${sessionCookie}; ${header.split(";")[0]}` : header.split(";")[0];
+  }
+  return res;
+}
+
 async function getState() {
-  const res = await fetch(new URL("/api/state", baseUrl));
+  const res = await request("/api/state");
   expect(res.status).toBe(200);
   return res.json();
 }
 
 function connect(): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(wsUrl, sessionCookie ? { headers: { cookie: sessionCookie } } : undefined);
     ws.once("open", () => resolve(ws));
     ws.once("error", reject);
   });
@@ -63,7 +86,7 @@ it("pushes the updated resources to an open connection when a gather command com
 
   const ws = await connect();
   try {
-    const res = await fetch(new URL("/api/command/gather", baseUrl), {
+    const res = await request("/api/command/gather", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
@@ -85,7 +108,7 @@ it("broadcasts to every open connection, not just the one that caused the change
     const worker = before.workers[1];
     const node = closestNode(before, worker, "sugar");
 
-    const res = await fetch(new URL("/api/command/gather", baseUrl), {
+    const res = await request("/api/command/gather", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
@@ -111,7 +134,7 @@ it("worker movement is broadcast to open WebSocket clients without a reload", as
 
   const ws = await connect();
   try {
-    const res = await fetch(new URL("/api/command/move", baseUrl), {
+    const res = await request("/api/command/move", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ workerIds: [worker.id], x: target.x, y: target.y }),
@@ -141,7 +164,7 @@ it("a group move command broadcasts one frame reflecting every moved worker to e
 
   const [wsA, wsB] = await Promise.all([connect(), connect()]);
   try {
-    const res = await fetch(new URL("/api/command/move", baseUrl), {
+    const res = await request("/api/command/move", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ workerIds: movers.map((w: any) => w.id), x: target.x, y: target.y }),
@@ -187,7 +210,7 @@ async function gatherProteinUntil(targetProtein: number): Promise<void> {
     const idleWorkers = state.workers.filter((w: any) => !w.carrying);
     for (const worker of idleWorkers) {
       const node = closestNode(state, worker, "protein");
-      await fetch(new URL("/api/command/gather", baseUrl), {
+      await request("/api/command/gather", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
@@ -206,8 +229,8 @@ it("two simultaneous reproduce calls racing for the same protein: exactly one su
   const before = await getState();
 
   const [resA, resB] = await Promise.all([
-    fetch(new URL("/api/reproduce", baseUrl), { method: "POST" }),
-    fetch(new URL("/api/reproduce", baseUrl), { method: "POST" }),
+    request("/api/reproduce", { method: "POST" }),
+    request("/api/reproduce", { method: "POST" }),
   ]);
 
   expect([resA.status, resB.status].sort()).toEqual([200, 400]);
@@ -227,7 +250,7 @@ it(
 
     const [wsA, wsB] = await Promise.all([connect(), connect()]);
     try {
-      const res = await fetch(new URL("/api/command/gather", baseUrl), {
+      const res = await request("/api/command/gather", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
@@ -332,7 +355,7 @@ it(
 
     const [wsA, wsB] = await Promise.all([connect(), connect()]);
     try {
-      const res = await fetch(new URL("/api/command/attack", baseUrl), {
+      const res = await request("/api/command/attack", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ workerIds: [worker.id], creatureId: creature.id }),

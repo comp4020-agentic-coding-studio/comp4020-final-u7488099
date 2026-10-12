@@ -154,7 +154,7 @@ describe("gradual movement", () => {
     const start = { x: worker.x, y: worker.y };
     const target = { x: start.x + 1000, y: start.y };
 
-    expect(sim.issueMoveCommand(worker.id, target.x, target.y)).toBeNull();
+    expect(sim.issueMoveCommand(worker.id, target.x, target.y, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     const after = workerById(worker.id);
@@ -168,7 +168,7 @@ describe("gradual movement", () => {
     // affected each other), but Stage 3's separation makes a passing-by
     // worker observable to anyone it nears. Send it back home and let it
     // settle so later tests' own geometry is the only thing in play.
-    expect(sim.issueMoveCommand(worker.id, start.x, start.y)).toBeNull();
+    expect(sim.issueMoveCommand(worker.id, start.x, start.y, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
     expect(workerById(worker.id)).toEqual({ id: worker.id, x: start.x, y: start.y, carrying: null });
     expect(sim.getWorkerCommand(worker.id)).toBe("idle");
@@ -181,7 +181,7 @@ describe("arrival", () => {
     const start = { x: worker.x, y: worker.y };
     const target = { x: start.x + 30, y: start.y };
 
-    expect(sim.issueMoveCommand(worker.id, target.x, target.y)).toBeNull();
+    expect(sim.issueMoveCommand(worker.id, target.x, target.y, colony.id)).toBeNull();
     // 30 units at WORKER_SPEED=150/s needs 0.2s; advance well past that.
     for (let i = 0; i < 10; i++) sim.advanceSimulation(TICK_DT);
 
@@ -198,19 +198,19 @@ describe("arrival", () => {
 
 describe("world bounds / invalid movement", () => {
   it("rejects a command for a worker that doesn't exist", () => {
-    expect(sim.issueMoveCommand(999999, 100, 100)).toBe("no such worker");
+    expect(sim.issueMoveCommand(999999, 100, 100, colony.id)).toBe("no such worker");
   });
 
   it("rejects non-finite coordinates", () => {
     const [, , worker] = sim.getWorkersForColony(colony.id);
-    expect(sim.issueMoveCommand(worker.id, Number.NaN, 100)).toBe("invalid coordinates");
-    expect(sim.issueMoveCommand(worker.id, 100, Number.POSITIVE_INFINITY)).toBe("invalid coordinates");
+    expect(sim.issueMoveCommand(worker.id, Number.NaN, 100, colony.id)).toBe("invalid coordinates");
+    expect(sim.issueMoveCommand(worker.id, 100, Number.POSITIVE_INFINITY, colony.id)).toBe("invalid coordinates");
   });
 
   it("rejects coordinates outside the world bounds", () => {
     const [, , worker] = sim.getWorkersForColony(colony.id);
-    expect(sim.issueMoveCommand(worker.id, -10, 100)).toBe("coordinates out of bounds");
-    expect(sim.issueMoveCommand(worker.id, world.width + 10, 100)).toBe("coordinates out of bounds");
+    expect(sim.issueMoveCommand(worker.id, -10, 100, colony.id)).toBe("coordinates out of bounds");
+    expect(sim.issueMoveCommand(worker.id, world.width + 10, 100, colony.id)).toBe("coordinates out of bounds");
   });
 });
 
@@ -219,7 +219,7 @@ describe("checkpoint persistence", () => {
     const [worker] = sim.getWorkersForColony(colony.id);
     const target = { x: worker.x + 1000, y: worker.y };
 
-    expect(sim.issueMoveCommand(worker.id, target.x, target.y)).toBeNull();
+    expect(sim.issueMoveCommand(worker.id, target.x, target.y, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT); // mid-flight, not arrived
     const midFlight = workerById(worker.id);
     expect(sim.getWorkerCommand(worker.id)).toBe("move");
@@ -247,7 +247,7 @@ describe("gather: travel + claim", () => {
     const worker = registerTestWorker(9001, sugarNode.x - 500, sugarNode.y);
     const before = resourceAmount("sugar");
 
-    expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
 
     expect(sim.getWorkerCommand(worker.id)).toBe("gather");
     expect(resourceAmount("sugar")).toBe(before);
@@ -259,7 +259,7 @@ describe("gather: travel + claim", () => {
     const worker = registerTestWorker(9002, sugarNode.x, sugarNode.y);
     const before = resourceAmount("sugar");
 
-    expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     expect(resourceAmount("sugar")).toBe(before); // not credited yet — only deposit credits the colony
@@ -277,7 +277,7 @@ describe("gather: travel + claim", () => {
     const beforeColony = resourceAmount("protein");
     const beforeNode = nodeRow(proteinNode.id)!.amount!;
 
-    expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     expect(resourceAmount("protein")).toBe(beforeColony); // not credited until deposit
@@ -292,7 +292,7 @@ describe("gather: travel + claim", () => {
     const worker = registerTestWorker(9004, proteinNode.x, proteinNode.y);
     const beforeColony = resourceAmount("protein");
 
-    expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     expect(resourceAmount("protein")).toBe(beforeColony); // still not credited
@@ -310,8 +310,8 @@ describe("gather: travel + claim", () => {
     const second = registerTestWorker(9006, proteinNode.x + 5, proteinNode.y);
     const beforeColony = resourceAmount("protein");
 
-    expect(sim.issueGatherCommand(first.id, proteinNode.id)).toBeNull();
-    expect(sim.issueGatherCommand(second.id, proteinNode.id)).toBeNull();
+    expect(sim.issueGatherCommand(first.id, proteinNode.id, colony.id)).toBeNull();
+    expect(sim.issueGatherCommand(second.id, proteinNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     // The node only had GATHER_YIELD left — exactly one claim can have landed.
@@ -325,10 +325,10 @@ describe("gather: travel + claim", () => {
 
   it("F: rejects a gather command for a worker or resource node that doesn't exist", () => {
     const [sugarNode] = findNodesByType("sugar");
-    expect(sim.issueGatherCommand(999999, sugarNode.id)).toBe("no such worker");
+    expect(sim.issueGatherCommand(999999, sugarNode.id, colony.id)).toBe("no such worker");
 
     const worker = registerTestWorker(9007, 0, 0);
-    expect(sim.issueGatherCommand(worker.id, 999999)).toBe("no such resource node");
+    expect(sim.issueGatherCommand(worker.id, 999999, colony.id)).toBe("no such resource node");
   });
 
   it("G: a node that disappears mid-flight redirects the worker to its last-known position instead of crediting anything", () => {
@@ -336,7 +336,7 @@ describe("gather: travel + claim", () => {
     const worker = registerTestWorker(9008, proteinNode.x - 1000, proteinNode.y);
     const beforeColony = resourceAmount("protein");
 
-    expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT); // mid-flight, resource still exists
 
     db.prepare("DELETE FROM resource_nodes WHERE id = ?").run(proteinNode.id);
@@ -360,7 +360,7 @@ describe("group commands", () => {
     const workers3 = [10001, 10002, 10003].map((id) => registerTestWorker(id, base.x, base.y + id));
     const target = { x: base.x + 1000, y: base.y };
 
-    for (const w of workers3) expect(sim.issueMoveCommand(w.id, target.x, target.y)).toBeNull();
+    for (const w of workers3) expect(sim.issueMoveCommand(w.id, target.x, target.y, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     for (const w of workers3) {
@@ -380,12 +380,12 @@ describe("group commands", () => {
     const firstTarget = { x: 2500, y: 2000 };
     const secondTarget = { x: 2000, y: 2500 };
 
-    expect(sim.issueMoveCommand(a.id, firstTarget.x, firstTarget.y)).toBeNull();
-    expect(sim.issueMoveCommand(b.id, firstTarget.x, firstTarget.y)).toBeNull();
+    expect(sim.issueMoveCommand(a.id, firstTarget.x, firstTarget.y, colony.id)).toBeNull();
+    expect(sim.issueMoveCommand(b.id, firstTarget.x, firstTarget.y, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     // Retarget `a` mid-flight before it arrives; `b` keeps heading to firstTarget.
-    expect(sim.issueMoveCommand(a.id, secondTarget.x, secondTarget.y)).toBeNull();
+    expect(sim.issueMoveCommand(a.id, secondTarget.x, secondTarget.y, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     const afterA = workerById(a.id);
@@ -402,7 +402,7 @@ describe("group commands", () => {
     const group = [10006, 10007, 10008].map((id) => registerTestWorker(id, sugarNode.x, sugarNode.y));
     const before = resourceAmount("sugar");
 
-    for (const w of group) expect(sim.issueGatherCommand(w.id, sugarNode.id)).toBeNull();
+    for (const w of group) expect(sim.issueGatherCommand(w.id, sugarNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     // Claiming doesn't credit the colony — each worker is now carrying its
@@ -428,7 +428,7 @@ describe("group commands", () => {
     );
     const beforeColony = resourceAmount("protein");
 
-    for (const w of group) expect(sim.issueGatherCommand(w.id, proteinNode.id)).toBeNull();
+    for (const w of group) expect(sim.issueGatherCommand(w.id, proteinNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     // The node only had GATHER_YIELD left — exactly one claim can have
@@ -472,7 +472,7 @@ describe("Stage 3: loose swarm movement", () => {
     expect(destinations.get(11006)).toEqual(center);
 
     const worker = registerTestWorker(11006, center.x - 30, center.y);
-    expect(sim.issueMoveCommand(worker.id, center.x, center.y)).toBeNull();
+    expect(sim.issueMoveCommand(worker.id, center.x, center.y, colony.id)).toBeNull();
     for (let i = 0; i < 10; i++) sim.advanceSimulation(TICK_DT);
 
     const after = workerById(worker.id);
@@ -500,7 +500,7 @@ describe("Stage 3: loose swarm movement", () => {
     const destinations = sim.computeGroupDestinations(ids, target.x, target.y);
     for (const id of ids) {
       const dest = destinations.get(id)!;
-      expect(sim.issueMoveCommand(id, dest.x, dest.y)).toBeNull();
+      expect(sim.issueMoveCommand(id, dest.x, dest.y, colony.id)).toBeNull();
     }
     for (let i = 0; i < 50; i++) sim.advanceSimulation(TICK_DT);
 
@@ -526,7 +526,7 @@ describe("Stage 3: loose swarm movement", () => {
     registerTestWorker(11014, 510, 500);
     const target = { x: 1000, y: 500 };
 
-    expect(sim.issueMoveCommand(mover.id, target.x, target.y)).toBeNull();
+    expect(sim.issueMoveCommand(mover.id, target.x, target.y, colony.id)).toBeNull();
     for (let i = 0; i < 50; i++) sim.advanceSimulation(TICK_DT);
 
     expect(workerById(mover.id).x).toBeGreaterThan(800);
@@ -563,7 +563,7 @@ describe("Stage 3: loose swarm movement", () => {
     const group = [11019, 11020, 11021].map((id, i) => registerTestWorker(id, 2000 + i * 5, 2800));
     const beforeColony = resourceAmount("biomass");
 
-    for (const w of group) expect(sim.issueGatherCommand(w.id, nodeId)).toBeNull();
+    for (const w of group) expect(sim.issueGatherCommand(w.id, nodeId, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     // Exactly one claim can have landed — and even that claim doesn't credit
@@ -585,7 +585,7 @@ describe("Stage 3: loose swarm movement", () => {
     const starts = ids.map((id, i) => registerTestWorker(id, 2000, 50 + i * 2));
     const firstTarget = { x: 2500, y: 50 };
 
-    for (const w of starts) expect(sim.issueMoveCommand(w.id, firstTarget.x, firstTarget.y)).toBeNull();
+    for (const w of starts) expect(sim.issueMoveCommand(w.id, firstTarget.x, firstTarget.y, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     // Baseline is taken right before the redirect, not at registration — the
@@ -596,7 +596,7 @@ describe("Stage 3: loose swarm movement", () => {
     // somehow erases that first tick's spacing adjustment.
     const beforeRedirect = workerById(starts[0].id);
     const secondTarget = { x: 2000, y: 500 };
-    expect(sim.issueMoveCommand(starts[0].id, secondTarget.x, secondTarget.y)).toBeNull();
+    expect(sim.issueMoveCommand(starts[0].id, secondTarget.x, secondTarget.y, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     const redirected = workerById(starts[0].id);
@@ -616,7 +616,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
     db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD * 3, proteinNode.id);
     const group = [9102, 9103, 9104].map((id, i) => registerTestWorker(id, proteinNode.x + i * 5, proteinNode.y));
 
-    for (const w of group) expect(sim.issueGatherCommand(w.id, proteinNode.id)).toBeNull();
+    for (const w of group) expect(sim.issueGatherCommand(w.id, proteinNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     for (const w of group) {
@@ -633,7 +633,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
     const worker = registerTestWorker(9105, queen.x + 20, queen.y);
     const beforeColony = resourceAmount("sugar");
 
-    expect(sim.issueGatherCommand(worker.id, nodeId)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT); // claim resolves: carrying set, command becomes "return"
 
     expect(workerById(worker.id).carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
@@ -651,7 +651,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
     const [worker] = sim.getWorkersForColony(colony.id);
     const [proteinNode] = findNodesByType("protein");
     sim.registerWorker({ id: worker.id, colonyId: colony.id, x: proteinNode.x, y: proteinNode.y });
-    expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     const carryingBefore = workerById(worker.id).carrying;
@@ -670,7 +670,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
     const nodeId = insertNode(queen.x + 20, queen.y, "sugar", null);
     sim.registerWorker({ id: worker.id, colonyId: colony.id, x: queen.x + 20, y: queen.y });
 
-    expect(sim.issueGatherCommand(worker.id, nodeId)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT); // claim -> carrying, command "return"
     sim.advanceSimulation(TICK_DT); // already in deposit range -> deposits
 
@@ -693,7 +693,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
     );
     const [proteinNode] = findNodesByType("protein");
     const worker = registerTestWorker(9100, proteinNode.x, proteinNode.y);
-    expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
     expect(workerById(worker.id).carrying).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
 
@@ -703,13 +703,13 @@ describe("Stage 4: carry, return, deposit economy", () => {
   it("a carrying worker rejects move and gather commands, leaving its state unchanged", () => {
     const [sugarNode] = findNodesByType("sugar");
     const worker = registerTestWorker(9101, sugarNode.x, sugarNode.y);
-    expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
     const carryingState = workerById(worker.id);
     expect(carryingState.carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
 
-    expect(sim.issueMoveCommand(worker.id, 0, 0)).toBe("worker is busy returning resources");
-    expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBe("worker is busy returning resources");
+    expect(sim.issueMoveCommand(worker.id, 0, 0, colony.id)).toBe("worker is busy returning resources");
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBe("worker is busy returning resources");
     expect(sim.getWorkerCommand(worker.id)).toBe("return");
     expect(workerById(worker.id)).toEqual(carryingState);
   });
@@ -758,7 +758,7 @@ describe("Stage 5: renewable resource regeneration", () => {
     db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(1, sugarNode.id);
     const worker = registerTestWorker(9200, sugarNode.x, sugarNode.y);
 
-    expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT); // regen (node still below GATHER_YIELD) then claim drains it exactly to 0
 
     expect(fullNodeRow(sugarNode.id)?.amount).toBe(0);
@@ -836,21 +836,21 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     const [creature] = sim.getCreaturesForWorld(world.id);
     const worker = registerTestWorker(13001, creature.x, creature.y);
 
-    expect(sim.issueAttackCommand(999999, creature.id)).toBe("no such worker");
-    expect(sim.issueAttackCommand(worker.id, 999999)).toBe("no such creature");
-    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(999999, creature.id, colony.id)).toBe("no such worker");
+    expect(sim.issueAttackCommand(worker.id, 999999, colony.id)).toBe("no such creature");
+    expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBeNull();
     expect(sim.getWorkerCommand(worker.id)).toBe("attack");
   });
 
   it("B: a carrying worker rejects an attack command and keeps returning", () => {
     const [sugarNode] = findNodesByType("sugar");
     const worker = registerTestWorker(13002, sugarNode.x, sugarNode.y);
-    expect(sim.issueGatherCommand(worker.id, sugarNode.id)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
     expect(workerById(worker.id).carrying).not.toBeNull();
 
     const [creature] = sim.getCreaturesForWorld(world.id);
-    expect(sim.issueAttackCommand(worker.id, creature.id)).toBe("worker is busy returning resources");
+    expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBe("worker is busy returning resources");
     expect(sim.getWorkerCommand(worker.id)).toBe("return");
   });
 
@@ -859,7 +859,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     const startX = creature.x;
     const startY = creature.y;
     const worker = registerTestWorker(13003, creature.x + 2000, creature.y);
-    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBeNull();
 
     // Stop as soon as the worker first reaches attack range, rather than
     // running a fixed number of ticks — once in range, cooldown-gated hits
@@ -886,7 +886,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
   it("D: closes to within attack range without overshooting past the creature", () => {
     const [creature] = sim.getCreaturesForWorld(world.id);
     const worker = registerTestWorker(13004, creature.x - (WORKER_ATTACK_RANGE + 50), creature.y);
-    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBeNull();
 
     // Exactly 10 ticks = 1 second = the aphid's idle period, so it hasn't
     // started wandering yet and this geometry stays exact.
@@ -901,7 +901,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
   it("E: cooldown gates how often damage lands", () => {
     const [creature] = sim.getCreaturesForWorld(world.id);
     const worker = registerTestWorker(13005, creature.x, creature.y);
-    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBeNull();
 
     sim.advanceSimulation(TICK_DT); // first hit lands immediately — cooldownRemaining starts at 0
     const afterFirstHit = creatureById(creature.id).health;
@@ -918,8 +918,8 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     const [creature] = sim.getCreaturesForWorld(world.id);
     const a = registerTestWorker(13006, creature.x, creature.y);
     const b = registerTestWorker(13007, creature.x + 5, creature.y);
-    expect(sim.issueAttackCommand(a.id, creature.id)).toBeNull();
-    expect(sim.issueAttackCommand(b.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(a.id, creature.id, colony.id)).toBeNull();
+    expect(sim.issueAttackCommand(b.id, creature.id, colony.id)).toBeNull();
 
     sim.advanceSimulation(TICK_DT);
 
@@ -929,7 +929,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
   it("G: damaged health persists through loadSimulation", () => {
     const [creature] = sim.getCreaturesForWorld(world.id);
     const worker = registerTestWorker(13008, creature.x, creature.y);
-    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
     const damagedHealth = creatureById(creature.id).health;
     expect(damagedHealth).toBeLessThan(creature.maxHealth);
@@ -945,7 +945,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     const [creature] = sim.getCreaturesForWorld(world.id);
     setCreatureHealth(creature.id, WORKER_ATTACK_DAMAGE); // dies in exactly one hit
     const worker = registerTestWorker(13009, creature.x, creature.y);
-    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBeNull();
 
     sim.advanceSimulation(TICK_DT);
 
@@ -971,7 +971,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     const [creature] = sim.getCreaturesForWorld(world.id);
     setCreatureHealth(creature.id, WORKER_ATTACK_DAMAGE);
     const worker = registerTestWorker(13010, creature.x, creature.y);
-    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBeNull();
 
     sim.advanceSimulation(TICK_DT);
 
@@ -987,7 +987,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     const [creature] = sim.getCreaturesForWorld(world.id);
     setCreatureHealth(creature.id, WORKER_ATTACK_DAMAGE);
     const worker = registerTestWorker(13011, creature.x, creature.y);
-    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT); // kill lands, carcass created
 
     const carcass = db.prepare("SELECT id FROM resource_nodes WHERE kind = 'item'").get() as { id: number };
@@ -998,7 +998,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
 
     db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD, carcass.id);
     const gatherer = registerTestWorker(13012, creature.x, creature.y);
-    expect(sim.issueGatherCommand(gatherer.id, carcass.id)).toBeNull();
+    expect(sim.issueGatherCommand(gatherer.id, carcass.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     expect(nodeRow(carcass.id)).toBeUndefined(); // deleted once fully claimed, same as any finite node
@@ -1012,12 +1012,12 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     sim.loadSimulation();
     const liveCreature = creatureById(creature.id);
     const worker = registerTestWorker(13013, liveCreature.x, liveCreature.y);
-    expect(sim.issueAttackCommand(worker.id, liveCreature.id)).toBeNull();
+    expect(sim.issueAttackCommand(worker.id, liveCreature.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT); // kill lands; worker goes idle; carcass appears next to the queen
 
     const beforeColony = resourceAmount("protein");
     const carcass = db.prepare("SELECT id FROM resource_nodes WHERE kind = 'item'").get() as { id: number };
-    expect(sim.issueGatherCommand(worker.id, carcass.id)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, carcass.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT); // claim resolves: carrying set, command becomes return
     expect(resourceAmount("protein")).toBe(beforeColony); // claiming alone never credits
 
@@ -1036,8 +1036,8 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     // each other legitimately drift apart, which isn't what this test is
     // checking for. Still within WORKER_ATTACK_RANGE of the creature.
     const b = registerTestWorker(13015, creature.x, creature.y + 25);
-    expect(sim.issueAttackCommand(a.id, creature.id)).toBeNull();
-    expect(sim.issueAttackCommand(b.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(a.id, creature.id, colony.id)).toBeNull();
+    expect(sim.issueAttackCommand(b.id, creature.id, colony.id)).toBeNull();
 
     sim.advanceSimulation(TICK_DT); // kill lands
 
@@ -1063,8 +1063,8 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     const killer = registerTestWorker(13016, creature.x, creature.y); // in range immediately
     const approacher = registerTestWorker(13017, creature.x - 500, creature.y); // still far away
 
-    expect(sim.issueAttackCommand(killer.id, creature.id)).toBeNull();
-    expect(sim.issueAttackCommand(approacher.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(killer.id, creature.id, colony.id)).toBeNull();
+    expect(sim.issueAttackCommand(approacher.id, creature.id, colony.id)).toBeNull();
 
     expect(() => sim.advanceSimulation(TICK_DT)).not.toThrow(); // killer's hit lands and kills it this same tick
 
@@ -1077,7 +1077,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     expect(fullNodeRow(proteinNode.id)?.kind).toBe("source");
     db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD, proteinNode.id);
     const worker = registerTestWorker(13018, proteinNode.x, proteinNode.y);
-    expect(sim.issueGatherCommand(worker.id, proteinNode.id)).toBeNull();
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
     expect(nodeRow(proteinNode.id)).toBeUndefined();
   });
@@ -1088,17 +1088,17 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     sim.loadSimulation();
     const worker = registerTestWorker(13019, 2000, 2000); // starts on top of the "near" creature
 
-    expect(sim.issueAttackCommand(worker.id, farCreatureId)).toBeNull();
+    expect(sim.issueAttackCommand(worker.id, farCreatureId, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT); // chasing the far creature, not in range of either yet
     expect(creatureById(farCreatureId).health).toBe(APHID_MAX_HEALTH);
     expect(creatureById(nearCreatureId).health).toBe(APHID_MAX_HEALTH);
 
-    expect(sim.issueAttackCommand(worker.id, nearCreatureId)).toBeNull(); // retarget
+    expect(sim.issueAttackCommand(worker.id, nearCreatureId, colony.id)).toBeNull(); // retarget
     sim.advanceSimulation(TICK_DT); // still within range of the near creature -> hits it, not the far one
     expect(creatureById(nearCreatureId).health).toBe(APHID_MAX_HEALTH - WORKER_ATTACK_DAMAGE);
     expect(creatureById(farCreatureId).health).toBe(APHID_MAX_HEALTH); // untouched — override abandoned it
 
-    expect(sim.issueMoveCommand(worker.id, 2500, 2500)).toBeNull(); // move replaces attack outright
+    expect(sim.issueMoveCommand(worker.id, 2500, 2500, colony.id)).toBeNull(); // move replaces attack outright
     sim.advanceSimulation(TICK_DT);
     expect(sim.getWorkerCommand(worker.id)).toBe("move");
   });
@@ -1107,7 +1107,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     const [creature] = sim.getCreaturesForWorld(world.id);
     const [worker] = sim.getWorkersForColony(colony.id); // a real seeded worker — survives reload
     sim.registerWorker({ id: worker.id, colonyId: colony.id, x: creature.x, y: creature.y });
-    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
     const damagedHealth = creatureById(creature.id).health;
@@ -1125,7 +1125,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     const [creature] = sim.getCreaturesForWorld(world.id);
     setCreatureHealth(creature.id, WORKER_ATTACK_DAMAGE);
     const worker = registerTestWorker(13020, creature.x, creature.y);
-    expect(sim.issueAttackCommand(worker.id, creature.id)).toBeNull();
+    expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT); // kill lands, carcass created
 
     const carcass = db.prepare("SELECT id, amount FROM resource_nodes WHERE kind = 'item'").get() as {
