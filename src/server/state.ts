@@ -1,6 +1,6 @@
 import { RESOURCE_TYPES } from "./balance.ts";
 import { db } from "./db.ts";
-import { getCreaturesForWorld, getWorkersForColony, type Carrying } from "./simulation.ts";
+import { getCreaturesForWorld, getWorkersExcludingColony, getWorkersForColony, type Carrying } from "./simulation.ts";
 
 export interface ColonyState {
   world: { width: number; height: number };
@@ -11,6 +11,14 @@ export interface ColonyState {
     resources: Record<string, number>;
   };
   workers: { id: number; x: number; y: number; carrying: Carrying }[];
+  // Post-Stage-6b fix: every OTHER colony's workers, visible in the shared
+  // world but never controllable by this session — kept as its own field
+  // (not merged into `workers`) so "workers = my own colony, fully
+  // selectable" stays an invariant the client can rely on structurally,
+  // rather than something it has to remember to filter for. colonyId is the
+  // public ownership tag the client needs to render these distinctly; no
+  // session/cookie data is ever included here.
+  otherWorkers: { id: number; colonyId: number; x: number; y: number; carrying: Carrying }[];
   resourceNodes: {
     id: number;
     x: number;
@@ -47,6 +55,7 @@ export function getState(colonyId: number): ColonyState {
   // Live positions come from in-memory simulation state, not straight from
   // SQLite — the table only ever holds the last checkpoint. See simulation.ts.
   const workers = getWorkersForColony(colonyRow.id);
+  const otherWorkers = getWorkersExcludingColony(colonyRow.id);
 
   const resourceNodes = db
     .prepare(
@@ -64,6 +73,7 @@ export function getState(colonyId: number): ColonyState {
     world: { width: world.width, height: world.height },
     colony: { id: colonyRow.id, queenX: colonyRow.queenX, queenY: colonyRow.queenY, resources },
     workers,
+    otherWorkers,
     resourceNodes,
     creatures,
     colonies,

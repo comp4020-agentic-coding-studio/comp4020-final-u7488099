@@ -79,6 +79,67 @@ async function waitForResourceIncreaseOnSocket(
   throw new Error(`no broadcast showed ${resourceType} above ${baseline} within ${timeoutMs}ms`);
 }
 
+// Regression test (H) for the post-Stage-6b multiplayer visibility bug: a
+// worker move issued by one colony must reach another colony's own open
+// WebSocket connection, in its `otherWorkers` field, with no reload. This
+// needs a second, cookie-isolated colony — unlike every other test in this
+// file, which reuses the single module-scope session — so it gets its own
+// small self-contained cookie jar + WS connect helper, mirroring
+// spec/multiplayer.test.ts's createSession() (duplicated, not imported, per
+// this file's header comment on why these specs stay self-contained).
+function createOtherSession() {
+  let cookie: string | null = null;
+  const sessionRequest = async (path: string, init: RequestInit = {}) => {
+    const headers = new Headers(init.headers);
+    if (cookie) headers.set("cookie", cookie);
+    const res = await fetch(new URL(path, baseUrl), { ...init, headers });
+    const setCookie = (res.headers as any).getSetCookie?.() ?? [];
+    for (const header of setCookie) {
+      cookie = cookie ? `${cookie}; ${header.split(";")[0]}` : header.split(";")[0];
+    }
+    return res;
+  };
+  const sessionConnect = (): Promise<WebSocket> =>
+    new Promise((resolve, reject) => {
+      const ws = new WebSocket(wsUrl, cookie ? { headers: { cookie } } : undefined);
+      ws.once("open", () => resolve(ws));
+      ws.once("error", reject);
+    });
+  return { request: sessionRequest, connect: sessionConnect };
+}
+
+it("a worker move issued by one colony is delivered, as an otherWorkers update, to another colony's own open WebSocket connection with no reload", async () => {
+  const colonyA = createOtherSession();
+  const colonyB = createOtherSession();
+
+  const aState = await colonyA.request("/api/state").then((r) => r.json());
+  await colonyB.request("/api/state").then((r) => r.json()); // ensure colony B's session/colony exists first
+
+  const aWorker = aState.workers[0];
+  const target = { x: Math.min(aState.world.width - 10, aWorker.x + 500), y: aWorker.y };
+
+  const wsB = await colonyB.connect();
+  try {
+    const res = await colonyA.request("/api/command/move", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerIds: [aWorker.id], x: target.x, y: target.y }),
+    });
+    expect(res.status).toBe(200);
+
+    const deadline = Date.now() + 3000;
+    let moved = false;
+    while (!moved && Date.now() < deadline) {
+      const message = await nextMessage(wsB, 3000);
+      const current = message.otherWorkers.find((w: any) => w.id === aWorker.id);
+      if (current && (current.x !== aWorker.x || current.y !== aWorker.y)) moved = true;
+    }
+    expect(moved).toBe(true);
+  } finally {
+    wsB.close();
+  }
+});
+
 it("pushes the updated resources to an open connection when a gather command completes, with no reload", async () => {
   const before = await getState();
   const worker = before.workers[0];

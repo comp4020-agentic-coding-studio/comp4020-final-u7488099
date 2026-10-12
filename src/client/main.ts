@@ -4,6 +4,16 @@ interface ColonyState {
   world: { width: number; height: number };
   colony: { id: number; queenX: number; queenY: number; resources: Record<string, number> };
   workers: { id: number; x: number; y: number; carrying: { resourceType: string; amount: number } | null }[];
+  // Every other colony's workers, visible but never selectable/controllable
+  // from this session — see hitTest/selectWorkersInBox, which only ever look
+  // at `workers` above, never this.
+  otherWorkers: {
+    id: number;
+    colonyId: number;
+    x: number;
+    y: number;
+    carrying: { resourceType: string; amount: number } | null;
+  }[];
   resourceNodes: {
     id: number;
     x: number;
@@ -190,13 +200,19 @@ function draw(): void {
     diamond(creature.x, creature.y, APHID_RADIUS, "#7cb342", "#33691e");
     drawHealthBar(creature.x, creature.y, APHID_RADIUS, creature.health, creature.maxHealth);
   }
-  // Crit 10: every other colony's queen is part of the shared world this
-  // session can see, drawn in a distinct colour from "your own" gold queen
-  // below so the two are never confused. No workers/resources are rendered
-  // for them — getState() never sends another colony's private economy.
+  // Crit 10 / post-6b visibility fix: every other colony's queen and workers
+  // are part of the shared world this session can see, drawn in the same
+  // "other colony" purple so the convention reads consistently across unit
+  // types — but never selectable/commandable (otherWorkers is never consulted
+  // by hitTest or selectWorkersInBox). Resources stay private: getState()
+  // never sends another colony's economy.
   for (const colony of state.colonies) {
     if (colony.id === state.colony.id) continue;
     circle(colony.queenX, colony.queenY, QUEEN_RADIUS, "#ce93d8", "#6a1b9a");
+  }
+  for (const worker of state.otherWorkers) {
+    circle(worker.x, worker.y, WORKER_RADIUS, "#ce93d8", "#6a1b9a");
+    if (worker.carrying) drawCarryingBadge(worker.x, worker.y, WORKER_RADIUS, worker.carrying.resourceType);
   }
   circle(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS, "#ffd54d", "#b8860b");
   for (const worker of state.workers) {

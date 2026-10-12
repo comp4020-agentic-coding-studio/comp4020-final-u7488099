@@ -734,6 +734,20 @@ shared world, and the server is the one place that decides who owns what.
   them — "the roster is shared, the economy isn't" is enforced by what the
   server ever puts in the payload, not by anything the client chooses not
   to draw.
+  **Post-Stage-6b correction:** "no workers... rendered for them" above was
+  a real bug, not a deliberate design choice — two colonies standing in the
+  same spot couldn't see each other's workers at all. The fix adds
+  `otherWorkers` to `ColonyState` (`getWorkersExcludingColony()` in
+  `simulation.ts`): every worker NOT belonging to the caller, tagged with
+  its public `colonyId`. It's a new field, not a widened `workers`, so
+  `workers` still means exactly "my own colony, fully selectable" and
+  `hitTest`/`selectWorkersInBox` in `main.ts` needed no new filter — they
+  simply never look at `otherWorkers`. Authorization was never the bug and
+  is untouched: `issueMoveCommand`/`issueGatherCommand`/`issueAttackCommand`
+  already checked `worker.colonyId !== ownerColonyId` against the full
+  in-memory worker map, independent of what `getState()` chose to render.
+  See `spec/multiplayer.test.ts`'s otherWorkers tests and
+  `spec/realtime.test.ts`'s otherWorkers WebSocket test.
 - **The WebSocket layer moved from one shared broadcast to one broadcast
   per colony, computed once per tick, not once per client.** Pre-Crit-10,
   `broadcastState()` serialized a single precomputed state once and sent

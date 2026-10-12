@@ -285,6 +285,24 @@ export function getWorkersForColony(colonyId: number): { id: number; x: number; 
     .map(({ id, x, y, carrying }) => ({ id, x, y, carrying }));
 }
 
+// Multiplayer visibility fix: the shared world has exactly one population of
+// workers, and every colony's workers are visible to every other colony (only
+// *commanding* them is restricted — see the ownership check below). Returns
+// every worker NOT belonging to `colonyId`, tagged with its own colonyId so
+// the client can render it distinctly and never mistake it for a controllable
+// worker. Deliberately a separate function/field from getWorkersForColony
+// (consumed as ColonyState.otherWorkers, not merged into `workers`) so the
+// existing "workers = my own colony" contract — and everything that already
+// relies on it, selection/hit-testing included — stays exactly as it was.
+export function getWorkersExcludingColony(
+  colonyId: number,
+): { id: number; colonyId: number; x: number; y: number; carrying: Carrying }[] {
+  return [...workers.values()]
+    .filter((w) => w.colonyId !== colonyId)
+    .sort((a, b) => a.id - b.id)
+    .map(({ id, colonyId, x, y, carrying }) => ({ id, colonyId, x, y, carrying }));
+}
+
 export function getWorkerCommand(workerId: number): "idle" | "move" | "gather" | "return" | "attack" {
   const worker = workers.get(workerId);
   if (!worker) throw new Error(`no such worker: ${workerId}`);

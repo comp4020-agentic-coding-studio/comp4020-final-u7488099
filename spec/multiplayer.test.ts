@@ -95,6 +95,83 @@ it("shows both sessions the same shared world, and each session the other's colo
   expect(bobColonyIds).toContain(aliceState.colony.id);
 });
 
+// Regression test for a real production bug found during manual Stage 6b
+// testing: two colonies moved to the same spot could not see each other's
+// workers, because getState() was filtering `workers` down to the caller's
+// own colony. The fix adds a separate `otherWorkers` field (every worker NOT
+// belonging to the caller, each tagged with its public colonyId) rather than
+// widening `workers` itself, so "workers = my own colony, fully selectable"
+// stays true and selection/hit-testing in the client needed no new filter.
+it("gives each session visibility into every other colony's workers, tagged with a public colonyId, without touching its own controllable set", async () => {
+  const alice = createSession();
+  const bob = createSession();
+
+  const aliceState = await getState(alice);
+  const bobState = await getState(bob);
+
+  // D: otherWorkers carries enough public ownership info to tell colonies
+  // apart — a colonyId, never a session identifier/cookie.
+  expect(Array.isArray(aliceState.otherWorkers)).toBe(true);
+  for (const w of aliceState.otherWorkers) {
+    expect(typeof w.colonyId).toBe("number");
+    expect(w).not.toHaveProperty("sid");
+    expect(w).not.toHaveProperty("session");
+    expect(w).not.toHaveProperty("cookie");
+  }
+
+  // B & C: each session's own workers show up in the *other* session's
+  // otherWorkers list — the shared world contains both colonies' workers,
+  // readable from either side.
+  const aliceOwnIds = new Set(aliceState.workers.map((w: any) => w.id));
+  const bobOwnIds = new Set(bobState.workers.map((w: any) => w.id));
+  const aliceSeenByBobIds = new Set(
+    bobState.otherWorkers.filter((w: any) => w.colonyId === aliceState.colony.id).map((w: any) => w.id),
+  );
+  const bobSeenByAliceIds = new Set(
+    aliceState.otherWorkers.filter((w: any) => w.colonyId === bobState.colony.id).map((w: any) => w.id),
+  );
+  expect(aliceSeenByBobIds).toEqual(aliceOwnIds);
+  expect(bobSeenByAliceIds).toEqual(bobOwnIds);
+
+  // Visibility must never leak into "controllable": each session's own
+  // `workers` array — the only one hitTest/selectWorkersInBox consult on the
+  // client — contains none of the other colony's workers, and otherWorkers
+  // contains none of this session's own.
+  for (const id of aliceOwnIds) expect(bobOwnIds.has(id)).toBe(false);
+  expect(aliceState.workers.some((w: any) => aliceState.otherWorkers.some((o: any) => o.id === w.id))).toBe(false);
+  expect(bobState.otherWorkers.every((w: any) => w.colonyId !== bobState.colony.id)).toBe(true);
+});
+
+// G: realtime visibility, checked over plain HTTP polling (the WebSocket
+// delivery path — H — is covered separately in spec/realtime.test.ts).
+it("lets session B observe, via its own state, a worker move issued by session A", async () => {
+  const alice = createSession();
+  const bob = createSession();
+
+  const aliceState = await getState(alice);
+  await getState(bob); // make sure Bob's colony exists before Alice acts
+
+  const aliceWorker = aliceState.workers[0];
+  const target = {
+    x: aliceWorker.x > aliceState.world.width / 2 ? 0 : aliceState.world.width,
+    y: aliceWorker.y > aliceState.world.height / 2 ? 0 : aliceState.world.height,
+  };
+
+  const res = await alice("/api/command/move", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: [aliceWorker.id], x: target.x, y: target.y }),
+  });
+  expect(res.status).toBe(200);
+
+  await new Promise((r) => setTimeout(r, 500));
+  const bobStateAfter = await getState(bob);
+  const seenFromBob = bobStateAfter.otherWorkers.find((w: any) => w.id === aliceWorker.id);
+  expect(seenFromBob, "Bob's state should include Alice's worker in otherWorkers").toBeTruthy();
+  expect(Math.hypot(seenFromBob.x - aliceWorker.x, seenFromBob.y - aliceWorker.y)).toBeGreaterThan(5);
+  expect(seenFromBob.colonyId).toBe(aliceState.colony.id);
+});
+
 it("rejects a session's attempt to command a worker that belongs to someone else's colony", async () => {
   const alice = createSession();
   const bob = createSession();
