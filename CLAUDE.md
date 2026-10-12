@@ -805,4 +805,110 @@ shared world, and the server is the one place that decides who owns what.
   its own queen/ledger before this crit — Crit 10 only added the
   authorization check in front of issuing the command in the first place).
 
+## Stage 6b: playtest world reset, population, and player guidance
+
+Crit 10 made multiplayer real, but the deployed world was still the single
+seeded colony/resource set every prior stage had accumulated on top of, and
+nothing told a first-time visitor what to do. Stage 6b is explicitly **not**
+a new gameplay-system stage — no predators, PvP, worker death, respawning,
+evolution, or buildings — it's a one-time world reset plus denser,
+deterministic seeding plus an in-game manual, so the existing multi-colony
+game is actually playtestable. Every Crit 10 invariant above still holds
+unchanged; nothing in this stage weakens authorization, ownership, or the
+session→colony model.
+
+- **World population is generated once, at module load, from a fixed
+  literal seed — never `Math.random()`/`Date.now()`.** `buildWorldPopulation()`
+  in `balance.ts` runs a `mulberry32(WORLD_SEED)` PRNG over the first
+  `SPAWN_ANCHOR_COUNT` colony-spiral points (`colonySpiralPosition`, the same
+  function `createColony()` uses — spawn anchors and actual colony spawn
+  points are deliberately the same sequence, not two independent layouts),
+  scattering `SUGAR_PER_ANCHOR`/`BIOMASS_PER_ANCHOR`/`APHIDS_PER_ANCHOR`
+  pieces of content in a jittered cluster around each anchor (a fixed
+  fraction of anchors also get a protein deposit, via
+  `PROTEIN_ANCHOR_STRIDE`), plus a smaller scattering of each type across the
+  whole map (`SCATTER_*_COUNT`) so the world isn't legible as "a ring of
+  identical clusters." Every count and radius is a named constant in
+  `balance.ts`, per the existing "balance constants never inline" rule —
+  rebalancing density later means changing a number there, not touching the
+  generator. `RESOURCE_NODES`/`APHID_SEED_POSITIONS` are computed once as
+  `const WORLD_POPULATION = buildWorldPopulation()` and both `seedIfEmpty()`
+  and `resetProductionWorld()` seed from that same array — there is still
+  exactly one source of truth for initial world content, just a generated
+  one instead of a hand-written literal list.
+- **Content deliberately keeps clear of a spawn anchor itself** — every
+  generated node and aphid sits outside a minimum radius of the anchor it
+  clustered around, so a fresh colony's queen never spawns standing on top
+  of a resource, and there's open ground around the queen for workers to
+  path through. `spec/world.test.ts`'s Section-16B tests assert this
+  directly, plus that every anchor has its own nearby sugar/biomass/aphid
+  content and that anchors themselves stay well separated from each other.
+- **Resources and creatures are global map content, not colony property.**
+  Placing dense clusters near every spawn anchor is about layout only —
+  every node and creature is still claimable/huntable by any colony's
+  workers regardless of whose spawn it clustered near, exactly as before
+  this stage. Nothing about ownership of a resource node or creature changed.
+- **Production reset is a deliberate, one-time, explicitly-invoked
+  operation — never automatic, and never a public endpoint.**
+  `resetProductionWorld()` (`db.ts`) is only ever called from
+  `scripts/reset-world.ts`, a CLI script that refuses to do anything unless
+  invoked with a literal `--yes` flag (prints a refusal and exits nonzero
+  otherwise); it is never imported or called from `index.ts`, so no HTTP
+  route can trigger it and server boot/restart never runs it. This was run
+  exactly once against the live deployment as part of shipping Stage 6b —
+  see `PROCESS.md` for the exact invocation and the before/after counts it
+  reported. Don't invoke it again outside another deliberate, user-directed
+  reset.
+- **The production reset preserves the session/ownership *model*, not any
+  specific session.** It wipes `colonies`, `workers`, `colony_resources`,
+  `resource_nodes`, `creatures`, and `sessions`, then reseeds from
+  `seedIfEmpty()`/`seedCreaturesIfEmpty()` inside one `db.transaction()` —
+  so there's never a half-reset state visible mid-transaction. Clearing
+  `sessions` is deliberately not special-cased: an old `sid` cookie simply
+  no longer resolves to a row, so `resolveOrCreateColony()`'s existing
+  no-cookie-or-stale-cookie path mints a fresh colony for it exactly as it
+  already does for a brand-new visitor — this is what "no dangling session
+  ownership references" means in practice, and why it needed no new code in
+  `sessions.ts` or `index.ts` at all.
+- **`action_log` is deliberately preserved across a production reset, not
+  wiped.** Crit 10 added durable logging specifically for evidence and
+  accountability; a reset is exactly the kind of event that log should be
+  able to show (who did what, right up until the reset happened), so
+  erasing it at the one moment it would be most useful would defeat its own
+  purpose. `resetForTests()` (test-only) still wipes `action_log`, since
+  tests want a fully blank slate between runs and have no accountability
+  need — don't confuse the two functions' behavior here, they're
+  intentionally different. `resetProductionWorld()`'s returned
+  `actionLogPreservedRows` count is how `scripts/reset-world.ts`'s summary
+  (and `spec/world.test.ts`'s Section-16E test) prove the row count survived
+  the transaction unchanged.
+- **The in-game "How to play" overlay (`#help-button`/`#help-overlay` in
+  `public/index.html`, wired up in `main.ts`) is the primary player-facing
+  guide — not this file, not the README.** It documents the controls,
+  objective, a numbered quick start, and a legend as they actually render
+  today; if a future stage changes a control, a marker's shape/colour, or
+  the reproduction cost, update the overlay's copy in the same change, the
+  same way `spec/realtime.test.ts` has to be updated alongside the
+  broadcast contract it checks. It never touches `state` or issues a
+  command — opening/closing it has zero interaction with simulation or
+  selection, so it's safe to open mid-drag or mid-selection with no side
+  effects.
+- **Small readability polish, not an art pass.** Own-queen (gold) vs.
+  other-colony-queen (purple) vs. worker (blue) colour coding, the dashed
+  selection ring, and the small carrying-badge dot all predate this stage
+  (Crit 10/Stage 4); Stage 6b's own pass confirmed these already satisfy the
+  brief's "own vs. other, basic legibility" bar at the new, denser content
+  levels rather than redesigning them.
+- **`spec/world.test.ts` is the dedicated regression suite for this stage**
+  (deterministic seed counts and exact pinned coordinates, multi-colony
+  spawn support, starting colony state for both the seeded and a freshly
+  minted colony, world-wide distribution, the reset mechanism at both the
+  function level and the CLI-script level via a real subprocess, the
+  simulation layer loading every seeded aphid, and a lightweight
+  `jsdom`-based check of the served Help markup — no headless browser). It
+  follows `spec/simulation.test.ts`'s direct-module-import-with-overridden-
+  `DB_PATH` pattern for everything except the Help check, which follows
+  `spec/invariants.test.ts`'s `inject("baseUrl")` + `fetch` + `JSDOM`
+  pattern instead.
+
 

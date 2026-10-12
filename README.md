@@ -1,9 +1,15 @@
 # Colony
 
-A tiny persistent ant colony. One world, one queen, three workers to start.
-Gather food to grow a protein stockpile, then spend it to hatch new workers.
-Nothing resets on a refresh or a redeploy — the whole colony lives in SQLite
-on the app's one persistent volume.
+A persistent multiplayer ant colony. Visit the app and your browser session
+is given its own queen and workers, placed in a large shared 3000x3000 world
+alongside every other colony already growing there. Send workers out to
+gather sugar, biomass, and protein, hunt the wandering aphid population for
+more protein, and spend protein to hatch new workers — all in real time,
+all visible to anyone else looking at the same world. Nothing resets on a
+refresh or a redeploy; the whole world lives in SQLite on the app's one
+persistent volume. Click "How to play" in the running app for the full
+control scheme and a numbered quick start — this file is the project
+account, not the player manual.
 
 ## What "good" means here (a first version)
 
@@ -19,9 +25,13 @@ shared world other players encounter and respond to — multiple people using
 it at once should change the experience itself, not just put two cursors in
 the same room.
 
-This is deliberately a first, rough definition, written down before the
-multiplayer half of the project exists, so it can be checked against and
-revised rather than retrofitted later. It's built on three ideas from game
+This was written down before the multiplayer half of the project existed,
+specifically so it could be checked against rather than retrofitted later.
+Multiplayer is now real (Crit 10): colonies share one world, one resource
+population, and one set of aphids, and every colony is visible to every
+other — the test of "shared means more than co-presence" is now something
+you can actually go try with a second browser, not just a design intention.
+It's built on three ideas from game
 design and virtual-worlds writing: Salen and Zimmerman's *meaningful play* —
 an action's consequence has to be both legible and woven into the system,
 not just a number ticking up, which is the direct source for "understandable
@@ -33,25 +43,41 @@ accumulates from what players have actually done in it and is encountered by
 whoever arrives next — the source for why "shared" has to mean more than
 co-presence.
 
-## What's here (Crit 8 + 9)
+## What's here
 
-- One global colony: a queen, a handful of workers, five food nodes on a
-  10x10 grid.
-- Click a worker, then a food node, to gather. Protein goes up, immediately.
-- Spend 50 protein to hatch a new worker at the queen's position.
-- All of it lives on the server; the browser only ever renders what
-  `GET /api/state` or a `/ws` push returns, never computes an outcome
-  itself. Reload, or come back tomorrow, and it's still there.
-- Realtime: every tab holds a WebSocket open, so another tab's gather or
-  reproduce appears within about a second, with no reload.
+- **A shared, continuous 3000x3000 world**, populated with dozens of sugar,
+  biomass, and protein deposits and dozens of wandering aphids, spread
+  across natural, deterministically-seeded clusters rather than a grid —
+  with room for many colonies to each spawn somewhere with their own nearby
+  resources.
+- **Real multiplayer, server-enforced.** An anonymous session cookie resolves
+  to one colony; every other colony's queen is visible in the shared world,
+  but you can only ever select and command your own workers, and your
+  resources are private to you. There are no accounts or passwords — the
+  colony itself is the identity.
+- **RTS-style control**: drag-select workers, then click to move, gather, or
+  attack. Gathering is real travel — a worker walks to a node, claims some of
+  it, carries it home, and deposits it, not an instant credit. Sugar and
+  biomass regenerate over time; protein is finite.
+- **Hunting and carcasses.** Selected workers can attack a wandering aphid;
+  it dies after enough hits and leaves behind a carcass worth protein, which
+  must then be explicitly gathered like any other node.
+- **Reproduction**: spend 50 protein to hatch a new worker at your queen.
+- **Realtime and durable.** Every mutation is computed server-side and
+  pushed to every open tab over WebSocket within about a second; everything
+  that matters after a restart — colonies, workers, resources, creatures,
+  sessions — lives in SQLite, not server memory.
+- An in-game **"How to play" overlay**, opened from a button next to the
+  title, documents the controls and a quick-start for a first-time visitor
+  with no outside explanation needed.
 
 ## What's deliberately not here yet
 
-No multiplayer accounts or identity yet — one colony, visible to everyone,
-no login. No presence (you can't see who else is connected). No combat,
-predators or resource depletion — food nodes are an infinite supply for
-now, not an economy. No graphics beyond plain positioned circles. Each of
-these is a layer to add on top of what's here, not a rewrite of it.
+No predators, no worker death, no aphid respawning, no PvP, no evolution, no
+buildings or territory, no formal biomes or runtime procedural spawning
+(the world's content is seeded once, deterministically, not generated live).
+No art pass beyond simple shape/colour readability. Each of these is a layer
+to add on top of what's here, not a rewrite of it.
 
 ## Stack
 
