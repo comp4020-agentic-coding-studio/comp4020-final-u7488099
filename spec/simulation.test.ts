@@ -38,6 +38,13 @@ const {
   WORKER_ATTACK_DAMAGE,
   WORKER_ATTACK_COOLDOWN,
   WORKER_MAX_HEALTH,
+  SPIDER_MAX_HEALTH,
+  SPIDER_AGGRO_RANGE,
+  SPIDER_DISENGAGE_RANGE,
+  SPIDER_ATTACK_RANGE,
+  SPIDER_ATTACK_DAMAGE,
+  SPIDER_ATTACK_COOLDOWN,
+  SPIDER_IDLE_MAX,
 } = await import("../src/server/balance.ts");
 
 const TICK_DT = 1 / SIMULATION.tickHz;
@@ -145,6 +152,16 @@ function setWorkerHealth(id: number, health: number): void {
 function insertCreature(x: number, y: number, health = APHID_MAX_HEALTH): number {
   const { lastInsertRowid } = db
     .prepare("INSERT INTO creatures (world_id, species, x, y, health, max_health) VALUES (?, 'aphid', ?, ?, ?, ?)")
+    .run(world.id, x, y, health, health);
+  return Number(lastInsertRowid);
+}
+
+// Stage 7: mirrors insertCreature exactly, but species='spider' — tests that
+// need a spider at a specific, controlled position (rather than relying on
+// seeded SPIDER_SEED_POSITIONS geometry) use this instead.
+function insertSpider(x: number, y: number, health = SPIDER_MAX_HEALTH): number {
+  const { lastInsertRowid } = db
+    .prepare("INSERT INTO creatures (world_id, species, x, y, health, max_health) VALUES (?, 'spider', ?, ?, ?, ?)")
     .run(world.id, x, y, health, health);
   return Number(lastInsertRowid);
 }
@@ -876,6 +893,196 @@ describe("Stage 7: worker health", () => {
     expect(sim.getWorkerCommand(worker.id)).toBe("return");
     expect(workerById(worker.id).carrying).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
     expect(workerById(worker.id).health).toBe(WORKER_MAX_HEALTH - 5);
+  });
+});
+
+describe("Stage 7: spider AI", () => {
+  it("A: a spider with no worker nearby just wanders, like an aphid", () => {
+    const spiderId = insertSpider(10, 10);
+    sim.loadSimulation();
+    const start = { x: creatureById(spiderId).x, y: creatureById(spiderId).y };
+
+    let moved = false;
+    const ticks = Math.ceil((SPIDER_IDLE_MAX + 10) / TICK_DT);
+    for (let i = 0; i < ticks; i++) {
+      sim.advanceSimulation(TICK_DT);
+      expect(sim.getCreatureCommand(spiderId)).not.toBe("chase");
+      const current = creatureById(spiderId);
+      if (current.x !== start.x || current.y !== start.y) moved = true;
+    }
+    expect(moved).toBe(true);
+  });
+
+  it("B: a worker entering SPIDER_AGGRO_RANGE is detected and chased", () => {
+    const spiderId = insertSpider(1000, 1000);
+    sim.loadSimulation();
+    const worker = registerTestWorker(14001, 1000, 1000 + SPIDER_AGGRO_RANGE - 10);
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase");
+    expect(sim.getCreatureChaseTarget(spiderId)).toBe(worker.id);
+  });
+
+  it("a worker outside SPIDER_AGGRO_RANGE is not detected", () => {
+    const spiderId = insertSpider(1000, 1000);
+    sim.loadSimulation();
+    registerTestWorker(14002, 1000, 1000 + SPIDER_AGGRO_RANGE + 50);
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureCommand(spiderId)).not.toBe("chase");
+  });
+
+  it("C: of two equidistant workers in range, the spider targets the one with the lower id", () => {
+    const spiderId = insertSpider(1000, 1000);
+    sim.loadSimulation();
+    const high = registerTestWorker(14100, 1000 + 50, 1000);
+    const low = registerTestWorker(14050, 1000 - 50, 1000); // same distance, lower id
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureChaseTarget(spiderId)).toBe(low.id);
+    expect(sim.getCreatureChaseTarget(spiderId)).not.toBe(high.id);
+  });
+
+  it("D: a chasing spider follows the worker's live position, not where it was when aggro triggered", () => {
+    const spiderId = insertSpider(1000, 1000);
+    sim.loadSimulation();
+    const worker = registerTestWorker(14003, 1000, 1000 + SPIDER_AGGRO_RANGE - 10);
+
+    sim.advanceSimulation(TICK_DT);
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase");
+
+    // Move the target away (still within disengage range) and confirm the
+    // spider's next step closes distance toward the *new* position.
+    sim.registerWorker({ id: worker.id, colonyId: colony.id, x: 1000, y: 1000 + SPIDER_DISENGAGE_RANGE - 20, health: WORKER_MAX_HEALTH, maxHealth: WORKER_MAX_HEALTH });
+    const before = Math.hypot(creatureById(spiderId).x - worker.x, creatureById(spiderId).y - (1000 + SPIDER_DISENGAGE_RANGE - 20));
+
+    sim.advanceSimulation(TICK_DT);
+
+    const after = sim.getCreaturesForWorld(world.id).find((c) => c.id === spiderId)!;
+    const afterDist = Math.hypot(after.x - 1000, after.y - (1000 + SPIDER_DISENGAGE_RANGE - 20));
+    expect(afterDist).toBeLessThan(before);
+  });
+
+  it("E: a spider disengages once the target moves beyond SPIDER_DISENGAGE_RANGE", () => {
+    const spiderId = insertSpider(1000, 1000);
+    sim.loadSimulation();
+    const worker = registerTestWorker(14004, 1000, 1000 + SPIDER_AGGRO_RANGE - 10);
+
+    sim.advanceSimulation(TICK_DT);
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase");
+
+    sim.registerWorker({
+      id: worker.id,
+      colonyId: colony.id,
+      x: 1000,
+      y: 1000 + SPIDER_DISENGAGE_RANGE + 50,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+    });
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureCommand(spiderId)).not.toBe("chase");
+  });
+
+  it("F: a spider disengages (drops to idle, then wander) once its target dies", () => {
+    const spiderId = insertSpider(1000, 1000);
+    sim.loadSimulation();
+    const worker = registerTestWorker(14005, 1000, 1000 + SPIDER_AGGRO_RANGE - 10);
+
+    sim.advanceSimulation(TICK_DT);
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase");
+
+    sim.applyDamageToWorker(worker.id, WORKER_MAX_HEALTH, 999999);
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureCommand(spiderId)).not.toBe("chase");
+  });
+
+  it("G: a spider in range attacks on cooldown, dealing SPIDER_ATTACK_DAMAGE per hit", () => {
+    const spiderId = insertSpider(1000, 1000);
+    sim.loadSimulation();
+    const worker = registerTestWorker(14006, 1000, 1000 + SPIDER_ATTACK_RANGE - 5);
+
+    sim.advanceSimulation(TICK_DT); // idle -> chase (cooldownRemaining starts at 0, but the hit lands next tick)
+    expect(workerById(worker.id).health).toBe(WORKER_MAX_HEALTH);
+
+    sim.advanceSimulation(TICK_DT); // already in range, cooldown elapsed — first hit lands
+    expect(workerById(worker.id).health).toBe(WORKER_MAX_HEALTH - SPIDER_ATTACK_DAMAGE);
+
+    sim.advanceSimulation(TICK_DT); // still on cooldown — no second hit yet
+    expect(workerById(worker.id).health).toBe(WORKER_MAX_HEALTH - SPIDER_ATTACK_DAMAGE);
+
+    sim.advanceSimulation(SPIDER_ATTACK_COOLDOWN); // cooldown elapses — second hit lands
+    expect(workerById(worker.id).health).toBe(WORKER_MAX_HEALTH - SPIDER_ATTACK_DAMAGE * 2);
+  });
+
+  it("H: repeated spider hits can kill a worker outright", () => {
+    const spiderId = insertSpider(1000, 1000);
+    sim.loadSimulation();
+    const worker = registerTestWorker(14007, 1000, 1000 + SPIDER_ATTACK_RANGE - 5, SPIDER_ATTACK_DAMAGE);
+
+    sim.advanceSimulation(TICK_DT); // idle -> chase, no hit yet
+    expect(sim.getWorkersForColony(colony.id).some((w) => w.id === worker.id)).toBe(true);
+
+    sim.advanceSimulation(TICK_DT); // already in range, cooldown elapsed — lethal hit lands
+
+    expect(sim.getWorkersForColony(colony.id).some((w) => w.id === worker.id)).toBe(false);
+    expect(sim.getCreatureCommand(spiderId)).not.toBe("chase");
+  });
+
+  it("I: a spider's target selection ignores colony ownership — any colony's worker can be aggroed", async () => {
+    const { createColony } = await import("../src/server/db.ts");
+    const other = createColony();
+    const spiderId = insertSpider(1000, 1000);
+    sim.loadSimulation();
+    sim.registerWorker({
+      id: other.workers[0].id,
+      colonyId: other.colonyId,
+      x: 1000,
+      y: 1000 + SPIDER_AGGRO_RANGE - 10,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+    });
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase");
+    expect(sim.getCreatureChaseTarget(spiderId)).toBe(other.workers[0].id);
+  });
+
+  it("queens are structurally unreachable — a spider never targets one, even standing on top of it", () => {
+    // The colony's 3 seeded workers spawn close to the queen, so clear them
+    // first — otherwise a spider standing at the queen's position would
+    // correctly aggro onto one of *them*, which would pass for the wrong
+    // reason. With no worker anywhere near, the only thing left to possibly
+    // target is the queen itself, which the workers Map structurally cannot
+    // contain.
+    for (const w of sim.getWorkersForColony(colony.id)) {
+      sim.applyDamageToWorker(w.id, WORKER_MAX_HEALTH, 999999);
+    }
+    const spiderId = insertSpider(queenPosition().x, queenPosition().y);
+    sim.loadSimulation();
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureCommand(spiderId)).not.toBe("chase");
+  });
+
+  it("J: when the chase target dies mid-combat, the spider's command is swept to idle (no dangling target)", () => {
+    const spiderId = insertSpider(1000, 1000);
+    sim.loadSimulation();
+    const worker = registerTestWorker(14008, 1000, 1000 + SPIDER_ATTACK_RANGE - 5, 1); // dies in one hit
+
+    sim.advanceSimulation(TICK_DT); // idle -> chase, no hit yet
+    sim.advanceSimulation(TICK_DT); // already in range, cooldown elapsed — lethal hit lands
+
+    expect(sim.getWorkersForColony(colony.id).some((w) => w.id === worker.id)).toBe(false);
+    expect(sim.getCreatureCommand(spiderId)).not.toBe("chase");
+    expect(sim.getCreatureChaseTarget(spiderId)).toBeNull();
   });
 });
 

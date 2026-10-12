@@ -12,6 +12,15 @@ import {
   MIN_SEPARATION,
   RESOURCE_REGEN_RATES,
   SEPARATION_STRENGTH,
+  SPIDER_AGGRO_RANGE,
+  SPIDER_ATTACK_COOLDOWN,
+  SPIDER_ATTACK_DAMAGE,
+  SPIDER_ATTACK_RANGE,
+  SPIDER_DISENGAGE_RANGE,
+  SPIDER_IDLE_MAX,
+  SPIDER_IDLE_MIN,
+  SPIDER_SPEED,
+  SPIDER_WANDER_RADIUS,
   WORKER_ATTACK_COOLDOWN,
   WORKER_ATTACK_DAMAGE,
   WORKER_ATTACK_RANGE,
@@ -79,7 +88,15 @@ interface SimCreature {
   rngState: number; // not exposed externally; reseeded fresh on every loadSimulation()
 }
 
-type CreatureCommand = { type: "idle"; remaining: number } | { type: "wander"; targetX: number; targetY: number };
+// Stage 7: "chase" is a third ephemeral variant, same durability rule as
+// idle/wander — never persisted, always dropped back to idle on a restart
+// (see loadSimulation). targetWorkerId is looked up live in workers.get()
+// every tick, never a captured position, exactly like a worker's own
+// "attack" command looks up its creature target live. See CLAUDE.md.
+type CreatureCommand =
+  | { type: "idle"; remaining: number }
+  | { type: "wander"; targetX: number; targetY: number }
+  | { type: "chase"; targetWorkerId: number; cooldownRemaining: number };
 
 const creatures = new Map<number, SimCreature>();
 
@@ -166,7 +183,7 @@ export function loadSimulation(): void {
   for (const row of creatureRows) {
     creatures.set(row.id, {
       ...row,
-      command: { type: "idle", remaining: APHID_IDLE_MIN },
+      command: { type: "idle", remaining: WANDER_PARAMS[row.species].idleMin },
       rngState: seedRng(row.id),
     });
   }
@@ -191,48 +208,152 @@ function nextRandom(creature: SimCreature): number {
   return creature.rngState / 0xffffffff;
 }
 
-function pickWanderTarget(creature: SimCreature): { x: number; y: number } {
+// Stage 7: wander tuning is species-keyed rather than hardcoded to the aphid
+// constants, so advanceWander (below) is reusable for any neutral/wandering
+// species — today aphid and spider, both already seeded by the time
+// loadSimulation()'s top-level call (end of file) runs. See CLAUDE.md.
+const WANDER_PARAMS: Record<string, { speed: number; wanderRadius: number; idleMin: number; idleMax: number }> = {
+  aphid: { speed: APHID_SPEED, wanderRadius: APHID_WANDER_RADIUS, idleMin: APHID_IDLE_MIN, idleMax: APHID_IDLE_MAX },
+  spider: {
+    speed: SPIDER_SPEED,
+    wanderRadius: SPIDER_WANDER_RADIUS,
+    idleMin: SPIDER_IDLE_MIN,
+    idleMax: SPIDER_IDLE_MAX,
+  },
+};
+
+function pickWanderTarget(
+  creature: SimCreature,
+  params: { wanderRadius: number },
+): { x: number; y: number } {
   const angle = nextRandom(creature) * Math.PI * 2;
-  const dist = nextRandom(creature) * APHID_WANDER_RADIUS;
+  const dist = nextRandom(creature) * params.wanderRadius;
   return {
     x: clamp(creature.x + Math.cos(angle) * dist, 0, worldBounds.width),
     y: clamp(creature.y + Math.sin(angle) * dist, 0, worldBounds.height),
   };
 }
 
-function pickIdleDuration(creature: SimCreature): number {
-  return APHID_IDLE_MIN + nextRandom(creature) * (APHID_IDLE_MAX - APHID_IDLE_MIN);
+function pickIdleDuration(creature: SimCreature, params: { idleMin: number; idleMax: number }): number {
+  return params.idleMin + nextRandom(creature) * (params.idleMax - params.idleMin);
 }
 
-// Aphid wandering: idle -> choose a nearby destination -> walk toward it ->
-// arrive -> idle briefly -> repeat. Same step-capped movement idiom as
-// workers, but with no separation/collision against workers or other
-// creatures — not required this stage (see CLAUDE.md) — and no spatial grid,
-// since aphids don't need one yet either.
+// Idle -> choose a nearby destination -> walk toward it -> arrive -> idle
+// briefly -> repeat. Same step-capped movement idiom as workers, but with no
+// separation/collision against workers or other creatures, and no spatial
+// grid — neither aphids nor spiders need either. Shared by every species via
+// WANDER_PARAMS; a spider falls into this whenever it isn't chasing (see
+// advanceSpider).
+function advanceWander(creature: SimCreature, dt: number): void {
+  const params = WANDER_PARAMS[creature.species];
+  const command = creature.command;
+  if (command.type === "idle") {
+    const remaining = command.remaining - dt;
+    if (remaining <= 0) {
+      const target = pickWanderTarget(creature, params);
+      creature.command = { type: "wander", targetX: target.x, targetY: target.y };
+    } else {
+      creature.command = { type: "idle", remaining };
+    }
+    return;
+  }
+  if (command.type !== "wander") return; // chase is handled by advanceSpider, never reaches here
+  const dx = command.targetX - creature.x;
+  const dy = command.targetY - creature.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist <= ARRIVAL_EPSILON) {
+    creature.command = { type: "idle", remaining: pickIdleDuration(creature, params) };
+    return;
+  }
+  const step = Math.min(params.speed * dt, dist);
+  creature.x = clamp(creature.x + (dx / dist) * step, 0, worldBounds.width);
+  creature.y = clamp(creature.y + (dy / dist) * step, 0, worldBounds.height);
+  dirty = true;
+}
+
+// Stage 7: spider AI. Chasing always re-reads the live worker by id (never a
+// captured position), so a spider follows where the worker actually is, not
+// where it was when aggro triggered — same "live lookup, safe-degrade to
+// idle if the target's gone" idiom handleAttackCommand already uses for the
+// reverse direction (worker chasing creature). When not chasing, a spider
+// scans the full shared `workers` map (every colony, deliberately
+// ownership-blind — see CLAUDE.md) for the nearest worker within
+// SPIDER_AGGRO_RANGE, tie-broken explicitly by ascending worker id for
+// determinism (an explicit id comparison, not reliance on Map iteration
+// order — registerWorker() appends in call order, not id order, so only
+// a fresh loadSimulation() happens to iterate ascending). Queens are
+// structurally unreachable here: they live only in the colonies table,
+// never in the workers Map, so this scan can never select one — no guard
+// code needed.
+function advanceSpider(spider: SimCreature, dt: number): void {
+  const command = spider.command;
+  if (command.type === "chase") {
+    const target = workers.get(command.targetWorkerId);
+    if (!target) {
+      spider.command = { type: "idle", remaining: pickIdleDuration(spider, WANDER_PARAMS.spider) };
+      return;
+    }
+
+    const dx = target.x - spider.x;
+    const dy = target.y - spider.y;
+    const dist = Math.hypot(dx, dy);
+
+    if (dist > SPIDER_DISENGAGE_RANGE) {
+      spider.command = { type: "idle", remaining: pickIdleDuration(spider, WANDER_PARAMS.spider) };
+      return;
+    }
+
+    if (dist > SPIDER_ATTACK_RANGE) {
+      const step = Math.min(SPIDER_SPEED * dt, dist - SPIDER_ATTACK_RANGE + ARRIVAL_EPSILON);
+      spider.x = clamp(spider.x + (dx / dist) * step, 0, worldBounds.width);
+      spider.y = clamp(spider.y + (dy / dist) * step, 0, worldBounds.height);
+      dirty = true;
+    }
+
+    const cooldownRemaining = Math.max(0, command.cooldownRemaining - dt);
+    if (dist <= SPIDER_ATTACK_RANGE && cooldownRemaining <= 0) {
+      applyDamageToWorker(target.id, SPIDER_ATTACK_DAMAGE, spider.id);
+      // applyDamageToWorker's killWorker sweep may already have reset this
+      // spider to idle if that hit was lethal — only write the cooldown
+      // back if the command is still "chase".
+      if (spider.command.type === "chase") {
+        spider.command = { ...spider.command, cooldownRemaining: SPIDER_ATTACK_COOLDOWN };
+      }
+    } else if (spider.command.type === "chase") {
+      spider.command = { ...spider.command, cooldownRemaining };
+    }
+    return;
+  }
+
+  let nearest: SimWorker | null = null;
+  let nearestDist = Infinity;
+  for (const worker of workers.values()) {
+    const dist = Math.hypot(worker.x - spider.x, worker.y - spider.y);
+    if (dist > SPIDER_AGGRO_RANGE) continue;
+    // Explicit id tiebreak rather than relying on workers.values() iteration
+    // order: that order matches ascending id only for workers loaded via
+    // loadSimulation()'s ORDER BY id query, not for ones appended later via
+    // registerWorker() in call order (e.g. reproduce(), or test helpers).
+    if (dist < nearestDist || (dist === nearestDist && nearest !== null && worker.id < nearest.id)) {
+      nearest = worker;
+      nearestDist = dist;
+    }
+  }
+  if (nearest) {
+    spider.command = { type: "chase", targetWorkerId: nearest.id, cooldownRemaining: 0 };
+    return;
+  }
+
+  advanceWander(spider, dt);
+}
+
 function advanceCreatures(dt: number): void {
   for (const creature of creatures.values()) {
-    const command = creature.command;
-    if (command.type === "idle") {
-      const remaining = command.remaining - dt;
-      if (remaining <= 0) {
-        const target = pickWanderTarget(creature);
-        creature.command = { type: "wander", targetX: target.x, targetY: target.y };
-      } else {
-        creature.command = { type: "idle", remaining };
-      }
-      continue;
+    if (creature.species === "spider") {
+      advanceSpider(creature, dt);
+    } else {
+      advanceWander(creature, dt);
     }
-    const dx = command.targetX - creature.x;
-    const dy = command.targetY - creature.y;
-    const dist = Math.hypot(dx, dy);
-    if (dist <= ARRIVAL_EPSILON) {
-      creature.command = { type: "idle", remaining: pickIdleDuration(creature) };
-      continue;
-    }
-    const step = Math.min(APHID_SPEED * dt, dist);
-    creature.x = clamp(creature.x + (dx / dist) * step, 0, worldBounds.width);
-    creature.y = clamp(creature.y + (dy / dist) * step, 0, worldBounds.height);
-    dirty = true;
   }
 }
 
@@ -326,6 +447,25 @@ export function getWorkerCommand(workerId: number): "idle" | "move" | "gather" |
   const worker = workers.get(workerId);
   if (!worker) throw new Error(`no such worker: ${workerId}`);
   return worker.command.type;
+}
+
+// Stage 7: mirrors getWorkerCommand — the test entry point for introspecting
+// a creature's AI state (idle/wander/chase) without exposing the whole
+// CreatureCommand union on getCreaturesForWorld's public shape.
+export function getCreatureCommand(creatureId: number): "idle" | "wander" | "chase" {
+  const creature = creatures.get(creatureId);
+  if (!creature) throw new Error(`no such creature: ${creatureId}`);
+  return creature.command.type;
+}
+
+// Stage 7: the live worker id a spider is currently chasing, or null if it
+// isn't chasing anyone — lets tests assert deterministic target selection
+// (nearest, ascending-id tiebreak) directly rather than inferring it from
+// movement alone.
+export function getCreatureChaseTarget(creatureId: number): number | null {
+  const creature = creatures.get(creatureId);
+  if (!creature) throw new Error(`no such creature: ${creatureId}`);
+  return creature.command.type === "chase" ? creature.command.targetWorkerId : null;
 }
 
 // Crit 10: `ownerColonyId` is the caller's own colony, resolved server-side
@@ -578,6 +718,16 @@ function killCreature(creature: SimCreature): void {
 function killWorker(worker: SimWorker, cause: string, creatureId?: number): void {
   db.prepare("DELETE FROM workers WHERE id = ?").run(worker.id);
   workers.delete(worker.id);
+  // Mirrors killCreature's attacker-idle-sweep for the reverse direction:
+  // any spider mid-chase of this now-dead worker drops to idle rather than
+  // holding a dangling targetWorkerId. advanceCreatures processes
+  // creatures.values() in one single-threaded pass, so a spider reached
+  // later in the same tick already sees this sweep's effect.
+  for (const creature of creatures.values()) {
+    if (creature.command.type === "chase" && creature.command.targetWorkerId === worker.id) {
+      creature.command = { type: "idle", remaining: pickIdleDuration(creature, WANDER_PARAMS[creature.species]) };
+    }
+  }
   dirty = true;
   logAction(worker.colonyId, "worker_died", { workerId: worker.id, cause, creatureId });
 }
