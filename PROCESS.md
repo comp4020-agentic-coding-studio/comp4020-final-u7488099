@@ -1,5 +1,58 @@
 # Process overview
 
+## Crit 10: real multiplayer — sessions, ownership, and an audit log
+
+Crit 10's bar: two cookie-isolated browser sessions each get their own
+persistent colony in one shared world, the server derives ownership from
+session identity rather than trusting anything the client sends, a session
+can't command another's workers, and every action lands in a durable,
+queryable, server-side log. Crit 8/9's single global colony is still the
+substrate underneath — this is the first crit that actually makes more than
+one colony exist at once.
+
+I started, as with Crit 9, by writing the spec before the implementation:
+`spec/multiplayer.test.ts`
+([`e8fb85a`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/e8fb85a)),
+four tests, red by construction — distinct persistent colonies per session,
+a shared world/roster visible to both, a rejected cross-owner command with
+no side effect, and a durable, API-exposed log entry attributing an action
+to the acting colony. I treated this file as fixed from that point on: the
+brief was explicit that it, and the other black-box HTTP spec files, were
+allowed to gain a persistent-cookie helper to keep testing one consistent
+browser profile per file, but never to have their actual assertions
+loosened to fit whatever I happened to build.
+
+The implementation
+([`7c00c6e`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/7c00c6e),
+[`2b88996`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/2b88996))
+turns an anonymous `sid` cookie into a durable colony id via a new SQLite
+`sessions` table, places each freshly minted colony on the same
+golden-angle spiral the group-move code already used, and threads that
+resolved colony id — never anything from the request body — through
+`issueMoveCommand`/`issueGatherCommand`/`issueAttackCommand` so a
+wrong-owner worker id fails exactly like a nonexistent one. A new
+`action_log` table plus a concise stdout line back `GET /api/log`.
+
+Two of the four red tests exposed real design gaps rather than just bugs,
+each recorded in detail in `CLAUDE.md`'s Crit 10 section: the shared-world
+test required pre-minting one spare unclaimed colony so a session's own
+response already lists the colony the *next* joiner is about to get
+(impossible under naive lazy creation, since that colony genuinely doesn't
+exist yet at the moment the first session's request is served); and the
+WebSocket broadcast-identity test required moving `getState()` computation
+from once-per-client back to once-per-colony-per-tick, matching the
+pre-Crit-10 single-shared-payload guarantee the naive per-connection
+redesign had silently dropped.
+
+Test adaptation
+([`880872f`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/880872f))
+gave `colony.test.ts`/`realtime.test.ts` their own small persistent-cookie
+wrapper each (duplicated, not shared or imported from
+`spec/multiplayer.test.ts`, which stays untouched) and updated
+`simulation.test.ts`'s 77 direct `issue*Command` call sites to pass the one
+colony id it already captures — all 84 tests (80 carried-forward + 4 new)
+pass.
+
 ## Crit 9: realtime, and the concurrency decision
 
 Crit 9's bar is the brief's own line: real-time within about a second with no

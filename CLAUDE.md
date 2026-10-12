@@ -666,4 +666,143 @@ those remain explicitly out of scope.
   acceptable in tests, but production manual verification should kill only
   one or two aphids rather than exterminating the seeded population.
 
+## Crit 10: real multiplayer — one session, one colony, shared world
+
+Every stage through Stage 6 had exactly one colony; "multiplayer" meant
+several browser tabs all looking at the same thing. Crit 10 makes that
+literal: one anonymous browser session now owns one persistent colony in a
+shared world, and the server is the one place that decides who owns what.
+
+- **Authorization model: a session cookie resolves to a colony server-side;
+  the client never supplies one.** `sid` (`src/server/sessions.ts`) is an
+  opaque `crypto.randomUUID()` token, set `httpOnly`/`sameSite: "lax"` on
+  first contact with any `/api` route (`index.ts`'s session middleware,
+  scoped to `/api` only — static assets and `/readme/` don't need a colony,
+  and never minting one there means a cookie-less crawler never gets a
+  throwaway colony). `resolveOrCreateColony()` is the one function every
+  request's authority flows through: existing cookie → existing colony
+  (`sessions` table lookup); no cookie, or a stale one from a wiped test DB
+  → mint a new session and claim/create a colony. No passwords, no
+  accounts, no client-supplied id is ever trusted as an identity claim —
+  this is the whole point of the crit, and it's why `issueMoveCommand`/
+  `issueGatherCommand`/`issueAttackCommand` (`simulation.ts`) all take an
+  `ownerColonyId` argument resolved this way, never read from the request
+  body, and check `worker.colonyId !== ownerColonyId` before touching
+  anything. A worker that exists but belongs to someone else's colony is
+  reported as `"no such worker"` — the exact same error a nonexistent id
+  gets — so a wrong-owner id can never be used to probe which ids exist
+  under another player's colony.
+- **The original Crit 8 colony becomes "player one," not a migration
+  target.** `seedIfEmpty()`'s colony is unchanged, but as of Crit 10 it
+  starts out with no row in the new `sessions` table pointing at it —
+  `getUnclaimedColonyId()` (`db.ts`) finds exactly that colony and the very
+  first real session to arrive claims it, instead of a brand-new colony
+  being minted on top of it. This was chosen over dropping and reseeding
+  (Stage 1's precedent for a genuine schema break) because nothing about
+  Crit 10 actually requires throwing the existing colony away, and it's
+  also what keeps `spec/simulation.test.ts` — which captures
+  `colonies LIMIT 1` once at module load and expects it to already exist —
+  working unmodified.
+- **A spare, unclaimed colony is always kept pre-minted.** Without this, a
+  session's own `GET /api/state` response (its `colonies` roster) could
+  never include the colony the *next* session is about to claim — that
+  colony simply wouldn't exist yet at the moment this session's response is
+  serialized, since colonies are claimed/minted lazily on first contact.
+  `resolveOrCreateColony()` mints one extra unclaimed colony immediately
+  after resolving its own caller's, so the next joiner's eventual colony is
+  already a visible part of the shared world the instant this request
+  returns. `spec/multiplayer.test.ts`'s "shows both sessions the same
+  shared world..." test is exactly what this exists to satisfy — it never
+  re-fetches alice's state after bob's colony is created, so for alice's
+  *original* response to list bob's colony id, that colony has to already
+  exist before bob ever arrives.
+- **New colonies spread out on the same golden-angle spiral
+  `computeGroupDestinations` already uses for group worker placement**
+  (`GOLDEN_ANGLE`, now exported from `balance.ts` instead of a private
+  constant in `simulation.ts`, so `db.ts`'s `createColony()` can reuse the
+  exact same irrational number rather than a second copy of it), centred on
+  the world instead of a click point. Colony index 0 — the very first
+  colony any world ever seeds — lands at radius 0, exactly
+  `(width/2, height/2)`, the pre-Crit-10 single-colony seed position,
+  unchanged.
+- **Private economy vs. shared roster: `colonies` on `ColonyState` is
+  `{id, queenX, queenY}` only, never a resource ledger.** `state.ts`'s
+  `getState(colonyId)` still returns one colony's own full resources and
+  workers, same shape as before, plus this new array listing every colony
+  in the world. The client (`main.ts`) draws every other colony's queen in
+  a visually distinct colour, with no workers or resources rendered for
+  them — "the roster is shared, the economy isn't" is enforced by what the
+  server ever puts in the payload, not by anything the client chooses not
+  to draw.
+- **The WebSocket layer moved from one shared broadcast to one broadcast
+  per colony, computed once per tick, not once per client.** Pre-Crit-10,
+  `broadcastState()` serialized a single precomputed state once and sent
+  the identical string to every client — there was no per-connection
+  `getState()` call and no immediate send on connect, so near-simultaneous
+  connections always saw a bit-identical first frame (both came from the
+  same periodic tick). Now that every connection belongs to a different
+  colony, that single shared payload doesn't exist; the WS handshake
+  resolves `colonyId` once (`req.headers.cookie`, same session resolution
+  as any HTTP request — a WS upgrade bypasses Express's middleware
+  entirely, so this has to happen directly in the `connection` handler, not
+  via `req.colonyId`) and caches it on the connection for its lifetime.
+  `broadcastState()` computes `getState(colonyId)` **at most once per
+  distinct colony per call** (a `Map<number, string>` built fresh each
+  tick), and every client sharing that colony gets the identical cached
+  string — preserving the original "identical payload across simultaneous
+  connections" guarantee per-colony instead of globally. An earlier version
+  of this also sent an immediate `ws.send(getState(colonyId))` right on
+  connect; that was removed because it meant two near-simultaneous
+  connections to the *same* colony could independently compute `getState()`
+  a tick apart and see slightly different creature positions — violating
+  exactly the identical-broadcast guarantee `spec/realtime.test.ts` checks.
+  A connection's first frame always comes from the next periodic broadcast,
+  same as every pre-Crit-10 connection.
+- **The client's WebSocket connects only after the first `GET /api/state`
+  resolves, not alongside it.** The very first request from a fresh
+  browser profile is what sets the `sid` cookie (`res.cookie(...)` in the
+  session middleware); a WS upgrade request carries whatever cookies
+  existed *before* that response landed, so opening it in parallel could
+  race the cookie and mint a second, separate colony for the same player
+  on the same page load. `main.ts` now chains the WS connection off
+  `refresh().then(...)` instead of firing both at once.
+- **Durable action log: every mutation writes a SQLite row and a stdout
+  line, unconditionally, successes and failures together.** `log.ts`'s
+  `logAction(colonyId, action, detail?)` is the one place either happens —
+  an `action_log` table (`id, created_at, colony_id, action, detail`) for
+  `GET /api/log` to read back, and a `console.log` one-liner
+  (`[action] colony=<id> <action> <detail>`) for `flyctl logs` in
+  production, since nobody tails a SQLite table there. `colony_id` is the
+  acting colony rather than a player account, because there are no
+  accounts in this model — a colony *is* the identity. `runBatchCommand`
+  (`index.ts`) logs once per batch request with every attempted id and its
+  per-id outcome (`errors`), not once per worker — "who tried what" is the
+  useful signal, including the ids that failed because they belonged to
+  someone else.
+- **Test adaptation: `spec/colony.test.ts` and `spec/realtime.test.ts` gained
+  a small persistent-cookie `request()` wrapper each (duplicated between the
+  two files, and duplicated again from `spec/multiplayer.test.ts`'s own
+  `createSession()` — never imported, since that file is deliberately
+  self-contained and is never touched to make other tests pass), so every
+  request in a given file now belongs to one consistent session/colony,
+  matching what these pre-Crit-10 single-colony test suites already assume.
+  `realtime.test.ts`'s wrapper also threads the current cookie into
+  `connect()`'s WebSocket handshake headers (`new WebSocket(url, {headers:
+  {cookie}})`), since a WS upgrade has no browser cookie jar to rely on.
+  `spec/simulation.test.ts` calls `simulation.ts`'s `issue*Command`
+  functions directly (bypassing HTTP entirely), so instead it passes the one
+  `colony.id` it already captures at module load as the new required
+  `ownerColonyId` argument at every call site — every synthetic worker in
+  that file is already registered under that same colony, so this is always
+  correct, never a guess.
+- **Explicitly out of scope, same as the brief:** no passwords or accounts,
+  no PvP, no predators, no world reset/population changes, no evolution.
+  Nothing about ownership here touches combat, gathering mechanics, or
+  reproduction cost — only *whose* worker/colony a command is allowed to
+  act on, and whose ledger a deposit/reproduction spends from (both already
+  fell out for free: a carrying worker's `colonyId` was always the one it
+  was registered with, so it was already returning to and depositing into
+  its own queen/ledger before this crit — Crit 10 only added the
+  authorization check in front of issuing the command in the first place).
+
 
