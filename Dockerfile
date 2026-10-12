@@ -21,6 +21,7 @@ COPY --from=builder /app/dist ./dist
 COPY package.json ./package.json
 COPY src ./src
 COPY public ./public
+COPY scripts ./scripts
 COPY README.md ./README.md
 ENV PORT=8080
 CMD ["node", "src/server/index.ts"]
