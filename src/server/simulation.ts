@@ -18,6 +18,7 @@ import {
   WORKER_SPEED,
 } from "./balance.ts";
 import { db } from "./db.ts";
+import { logAction } from "./log.ts";
 
 // The authoritative simulation lives here, in memory — not in SQLite and not
 // derived fresh from it on every read. SQLite only ever holds the last
@@ -564,6 +565,37 @@ function killCreature(creature: SimCreature): void {
     }
   }
   dirty = true;
+}
+
+// Stage 7: worker death. A single DELETE is enough — no transaction, unlike
+// killCreature's carcass-insert — because there's nothing else to keep
+// atomic with it (no worker carcass; see the carried-resource rule below).
+// Deleting the row deletes carrying_type/carrying_amount with it: whatever
+// payload the worker held is simply gone, and because the row no longer
+// exists, nothing can ever later run attemptDeposit for this worker id. This
+// is the entire carried-resource-on-death rule — no separate code path, so
+// nothing can duplicate or re-credit it. See CLAUDE.md.
+function killWorker(worker: SimWorker, cause: string, creatureId?: number): void {
+  db.prepare("DELETE FROM workers WHERE id = ?").run(worker.id);
+  workers.delete(worker.id);
+  dirty = true;
+  logAction(worker.colonyId, "worker_died", { workerId: worker.id, cause, creatureId });
+}
+
+// Mirrors applyDamage: health is written synchronously on every hit, same
+// durability-on-mutation precedent. Id-based (not a live-object param, unlike
+// internal killWorker) so this doubles as the test entry point, exactly the
+// same role issueAttackCommand plays for creature combat — callers (future
+// advanceSpider, and tests) never need to hold a live SimWorker reference. A
+// no-op if the worker is already gone, mirroring handleAttackCommand's "no
+// such creature" guard for the symmetric case.
+export function applyDamageToWorker(workerId: number, amount: number, spiderId: number): void {
+  const worker = workers.get(workerId);
+  if (!worker) return;
+  worker.health = Math.max(0, worker.health - amount);
+  db.prepare("UPDATE workers SET health = ? WHERE id = ?").run(worker.health, worker.id);
+  dirty = true;
+  if (worker.health <= 0) killWorker(worker, "spider", spiderId);
 }
 
 // Stage 6: chase + attack resolution. Unlike move/gather/return, "in range"

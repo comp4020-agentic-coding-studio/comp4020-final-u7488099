@@ -127,6 +127,16 @@ function setCreatureHealth(id: number, health: number): void {
   sim.loadSimulation();
 }
 
+// Directly mutates durable worker health then reloads, mirroring
+// setCreatureHealth exactly. Only safe against one of the real seeded
+// workers (ids with an actual `workers` SQL row) — never a synthetic
+// registerTestWorker worker, which loadSimulation() would otherwise
+// silently erase (see Stage 4's note in CLAUDE.md).
+function setWorkerHealth(id: number, health: number): void {
+  db.prepare("UPDATE workers SET health = ? WHERE id = ?").run(health, id);
+  sim.loadSimulation();
+}
+
 // Inserts a creature row directly (for tests that need two creatures at
 // specific, controlled positions rather than relying on seeded aphid
 // geometry). Same ordering caveat as setCreatureHealth: call before
@@ -782,6 +792,89 @@ describe("Stage 7: worker health", () => {
       expect(w.health).toBe(WORKER_MAX_HEALTH);
       expect(w.maxHealth).toBe(WORKER_MAX_HEALTH);
     }
+  });
+
+  it("E: applyDamageToWorker persists the new health synchronously to SQLite, not just in memory", () => {
+    const [worker] = sim.getWorkersForColony(colony.id);
+
+    sim.applyDamageToWorker(worker.id, 10, 999);
+
+    expect(workerById(worker.id).health).toBe(WORKER_MAX_HEALTH - 10);
+    const row = db.prepare("SELECT health FROM workers WHERE id = ?").get(worker.id) as { health: number };
+    expect(row.health).toBe(WORKER_MAX_HEALTH - 10);
+  });
+
+  it("F: lethal damage kills the worker — removed from the sim map and the workers table, and logged", () => {
+    const [worker] = sim.getWorkersForColony(colony.id);
+
+    sim.applyDamageToWorker(worker.id, WORKER_MAX_HEALTH, 999);
+
+    expect(sim.getWorkersForColony(colony.id).some((w) => w.id === worker.id)).toBe(false);
+    expect(db.prepare("SELECT * FROM workers WHERE id = ?").get(worker.id)).toBeUndefined();
+
+    const logRow = db
+      .prepare(
+        "SELECT action, detail FROM action_log WHERE colony_id = ? AND action = 'worker_died' ORDER BY id DESC LIMIT 1",
+      )
+      .get(colony.id) as { action: string; detail: string } | undefined;
+    expect(logRow).toBeTruthy();
+    expect(JSON.parse(logRow!.detail)).toMatchObject({ workerId: worker.id, cause: "spider", creatureId: 999 });
+  });
+
+  it("G: a dead worker is rejected by every command issuer, exactly like a nonexistent id", () => {
+    const [worker] = sim.getWorkersForColony(colony.id);
+    const [sugarNode] = findNodesByType("sugar");
+    const creatureId = insertCreature(0, 0);
+    sim.loadSimulation();
+
+    sim.applyDamageToWorker(worker.id, WORKER_MAX_HEALTH, 999);
+
+    expect(sim.issueMoveCommand(worker.id, 100, 100, colony.id)).toBe("no such worker");
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBe("no such worker");
+    expect(sim.issueAttackCommand(worker.id, creatureId, colony.id)).toBe("no such worker");
+  });
+
+  it("H: a carrying worker that dies loses its payload — not credited, not duplicated", () => {
+    const [proteinNode] = findNodesByType("protein");
+    const worker = registerTestWorker(9200, proteinNode.x, proteinNode.y);
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+    expect(workerById(worker.id).carrying).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
+    const beforeProtein = resourceAmount("protein");
+
+    sim.applyDamageToWorker(worker.id, WORKER_MAX_HEALTH, 999);
+
+    expect(sim.getWorkersForColony(colony.id).some((w) => w.id === worker.id)).toBe(false);
+    expect(resourceAmount("protein")).toBe(beforeProtein);
+
+    sim.advanceSimulation(TICK_DT * 100); // plenty of ticks — nothing left to ever deposit
+    expect(resourceAmount("protein")).toBe(beforeProtein);
+  });
+
+  it("I: a restart (reload from SQLite) preserves survivor health and a dead worker's absence", () => {
+    const [a, b] = sim.getWorkersForColony(colony.id);
+    setWorkerHealth(a.id, 7);
+    sim.applyDamageToWorker(b.id, WORKER_MAX_HEALTH, 999);
+
+    sim.loadSimulation();
+
+    expect(workerById(a.id).health).toBe(7);
+    expect(sim.getWorkersForColony(colony.id).some((w) => w.id === b.id)).toBe(false);
+    expect(db.prepare("SELECT * FROM workers WHERE id = ?").get(b.id)).toBeUndefined();
+  });
+
+  it("a carrying (returning) worker that takes damage keeps returning — damage never touches command", () => {
+    const [proteinNode] = findNodesByType("protein");
+    const worker = registerTestWorker(9201, proteinNode.x, proteinNode.y);
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+    expect(sim.getWorkerCommand(worker.id)).toBe("return");
+
+    sim.applyDamageToWorker(worker.id, 5, 999);
+
+    expect(sim.getWorkerCommand(worker.id)).toBe("return");
+    expect(workerById(worker.id).carrying).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
+    expect(workerById(worker.id).health).toBe(WORKER_MAX_HEALTH - 5);
   });
 });
 
