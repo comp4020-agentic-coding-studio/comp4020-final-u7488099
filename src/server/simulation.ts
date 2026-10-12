@@ -406,6 +406,22 @@ function advanceSpider(spider: SimCreature, dt: number): void {
   let nearest: SimWorker | null = null;
   let nearestDist = Infinity;
   for (const worker of workers.values()) {
+    // A straight-line wander step between two points that are each clear of
+    // every nest can still pass through a nest's clear zone in between (the
+    // exclusion in pickWanderTarget only constrains the chosen endpoints,
+    // not the path) — so a spider can end up physically close enough to
+    // aggro a worker standing at/near a nest even though it was never
+    // "supposed" to be there. Skipping any worker who is themselves inside
+    // a clear zone closes that gap directly, at the one point that actually
+    // matters (the aggro trigger), rather than chasing every possible path
+    // the spider's position could take to get near one. This also means a
+    // worker idling at its own queen is never aggro'd from a distance —
+    // acceptable (even desirable) as a small safe zone around home, and
+    // consistent with keeping seeded/wandering spiders out of the same
+    // radius in the first place. A chase already in progress still ignores
+    // this (unconstrained on purpose, see advanceSpider's chase branch) —
+    // this only gates the initial aggro pick.
+    if (!isClearOfNests(worker.x, worker.y, SPIDER_CLEAR_RADIUS)) continue;
     const dist = Math.hypot(worker.x - spider.x, worker.y - spider.y);
     if (dist > SPIDER_AGGRO_RANGE) continue;
     // Explicit id tiebreak rather than relying on workers.values() iteration

@@ -1,4 +1,4 @@
-import { APHID_RADIUS, WORKER_RADIUS } from "../server/balance.ts";
+import { APHID_RADIUS, SPIDER_RADIUS, WORKER_RADIUS } from "../server/balance.ts";
 
 interface ColonyState {
   world: { width: number; height: number };
@@ -109,6 +109,33 @@ function diamond(wx: number, wy: number, r: number, fill: string, stroke: string
   ctx.stroke();
 }
 
+// Stage 7: spider placeholder marker — a dark body circle with a few short
+// radiating "leg" strokes, in a danger red reserved for hostile creatures
+// (purple is "other colony", green is aphid, blue/gold are own units/queen).
+// Not selectable/clickable via diamond()/circle(); hitTest handles spiders
+// separately since their click radius differs from an aphid's.
+function drawSpider(wx: number, wy: number, r: number): void {
+  const [sx, sy] = worldToScreen(wx, wy);
+  if (sx < -r * 2 || sy < -r * 2 || sx > canvas.width + r * 2 || sy > canvas.height + r * 2) return;
+  ctx.save();
+  ctx.strokeStyle = "#4a0000";
+  ctx.lineWidth = 2;
+  for (let i = 0; i < 6; i++) {
+    const angle = (i / 6) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(sx + Math.cos(angle) * r * 0.6, sy + Math.sin(angle) * r * 0.6);
+    ctx.lineTo(sx + Math.cos(angle) * r * 1.6, sy + Math.sin(angle) * r * 1.6);
+    ctx.stroke();
+  }
+  ctx.beginPath();
+  ctx.arc(sx, sy, r * 0.7, 0, Math.PI * 2);
+  ctx.fillStyle = "#b71c1c";
+  ctx.fill();
+  ctx.strokeStyle = "#4a0000";
+  ctx.stroke();
+  ctx.restore();
+}
+
 // Stage 6: a carcass (resourceNodes entry with kind === "item") is drawn as
 // a dashed, differently-coloured circle instead of a node's usual solid
 // NODE_COLOR fill — distinct at a glance without a new drawing primitive.
@@ -206,6 +233,11 @@ function draw(): void {
     drawResourceNode(node);
   }
   for (const creature of state.creatures) {
+    if (creature.species === "spider") {
+      drawSpider(creature.x, creature.y, SPIDER_RADIUS);
+      drawHealthBar(creature.x, creature.y, SPIDER_RADIUS, creature.health, creature.maxHealth);
+      continue;
+    }
     diamond(creature.x, creature.y, APHID_RADIUS, "#7cb342", "#33691e");
     drawHealthBar(creature.x, creature.y, APHID_RADIUS, creature.health, creature.maxHealth);
   }
@@ -222,12 +254,14 @@ function draw(): void {
   for (const worker of state.otherWorkers) {
     circle(worker.x, worker.y, WORKER_RADIUS, "#ce93d8", "#6a1b9a");
     if (worker.carrying) drawCarryingBadge(worker.x, worker.y, WORKER_RADIUS, worker.carrying.resourceType);
+    drawHealthBar(worker.x, worker.y, WORKER_RADIUS, worker.health, worker.maxHealth);
   }
   circle(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS, "#ffd54d", "#b8860b");
   for (const worker of state.workers) {
     circle(worker.x, worker.y, WORKER_RADIUS, "#90caf9", "#1565c0");
     if (selectedWorkerIds.has(worker.id)) drawSelectionRing(worker.x, worker.y, WORKER_RADIUS + 4);
     if (worker.carrying) drawCarryingBadge(worker.x, worker.y, WORKER_RADIUS, worker.carrying.resourceType);
+    drawHealthBar(worker.x, worker.y, WORKER_RADIUS, worker.health, worker.maxHealth);
   }
 
   if (dragMode === "select" && dragged && selectionDrag) drawSelectionBox(selectionDrag);
@@ -373,7 +407,8 @@ function hitTest(wx: number, wy: number): { kind: "worker" | "creature" | "node"
   // so a click on an aphid standing over/near a resource node always hits
   // the creature, never falls through to the node underneath it.
   for (const creature of state.creatures) {
-    if (Math.hypot(creature.x - wx, creature.y - wy) <= APHID_RADIUS + 4) return { kind: "creature", id: creature.id };
+    const r = creature.species === "spider" ? SPIDER_RADIUS : APHID_RADIUS;
+    if (Math.hypot(creature.x - wx, creature.y - wy) <= r + 4) return { kind: "creature", id: creature.id };
   }
   for (const node of state.resourceNodes) {
     const r = NODE_RADIUS[node.resourceType] ?? 10;

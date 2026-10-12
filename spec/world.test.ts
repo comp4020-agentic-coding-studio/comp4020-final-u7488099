@@ -393,6 +393,13 @@ describe("in-game help (Section 16H)", () => {
     expect(overlayText).toMatch(/your queen/i);
     expect(overlayText).toMatch(/another\s+colony's queen/i);
     expect(overlayText).toMatch(/carcass/i);
+
+    // Stage 7: spiders are hostile and worker injury/death is real — the
+    // Danger section and the spider/health-bar legend rows must say so.
+    expect(overlayText).toMatch(/spider/i);
+    expect(overlayText).toMatch(/flee|run/i);
+    expect(overlayText).toMatch(/health/i);
+    expect(overlayText).toMatch(/death|dies|died/i);
   });
 
   it("the client bundle wires up opening and closing the help overlay", async () => {
