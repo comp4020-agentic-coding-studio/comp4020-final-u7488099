@@ -10,7 +10,8 @@
     "start": "node src/server/index.ts",
     "check": "pnpm typecheck && pnpm test",
     "check:evidence": "node scripts/check-evidence.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "reset:world": "node scripts/reset-world.ts"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",

@@ -5,15 +5,24 @@ export const WORLD = {
 
 export const STARTING_WORKERS = 3;
 
+// Stage 6b: every REPRODUCE_COST unit of starting protein lets a fresh
+// colony reproduce once immediately, without waiting on a hunt-and-carry
+// round trip first. Deliberately not "enormous" — exactly one reproduction's
+// worth, enough to exercise the loop on arrival. See CLAUDE.md's Stage 6b
+// section.
+export const REPRODUCE_COST = 50;
+export const STARTING_PROTEIN = REPRODUCE_COST;
+
 export const RESOURCE_TYPES = ["sugar", "protein", "biomass"] as const;
 export type ResourceType = (typeof RESOURCE_TYPES)[number];
 
-// Stage 5: sugar nodes are now finite + renewable (previously amount: null,
-// i.e. genuinely infinite — see CLAUDE.md for why that changed). Chosen
-// loosely around protein's scale: big enough that normal play and the HTTP
-// test suite never exhaust a single node, small enough that a manual
-// gather-to-zero check doesn't take forever.
+// Stage 5: sugar nodes are finite + renewable (see CLAUDE.md for why that
+// changed from genuinely infinite). Biomass/protein amounts are likewise
+// named constants (not inlined per-node) so Stage 6b's generated node list
+// and any future rebalancing share one source of truth per resource type.
 export const SUGAR_NODE_MAX_AMOUNT = 100;
+export const BIOMASS_NODE_MAX_AMOUNT = 500;
+export const PROTEIN_NODE_AMOUNT = 200;
 
 // Units regenerated per second at a node below its maxAmount. Rates are
 // arbitrary — balancing isn't a priority this stage — chosen only so
@@ -31,35 +40,185 @@ export const RESOURCE_REGEN_RATES: Partial<Record<ResourceType, number>> = {
   biomass: BIOMASS_REGEN_RATE,
 };
 
-// Stage 1 seed: fixed, deterministic positions spread across the world so it
-// visibly exceeds any one viewport. Not randomised — a fresh seed, and a
-// test run, must be reproducible. `amount`/`maxAmount` now drive real
-// depletion via Stage 1c's travel + claim gather (see simulation.ts).
-export const RESOURCE_NODES: {
+// Shared by computeGroupDestinations (simulation.ts), createColony (db.ts),
+// and Stage 6b's world-population generator below — one golden-angle spiral
+// constant and one placement formula, not three copies of the same idea.
+export const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+export const COLONY_SPACING = 300;
+export const COLONY_PLACEMENT_MARGIN = 200;
+
+// Crit 10: each new session mints its own colony, placed on the same
+// golden-angle spiral computeGroupDestinations already uses for group worker
+// placement, centred on the world instead of a click point. Colony index 0
+// (the very first colony any world ever seeds) gets radius 0 — exactly
+// (width/2, height/2), the pre-Crit-10 single-colony seed position,
+// unchanged. COLONY_PLACEMENT_MARGIN keeps a freshly spiralled queen (and
+// its starting workers, offset up to ~100 units away) comfortably inside
+// world bounds rather than clamped flush against an edge.
+//
+// Stage 6b reuses this exact function (not a re-derivation of the formula)
+// to decide where to place resource/aphid clusters, so "likely colony spawn
+// region" and "has useful nearby content" are the same coordinates by
+// construction rather than two things that could drift apart.
+export function colonySpiralPosition(index: number): { x: number; y: number } {
+  const radius = COLONY_SPACING * Math.sqrt(index);
+  const angle = index * GOLDEN_ANGLE;
+  const margin = COLONY_PLACEMENT_MARGIN;
+  const x = Math.min(Math.max(WORLD.width / 2 + radius * Math.cos(angle), margin), WORLD.width - margin);
+  const y = Math.min(Math.max(WORLD.height / 2 + radius * Math.sin(angle), margin), WORLD.height - margin);
+  return { x, y };
+}
+
+// --- Stage 6b: deterministic world population -----------------------------
+//
+// Replaces the original Stage 1 hand-placed 12-node array and Stage 5's
+// 14-position aphid seed with a generated, denser, deterministic world: a
+// cluster of resources + aphids around each of the first SPAWN_ANCHOR_COUNT
+// colony-spiral positions (so every colony a playtest actually mints has
+// useful nearby content on arrival — see CLAUDE.md's Stage 6b section),
+// plus a scatter of extra content across the rest of the map so exploring
+// away from any one colony still finds things. SPAWN_ANCHOR_COUNT=10 is not
+// arbitrary: it's exactly enough to cover every colony index the test suite
+// ever claims (colony.test.ts's session lands on index 0; multiplayer.test's
+// 8 alice/bob sessions claim indices 1-8; realtime.test.ts's session claims
+// index 9) — see spec/*.test.ts.
+//
+// Generation uses a fixed-seed PRNG (mulberry32, seeded with a literal
+// constant — never Math.random/Date.now) so positions are irregular-looking
+// but 100% reproducible: the same seed always produces the same world, which
+// is what makes a fresh deploy's layout, and the test suite's assumptions
+// about it, stable. This is "deterministic initial world seeding" computed
+// once at module load, not runtime procedural spawning — equivalent in
+// spirit to Stage 1's hand-typed array, just generated instead of typed by
+// hand because hand-placing 100+ coordinates isn't practical at this
+// density.
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return function next() {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+export const SPAWN_ANCHOR_COUNT = 10;
+export const SUGAR_PER_ANCHOR = 3;
+export const BIOMASS_PER_ANCHOR = 2;
+export const APHIDS_PER_ANCHOR = 4;
+// Every PROTEIN_ANCHOR_STRIDE-th anchor also gets one finite protein deposit
+// nearby — protein sources are deliberately rarer than sugar/biomass since
+// hunting aphids is the primary, renewable protein loop; these are a bonus,
+// not the main source (see CLAUDE.md's Stage 6b section).
+export const PROTEIN_ANCHOR_STRIDE = 2;
+
+// Background content scattered across the whole map, not tied to any one
+// colony's spawn, so exploring away from a colony still finds things and the
+// map doesn't read as "rich near colonies, empty everywhere else".
+export const SCATTER_SUGAR_COUNT = 6;
+export const SCATTER_BIOMASS_COUNT = 8;
+export const SCATTER_PROTEIN_COUNT = 3;
+export const SCATTER_APHID_COUNT = 12;
+
+// A cluster item lands at a random angle and this radius from its anchor —
+// far enough out that nothing sits on top of the queen or the starting
+// workers, close enough that a fresh colony doesn't have to travel far to
+// start gathering/hunting.
+const ANCHOR_CLUSTER_MIN_RADIUS = 150;
+const ANCHOR_CLUSTER_MAX_RADIUS = 450;
+// Scattered (non-cluster) content keeps this far from every anchor, so
+// "background" placement never accidentally drops something on a queen.
+const ANCHOR_CLEAR_RADIUS = 120;
+// Fixed, literal seed — not Math.random()/Date.now() — so the generated
+// world is exactly reproducible on every boot and every test run.
+const WORLD_SEED = 1337;
+
+type GeneratedNode = {
   x: number;
   y: number;
   resourceType: ResourceType;
   amount: number | null;
   maxAmount: number | null;
-}[] = [
-  // sugar/nectar: small, plentiful, renewable (Stage 5) — depletes like any
-  // finite node but regenerates over time via RESOURCE_REGEN_RATES below.
-  { x: 1200, y: 1200, resourceType: "sugar", amount: SUGAR_NODE_MAX_AMOUNT, maxAmount: SUGAR_NODE_MAX_AMOUNT },
-  { x: 1800, y: 1200, resourceType: "sugar", amount: SUGAR_NODE_MAX_AMOUNT, maxAmount: SUGAR_NODE_MAX_AMOUNT },
-  { x: 1200, y: 1800, resourceType: "sugar", amount: SUGAR_NODE_MAX_AMOUNT, maxAmount: SUGAR_NODE_MAX_AMOUNT },
-  { x: 1800, y: 1800, resourceType: "sugar", amount: SUGAR_NODE_MAX_AMOUNT, maxAmount: SUGAR_NODE_MAX_AMOUNT },
-  { x: 1500, y: 900, resourceType: "sugar", amount: SUGAR_NODE_MAX_AMOUNT, maxAmount: SUGAR_NODE_MAX_AMOUNT },
-  { x: 1500, y: 2100, resourceType: "sugar", amount: SUGAR_NODE_MAX_AMOUNT, maxAmount: SUGAR_NODE_MAX_AMOUNT },
-  // protein: medium-sized prey, finite, non-renewable.
-  { x: 700, y: 1500, resourceType: "protein", amount: 200, maxAmount: 200 },
-  { x: 2300, y: 1500, resourceType: "protein", amount: 200, maxAmount: 200 },
-  { x: 1500, y: 700, resourceType: "protein", amount: 200, maxAmount: 200 },
-  { x: 1500, y: 2300, resourceType: "protein", amount: 200, maxAmount: 200 },
-  // biomass: large, rare, finite — placed at the far corners to make the
-  // world's size obvious.
-  { x: 300, y: 300, resourceType: "biomass", amount: 500, maxAmount: 500 },
-  { x: 2700, y: 2700, resourceType: "biomass", amount: 500, maxAmount: 500 },
-];
+};
+
+function buildWorldPopulation(): { resourceNodes: GeneratedNode[]; aphidPositions: { x: number; y: number }[] } {
+  const rng = mulberry32(WORLD_SEED);
+  const anchors = Array.from({ length: SPAWN_ANCHOR_COUNT }, (_, i) => colonySpiralPosition(i));
+
+  const resourceNodes: GeneratedNode[] = [];
+  const aphidPositions: { x: number; y: number }[] = [];
+
+  function clamp(value: number, lo: number, hi: number): number {
+    return Math.min(Math.max(value, lo), hi);
+  }
+
+  function placeNearAnchor(anchor: { x: number; y: number }): { x: number; y: number } {
+    const angle = rng() * Math.PI * 2;
+    const radius = ANCHOR_CLUSTER_MIN_RADIUS + rng() * (ANCHOR_CLUSTER_MAX_RADIUS - ANCHOR_CLUSTER_MIN_RADIUS);
+    return {
+      x: clamp(anchor.x + Math.cos(angle) * radius, COLONY_PLACEMENT_MARGIN, WORLD.width - COLONY_PLACEMENT_MARGIN),
+      y: clamp(anchor.y + Math.sin(angle) * radius, COLONY_PLACEMENT_MARGIN, WORLD.height - COLONY_PLACEMENT_MARGIN),
+    };
+  }
+
+  // Bounded retries, not unbounded — this stays a pure, terminating function
+  // of the fixed seed even in the pathological case every draw rejects.
+  function placeScattered(): { x: number; y: number } {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const x = COLONY_PLACEMENT_MARGIN + rng() * (WORLD.width - 2 * COLONY_PLACEMENT_MARGIN);
+      const y = COLONY_PLACEMENT_MARGIN + rng() * (WORLD.height - 2 * COLONY_PLACEMENT_MARGIN);
+      if (anchors.every((a) => Math.hypot(a.x - x, a.y - y) > ANCHOR_CLEAR_RADIUS)) return { x, y };
+    }
+    return { x: WORLD.width / 2, y: WORLD.height / 2 };
+  }
+
+  anchors.forEach((anchor, index) => {
+    for (let i = 0; i < SUGAR_PER_ANCHOR; i++) {
+      const { x, y } = placeNearAnchor(anchor);
+      resourceNodes.push({ x, y, resourceType: "sugar", amount: SUGAR_NODE_MAX_AMOUNT, maxAmount: SUGAR_NODE_MAX_AMOUNT });
+    }
+    for (let i = 0; i < BIOMASS_PER_ANCHOR; i++) {
+      const { x, y } = placeNearAnchor(anchor);
+      resourceNodes.push({ x, y, resourceType: "biomass", amount: BIOMASS_NODE_MAX_AMOUNT, maxAmount: BIOMASS_NODE_MAX_AMOUNT });
+    }
+    if (index % PROTEIN_ANCHOR_STRIDE === 0) {
+      const { x, y } = placeNearAnchor(anchor);
+      resourceNodes.push({ x, y, resourceType: "protein", amount: PROTEIN_NODE_AMOUNT, maxAmount: PROTEIN_NODE_AMOUNT });
+    }
+    for (let i = 0; i < APHIDS_PER_ANCHOR; i++) {
+      aphidPositions.push(placeNearAnchor(anchor));
+    }
+  });
+
+  for (let i = 0; i < SCATTER_SUGAR_COUNT; i++) {
+    const { x, y } = placeScattered();
+    resourceNodes.push({ x, y, resourceType: "sugar", amount: SUGAR_NODE_MAX_AMOUNT, maxAmount: SUGAR_NODE_MAX_AMOUNT });
+  }
+  for (let i = 0; i < SCATTER_BIOMASS_COUNT; i++) {
+    const { x, y } = placeScattered();
+    resourceNodes.push({ x, y, resourceType: "biomass", amount: BIOMASS_NODE_MAX_AMOUNT, maxAmount: BIOMASS_NODE_MAX_AMOUNT });
+  }
+  for (let i = 0; i < SCATTER_PROTEIN_COUNT; i++) {
+    const { x, y } = placeScattered();
+    resourceNodes.push({ x, y, resourceType: "protein", amount: PROTEIN_NODE_AMOUNT, maxAmount: PROTEIN_NODE_AMOUNT });
+  }
+  for (let i = 0; i < SCATTER_APHID_COUNT; i++) {
+    aphidPositions.push(placeScattered());
+  }
+
+  return { resourceNodes, aphidPositions };
+}
+
+const WORLD_POPULATION = buildWorldPopulation();
+
+// Stage 6b: generated (see buildWorldPopulation above), not hand-typed —
+// ~36 sugar + ~28 biomass + ~8 protein sources clustered around the first
+// SPAWN_ANCHOR_COUNT colony spawn points plus scattered across the map.
+export const RESOURCE_NODES: GeneratedNode[] = WORLD_POPULATION.resourceNodes;
+
+// Stage 6b: generated — ~52 aphids clustered around spawn points plus
+// scattered across the map (up from Stage 5's original hand-placed 14).
+export const APHID_SEED_POSITIONS: { x: number; y: number }[] = WORLD_POPULATION.aphidPositions;
 
 // How much a single successful claim picks up into a worker's `carrying`,
 // and how much it decrements a finite node's remaining amount (capped at
@@ -79,7 +238,6 @@ export const GATHER_RANGE = 30;
 // deposit range of the queen while still keeping separation distance from
 // each other.
 export const DEPOSIT_RANGE = 30;
-export const REPRODUCE_COST = 50;
 
 export const WORKER_SPEED = 150; // world units per second
 
@@ -92,22 +250,6 @@ export const WORKER_RADIUS = 10;
 export const MIN_SEPARATION = WORKER_RADIUS * 2;
 export const SEPARATION_STRENGTH = 80; // world units/sec of push at full overlap, well under WORKER_SPEED
 export const GROUP_DESTINATION_SPACING = WORKER_RADIUS * 2;
-
-// Shared by computeGroupDestinations (simulation.ts) and createColony
-// (db.ts) — one golden-angle spiral constant, not two copies of the same
-// irrational number.
-export const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
-
-// Crit 10: each new session mints its own colony, placed on the same
-// golden-angle spiral computeGroupDestinations already uses for group worker
-// placement, centred on the world instead of a click point. Colony index 0
-// (the very first colony any world ever seeds) gets radius 0 — exactly
-// (width/2, height/2), the pre-Crit-10 single-colony seed position,
-// unchanged. COLONY_PLACEMENT_MARGIN keeps a freshly spiralled queen (and
-// its starting workers, offset up to ~100 units away) comfortably inside
-// world bounds rather than clamped flush against an edge.
-export const COLONY_SPACING = 300;
-export const COLONY_PLACEMENT_MARGIN = 200;
 
 // Simulation cadence: ticking faster than it broadcasts is deliberate — the
 // authoritative position updates smoothly in memory even though clients only
@@ -126,28 +268,6 @@ export const APHID_SPEED = 40; // world units/sec — well under WORKER_SPEED (1
 export const APHID_WANDER_RADIUS = 150; // max distance a newly chosen destination can land from the current spot
 export const APHID_IDLE_MIN = 1; // seconds idle before choosing a new destination
 export const APHID_IDLE_MAX = 4;
-
-// Deterministic seed spread across the whole world so aphids are visibly
-// everywhere, not clustered near the nest. Fixed positions, not randomised —
-// same rationale as RESOURCE_NODES: a fresh seed and a test run must be
-// reproducible. Expressed as fractions of WORLD so they stay in-bounds
-// regardless of world size.
-export const APHID_SEED_POSITIONS: { x: number; y: number }[] = [
-  { x: WORLD.width * 0.05, y: WORLD.height * 0.05 },
-  { x: WORLD.width * 0.95, y: WORLD.height * 0.05 },
-  { x: WORLD.width * 0.05, y: WORLD.height * 0.95 },
-  { x: WORLD.width * 0.95, y: WORLD.height * 0.95 },
-  { x: WORLD.width * 0.5, y: WORLD.height * 0.07 },
-  { x: WORLD.width * 0.5, y: WORLD.height * 0.93 },
-  { x: WORLD.width * 0.07, y: WORLD.height * 0.5 },
-  { x: WORLD.width * 0.93, y: WORLD.height * 0.5 },
-  { x: WORLD.width * 0.27, y: WORLD.height * 0.27 },
-  { x: WORLD.width * 0.73, y: WORLD.height * 0.27 },
-  { x: WORLD.width * 0.27, y: WORLD.height * 0.73 },
-  { x: WORLD.width * 0.73, y: WORLD.height * 0.73 },
-  { x: WORLD.width * 0.5, y: WORLD.height * 0.33 },
-  { x: WORLD.width * 0.33, y: WORLD.height * 0.63 },
-];
 
 // Stage 6: creature health. Keyed by species so a future species needs only
 // a new map entry, not a schema change (health/maxHealth columns are

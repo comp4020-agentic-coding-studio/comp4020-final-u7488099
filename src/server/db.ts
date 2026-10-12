@@ -4,12 +4,11 @@ import { dirname } from "node:path";
 import {
   APHID_MAX_HEALTH,
   APHID_SEED_POSITIONS,
-  COLONY_PLACEMENT_MARGIN,
-  COLONY_SPACING,
-  GOLDEN_ANGLE,
+  colonySpiralPosition,
   RESOURCE_NODES,
   RESOURCE_TYPES,
   SPECIES_MAX_HEALTH,
+  STARTING_PROTEIN,
   STARTING_WORKERS,
   SUGAR_NODE_MAX_AMOUNT,
   WORLD,
@@ -226,19 +225,13 @@ function seedIfEmpty(): void {
 
   const queenX = WORLD.width / 2;
   const queenY = WORLD.height / 2;
-  const { lastInsertRowid: colonyId } = db
+  const { lastInsertRowid: colonyRowId } = db
     .prepare("INSERT INTO colonies (world_id, queen_x, queen_y) VALUES (?, ?, ?)")
     .run(worldId, queenX, queenY);
+  const colonyId = Number(colonyRowId);
 
-  const insertResourceBucket = db.prepare(
-    "INSERT INTO colony_resources (colony_id, resource_type, amount) VALUES (?, ?, 0)",
-  );
-  for (const type of RESOURCE_TYPES) insertResourceBucket.run(colonyId, type);
-
-  const insertWorker = db.prepare("INSERT INTO workers (colony_id, x, y) VALUES (?, ?, ?)");
-  for (let i = 0; i < STARTING_WORKERS; i++) {
-    insertWorker.run(colonyId, queenX + (i - 1) * 50, queenY + 50);
-  }
+  seedColonyResources(colonyId);
+  spawnStartingWorkers(colonyId, queenX, queenY);
 
   const insertNode = db.prepare(
     "INSERT INTO resource_nodes (world_id, x, y, resource_type, amount, max_amount) VALUES (?, ?, ?, ?, ?, ?)",
@@ -246,6 +239,29 @@ function seedIfEmpty(): void {
   for (const node of RESOURCE_NODES) {
     insertNode.run(worldId, node.x, node.y, node.resourceType, node.amount, node.maxAmount);
   }
+}
+
+// Shared by seedIfEmpty() and createColony() so every colony — the original
+// seeded one or a Crit-10 mint — starts under the exact same fair rules
+// (Stage 6b). Protein starts at STARTING_PROTEIN (enough for one immediate
+// reproduction); sugar/biomass start at 0, same as always.
+function seedColonyResources(colonyId: number): void {
+  const insertResourceBucket = db.prepare(
+    "INSERT INTO colony_resources (colony_id, resource_type, amount) VALUES (?, ?, ?)",
+  );
+  for (const type of RESOURCE_TYPES) insertResourceBucket.run(colonyId, type, type === "protein" ? STARTING_PROTEIN : 0);
+}
+
+function spawnStartingWorkers(colonyId: number, queenX: number, queenY: number): { id: number; x: number; y: number }[] {
+  const insertWorker = db.prepare("INSERT INTO workers (colony_id, x, y) VALUES (?, ?, ?)");
+  const workers: { id: number; x: number; y: number }[] = [];
+  for (let i = 0; i < STARTING_WORKERS; i++) {
+    const x = queenX + (i - 1) * 50;
+    const y = queenY + 50;
+    const { lastInsertRowid } = insertWorker.run(colonyId, x, y);
+    workers.push({ id: Number(lastInsertRowid), x, y });
+  }
+  return workers;
 }
 
 // Crit 10: a colony with no row in `sessions` pointing at it — at most ever
@@ -280,9 +296,11 @@ function seedCreaturesIfEmpty(): void {
 // Test-only isolation seam (Stage 4): wipes every table, then reseeds via
 // seedIfEmpty(). None of these tables use AUTOINCREMENT, so SQLite reuses
 // the lowest free rowid — every reset reproduces the exact same ids
-// (world=1, colony=1, workers=1/2/3, resource_nodes=1..12), which is why
-// spec/simulation.test.ts can capture `colony`/`world` once at import time
-// and have them stay valid across every reset. Not used by production code.
+// (world=1, colony=1, workers=1/2/3, resource_nodes=1..RESOURCE_NODES.length),
+// which is why spec/simulation.test.ts can capture `colony`/`world` once at
+// import time and have them stay valid across every reset. Not used by
+// production code — see resetProductionWorld() in scripts/reset-world.ts for
+// the production-safe equivalent (Stage 6b).
 export function resetForTests(): void {
   db.exec(`
     DELETE FROM resource_nodes;
@@ -297,6 +315,58 @@ export function resetForTests(): void {
   seedIfEmpty();
   seedCreaturesIfEmpty();
   backfillCreatureHealth();
+}
+
+// Stage 6b: the production-safe, intentionally-invoked counterpart to
+// resetForTests(). Run only via `pnpm reset:world -- --yes`
+// (scripts/reset-world.ts), never automatically on boot/deploy/restart, and
+// never exposed as an HTTP endpoint — a public destructive endpoint would
+// let any visitor wipe every player's colony. Wipes gameplay state but
+// deliberately leaves `action_log` untouched: Crit 10's accountability
+// record should survive a playtest reset, not be erased by it (see
+// CLAUDE.md's Stage 6b section). Sessions are wiped too — every returning
+// browser's old `sid` cookie simply fails to resolve afterwards
+// (getColonyForSession returns undefined), so resolveOrCreateColony mints it
+// a brand-new colony exactly as it would for a first-time visitor. No
+// dangling session -> colony reference is possible because sessions and
+// colonies are wiped together, inside one transaction. Does not call
+// logAction itself (that would import log.ts, which imports this module) —
+// the caller (scripts/reset-world.ts) logs the event after this returns.
+export function resetProductionWorld(): {
+  colonies: number;
+  workers: number;
+  resourceNodes: number;
+  creatures: number;
+  sessionsCleared: number;
+  actionLogPreservedRows: number;
+} {
+  const sessionsCleared = (db.prepare("SELECT COUNT(*) AS n FROM sessions").get() as { n: number }).n;
+  const actionLogPreservedRows = (db.prepare("SELECT COUNT(*) AS n FROM action_log").get() as { n: number }).n;
+
+  const tx = db.transaction(() => {
+    db.exec(`
+      DELETE FROM resource_nodes;
+      DELETE FROM workers;
+      DELETE FROM colony_resources;
+      DELETE FROM sessions;
+      DELETE FROM colonies;
+      DELETE FROM creatures;
+      DELETE FROM worlds;
+    `);
+    seedIfEmpty();
+    seedCreaturesIfEmpty();
+    backfillCreatureHealth();
+  });
+  tx();
+
+  return {
+    colonies: (db.prepare("SELECT COUNT(*) AS n FROM colonies").get() as { n: number }).n,
+    workers: (db.prepare("SELECT COUNT(*) AS n FROM workers").get() as { n: number }).n,
+    resourceNodes: (db.prepare("SELECT COUNT(*) AS n FROM resource_nodes").get() as { n: number }).n,
+    creatures: (db.prepare("SELECT COUNT(*) AS n FROM creatures").get() as { n: number }).n,
+    sessionsCleared,
+    actionLogPreservedRows,
+  };
 }
 
 // Crit 10: mints a brand-new colony — its own queen, starting workers, and
@@ -318,38 +388,22 @@ export function createColony(): {
   queenY: number;
   workers: { id: number; x: number; y: number }[];
 } {
-  const world = db.prepare("SELECT id, width, height FROM worlds LIMIT 1").get() as
-    | { id: number; width: number; height: number }
-    | undefined;
+  const world = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number } | undefined;
   if (!world) throw new Error("no world seeded");
 
   const { n: index } = db.prepare("SELECT COUNT(*) AS n FROM colonies").get() as { n: number };
-  const radius = COLONY_SPACING * Math.sqrt(index);
-  const angle = index * GOLDEN_ANGLE;
-  const margin = COLONY_PLACEMENT_MARGIN;
-  const queenX = Math.min(Math.max(world.width / 2 + radius * Math.cos(angle), margin), world.width - margin);
-  const queenY = Math.min(Math.max(world.height / 2 + radius * Math.sin(angle), margin), world.height - margin);
+  const { x: queenX, y: queenY } = colonySpiralPosition(index);
 
   let colonyId = 0;
-  const workers: { id: number; x: number; y: number }[] = [];
+  let workers: { id: number; x: number; y: number }[] = [];
   const tx = db.transaction(() => {
     const colonyInfo = db
       .prepare("INSERT INTO colonies (world_id, queen_x, queen_y) VALUES (?, ?, ?)")
       .run(world.id, queenX, queenY);
     colonyId = Number(colonyInfo.lastInsertRowid);
 
-    const insertResourceBucket = db.prepare(
-      "INSERT INTO colony_resources (colony_id, resource_type, amount) VALUES (?, ?, 0)",
-    );
-    for (const type of RESOURCE_TYPES) insertResourceBucket.run(colonyId, type);
-
-    const insertWorker = db.prepare("INSERT INTO workers (colony_id, x, y) VALUES (?, ?, ?)");
-    for (let i = 0; i < STARTING_WORKERS; i++) {
-      const x = queenX + (i - 1) * 50;
-      const y = queenY + 50;
-      const { lastInsertRowid } = insertWorker.run(colonyId, x, y);
-      workers.push({ id: Number(lastInsertRowid), x, y });
-    }
+    seedColonyResources(colonyId);
+    workers = spawnStartingWorkers(colonyId, queenX, queenY);
   });
   tx();
 
