@@ -7,6 +7,7 @@ import {
   DEPOSIT_RANGE,
   GATHER_RANGE,
   GATHER_YIELD,
+  GOLDEN_ANGLE,
   GROUP_DESTINATION_SPACING,
   MIN_SEPARATION,
   RESOURCE_REGEN_RATES,
@@ -267,6 +268,16 @@ export function registerWorker(worker: { id: number; colonyId: number; x: number
   workers.set(worker.id, { ...worker, carrying: null, command: { type: "idle" } });
 }
 
+// Crit 10: registers a colony created outside the simulation (createColony()
+// inserts it straight into SQLite). Without this, nestPositions wouldn't know
+// where a freshly-minted colony's queen is until the next full
+// loadSimulation() (i.e. restart) — a brand-new session's worker could never
+// resolve a "return" command target in the meantime. Mirrors registerWorker
+// above for the same reason.
+export function registerColony(colonyId: number, queenX: number, queenY: number): void {
+  nestPositions.set(colonyId, { x: queenX, y: queenY });
+}
+
 export function getWorkersForColony(colonyId: number): { id: number; x: number; y: number; carrying: Carrying }[] {
   return [...workers.values()]
     .filter((w) => w.colonyId === colonyId)
@@ -280,9 +291,20 @@ export function getWorkerCommand(workerId: number): "idle" | "move" | "gather" |
   return worker.command.type;
 }
 
-export function issueMoveCommand(workerId: number, x: number, y: number): MoveCommandError | null {
+// Crit 10: `ownerColonyId` is the caller's own colony, resolved server-side
+// from their session — never a client-supplied value. A worker that exists
+// but belongs to someone else's colony is reported identically to a
+// nonexistent one ("no such worker"): from the actor's perspective a
+// wrong-owner id must behave exactly like a wrong id, never leak that the
+// target exists under another colony. See CLAUDE.md's Crit 10 section.
+export function issueMoveCommand(
+  workerId: number,
+  x: number,
+  y: number,
+  ownerColonyId: number,
+): MoveCommandError | null {
   const worker = workers.get(workerId);
-  if (!worker) return "no such worker";
+  if (!worker || worker.colonyId !== ownerColonyId) return "no such worker";
   if (worker.carrying) return "worker is busy returning resources";
   if (!Number.isFinite(x) || !Number.isFinite(y)) return "invalid coordinates";
   if (x < 0 || x > worldBounds.width || y < 0 || y > worldBounds.height) return "coordinates out of bounds";
@@ -302,9 +324,13 @@ export function issueMoveCommand(workerId: number, x: number, y: number): MoveCo
 // `worker.carrying`, not on `command.type === "return"`: carrying is the
 // actual economic-ownership flag, even though the two are always set
 // together. See CLAUDE.md.
-export function issueGatherCommand(workerId: number, resourceId: number): GatherCommandError | null {
+export function issueGatherCommand(
+  workerId: number,
+  resourceId: number,
+  ownerColonyId: number,
+): GatherCommandError | null {
   const worker = workers.get(workerId);
-  if (!worker) return "no such worker";
+  if (!worker || worker.colonyId !== ownerColonyId) return "no such worker";
   if (worker.carrying) return "worker is busy returning resources";
   const node = db.prepare("SELECT x, y FROM resource_nodes WHERE id = ?").get(resourceId) as
     | { x: number; y: number }
@@ -320,9 +346,13 @@ export function issueGatherCommand(workerId: number, resourceId: number): Gather
 // redirected mid-carry. `cooldownRemaining: 0` lets a freshly issued attack
 // land a hit the instant it's in range, rather than forcing a full
 // cooldown wait first.
-export function issueAttackCommand(workerId: number, creatureId: number): AttackCommandError | null {
+export function issueAttackCommand(
+  workerId: number,
+  creatureId: number,
+  ownerColonyId: number,
+): AttackCommandError | null {
   const worker = workers.get(workerId);
-  if (!worker) return "no such worker";
+  if (!worker || worker.colonyId !== ownerColonyId) return "no such worker";
   if (worker.carrying) return "worker is busy returning resources";
   if (!creatures.has(creatureId)) return "no such creature";
   worker.command = { type: "attack", creatureId, cooldownRemaining: 0 };
@@ -334,7 +364,6 @@ export function issueAttackCommand(workerId: number, creatureId: number): Attack
 // slot. A lone worker always gets the exact centre, untouched (no clamping
 // either), so a solo move's existing bounds-validation behaviour in
 // issueMoveCommand is completely unchanged. See CLAUDE.md.
-const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
 
 export function computeGroupDestinations(
   workerIds: number[],

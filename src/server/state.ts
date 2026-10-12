@@ -21,18 +21,22 @@ export interface ColonyState {
     kind: "source" | "item";
   }[];
   creatures: { id: number; species: string; x: number; y: number; health: number; maxHealth: number }[];
+  // Crit 10: every colony in the shared world, id + queen position only — no
+  // resource ledger, which is private to its own owner. Lets a session see
+  // that other players exist and where, without exposing their economy.
+  colonies: { id: number; queenX: number; queenY: number }[];
 }
 
-export function getState(): ColonyState {
+export function getState(colonyId: number): ColonyState {
   const world = db.prepare("SELECT id, width, height FROM worlds LIMIT 1").get() as
     | { id: number; width: number; height: number }
     | undefined;
   if (!world) throw new Error("no world seeded");
 
   const colonyRow = db
-    .prepare("SELECT id, queen_x AS queenX, queen_y AS queenY FROM colonies LIMIT 1")
-    .get() as { id: number; queenX: number; queenY: number } | undefined;
-  if (!colonyRow) throw new Error("no colony seeded");
+    .prepare("SELECT id, queen_x AS queenX, queen_y AS queenY FROM colonies WHERE id = ?")
+    .get(colonyId) as { id: number; queenX: number; queenY: number } | undefined;
+  if (!colonyRow) throw new Error("no such colony");
 
   const resourceRows = db
     .prepare("SELECT resource_type AS resourceType, amount FROM colony_resources WHERE colony_id = ?")
@@ -52,11 +56,16 @@ export function getState(): ColonyState {
 
   const creatures = getCreaturesForWorld(world.id);
 
+  const colonies = db
+    .prepare("SELECT id, queen_x AS queenX, queen_y AS queenY FROM colonies ORDER BY id")
+    .all() as ColonyState["colonies"];
+
   return {
     world: { width: world.width, height: world.height },
     colony: { id: colonyRow.id, queenX: colonyRow.queenX, queenY: colonyRow.queenY, resources },
     workers,
     resourceNodes,
     creatures,
+    colonies,
   };
 }

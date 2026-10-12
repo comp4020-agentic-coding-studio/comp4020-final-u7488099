@@ -93,6 +93,22 @@ export const MIN_SEPARATION = WORKER_RADIUS * 2;
 export const SEPARATION_STRENGTH = 80; // world units/sec of push at full overlap, well under WORKER_SPEED
 export const GROUP_DESTINATION_SPACING = WORKER_RADIUS * 2;
 
+// Shared by computeGroupDestinations (simulation.ts) and createColony
+// (db.ts) — one golden-angle spiral constant, not two copies of the same
+// irrational number.
+export const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+
+// Crit 10: each new session mints its own colony, placed on the same
+// golden-angle spiral computeGroupDestinations already uses for group worker
+// placement, centred on the world instead of a click point. Colony index 0
+// (the very first colony any world ever seeds) gets radius 0 — exactly
+// (width/2, height/2), the pre-Crit-10 single-colony seed position,
+// unchanged. COLONY_PLACEMENT_MARGIN keeps a freshly spiralled queen (and
+// its starting workers, offset up to ~100 units away) comfortably inside
+// world bounds rather than clamped flush against an edge.
+export const COLONY_SPACING = 300;
+export const COLONY_PLACEMENT_MARGIN = 200;
+
 // Simulation cadence: ticking faster than it broadcasts is deliberate — the
 // authoritative position updates smoothly in memory even though clients only
 // see a new frame every BROADCAST_HZ. See CLAUDE.md.

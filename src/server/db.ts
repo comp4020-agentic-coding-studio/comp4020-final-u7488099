@@ -4,6 +4,9 @@ import { dirname } from "node:path";
 import {
   APHID_MAX_HEALTH,
   APHID_SEED_POSITIONS,
+  COLONY_PLACEMENT_MARGIN,
+  COLONY_SPACING,
+  GOLDEN_ANGLE,
   RESOURCE_NODES,
   RESOURCE_TYPES,
   SPECIES_MAX_HEALTH,
@@ -93,6 +96,30 @@ db.exec(`
     max_health REAL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  -- Crit 10: one row per anonymous browser session, mapping it to the one
+  -- colony it owns. The session id itself is the cookie value (an opaque
+  -- random token, never a password/account) — durable here so a returning
+  -- cookie resolves to the same colony across a server restart, not just
+  -- within one process's lifetime. See CLAUDE.md's Crit 10 section.
+  CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    colony_id INTEGER NOT NULL REFERENCES colonies(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- Crit 10: durable, queryable record of "who did what" — GET /api/log
+  -- reads this straight back. colony_id is the acting colony (the only
+  -- identity that exists in an anonymous-session model); detail is
+  -- free-form JSON, never parsed back into relational columns because the
+  -- shape differs per action type and nothing needs to query inside it.
+  CREATE TABLE IF NOT EXISTS action_log (
+    id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    colony_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT
+  );
 `);
 
 seedIfEmpty();
@@ -180,6 +207,15 @@ function backfillCreatureHealth(): void {
   }
 }
 
+// Pre-Crit-10 this was "the" one global colony. It still seeds exactly the
+// same way (same world-centre queen position, same 3 starting workers) — but
+// as of Crit 10 it starts out unowned, and becomes whichever session asks
+// for a colony first (see getUnclaimedColonyId()/sessions.ts's
+// resolveOrCreateColony). That's deliberate continuity, not a migration: the
+// original Crit 8 colony becomes player one's colony instead of being thrown
+// away, and it's also what keeps this function's pre-Crit-10 contract exactly
+// intact for spec/simulation.test.ts, which captures `colonies LIMIT 1` at
+// module load time and expects it to already exist.
 function seedIfEmpty(): void {
   const row = db.prepare("SELECT COUNT(*) AS n FROM colonies").get() as { n: number };
   if (row.n > 0) return;
@@ -212,6 +248,18 @@ function seedIfEmpty(): void {
   }
 }
 
+// Crit 10: a colony with no row in `sessions` pointing at it — at most ever
+// the original seedIfEmpty() colony, and only until the first session claims
+// it. createColony()'s golden-angle index (COUNT(*) FROM colonies) already
+// accounts for this colony existing, so the first *freshly minted* colony
+// correctly lands at spiral index 1, not 0.
+export function getUnclaimedColonyId(): number | undefined {
+  const row = db
+    .prepare("SELECT c.id AS id FROM colonies c LEFT JOIN sessions s ON s.colony_id = c.id WHERE s.colony_id IS NULL LIMIT 1")
+    .get() as { id: number } | undefined;
+  return row?.id;
+}
+
 // Independent of seedIfEmpty()'s colonies-count gate: an already-deployed
 // world has colonies > 0 (seedIfEmpty no-ops) but creatures = 0 (this still
 // fires), so Stage 5 backfills aphids into existing worlds too. Called after
@@ -240,6 +288,8 @@ export function resetForTests(): void {
     DELETE FROM resource_nodes;
     DELETE FROM workers;
     DELETE FROM colony_resources;
+    DELETE FROM sessions;
+    DELETE FROM action_log;
     DELETE FROM colonies;
     DELETE FROM creatures;
     DELETE FROM worlds;
@@ -247,4 +297,74 @@ export function resetForTests(): void {
   seedIfEmpty();
   seedCreaturesIfEmpty();
   backfillCreatureHealth();
+}
+
+// Crit 10: mints a brand-new colony — its own queen, starting workers, and
+// zeroed resource ledger — for a session that doesn't already own one. One
+// transaction: a session that gets this colony's id back must never observe
+// a colony that exists without its workers or ledger, even across a crash
+// mid-creation (same discipline Stage 4's claim/deposit transactions use for
+// the same reason — see CLAUDE.md).
+//
+// Placement reuses computeGroupDestinations' golden-angle spiral (see
+// balance.ts's GOLDEN_ANGLE/COLONY_SPACING), centred on the world instead of
+// a click point, so successive colonies spread out deterministically instead
+// of stacking — colony index 0 (the very first colony any world ever seeds)
+// lands at radius 0, exactly (width/2, height/2), the pre-Crit-10
+// single-colony seed position, unchanged.
+export function createColony(): {
+  colonyId: number;
+  queenX: number;
+  queenY: number;
+  workers: { id: number; x: number; y: number }[];
+} {
+  const world = db.prepare("SELECT id, width, height FROM worlds LIMIT 1").get() as
+    | { id: number; width: number; height: number }
+    | undefined;
+  if (!world) throw new Error("no world seeded");
+
+  const { n: index } = db.prepare("SELECT COUNT(*) AS n FROM colonies").get() as { n: number };
+  const radius = COLONY_SPACING * Math.sqrt(index);
+  const angle = index * GOLDEN_ANGLE;
+  const margin = COLONY_PLACEMENT_MARGIN;
+  const queenX = Math.min(Math.max(world.width / 2 + radius * Math.cos(angle), margin), world.width - margin);
+  const queenY = Math.min(Math.max(world.height / 2 + radius * Math.sin(angle), margin), world.height - margin);
+
+  let colonyId = 0;
+  const workers: { id: number; x: number; y: number }[] = [];
+  const tx = db.transaction(() => {
+    const colonyInfo = db
+      .prepare("INSERT INTO colonies (world_id, queen_x, queen_y) VALUES (?, ?, ?)")
+      .run(world.id, queenX, queenY);
+    colonyId = Number(colonyInfo.lastInsertRowid);
+
+    const insertResourceBucket = db.prepare(
+      "INSERT INTO colony_resources (colony_id, resource_type, amount) VALUES (?, ?, 0)",
+    );
+    for (const type of RESOURCE_TYPES) insertResourceBucket.run(colonyId, type);
+
+    const insertWorker = db.prepare("INSERT INTO workers (colony_id, x, y) VALUES (?, ?, ?)");
+    for (let i = 0; i < STARTING_WORKERS; i++) {
+      const x = queenX + (i - 1) * 50;
+      const y = queenY + 50;
+      const { lastInsertRowid } = insertWorker.run(colonyId, x, y);
+      workers.push({ id: Number(lastInsertRowid), x, y });
+    }
+  });
+  tx();
+
+  return { colonyId, queenX, queenY, workers };
+}
+
+// Crit 10: resolves a session cookie value to the colony it owns, or
+// undefined if the cookie is missing/stale (e.g. from a wiped test DB).
+export function getColonyForSession(sessionId: string): number | undefined {
+  const row = db.prepare("SELECT colony_id AS colonyId FROM sessions WHERE id = ?").get(sessionId) as
+    | { colonyId: number }
+    | undefined;
+  return row?.colonyId;
+}
+
+export function saveSession(sessionId: string, colonyId: number): void {
+  db.prepare("INSERT INTO sessions (id, colony_id) VALUES (?, ?)").run(sessionId, colonyId);
 }

@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { WebSocket, WebSocketServer } from "ws";
 import { reproduce } from "./actions.ts";
 import { SIMULATION } from "./balance.ts";
+import { getLog, logAction } from "./log.ts";
+import { resolveOrCreateColony, SESSION_COOKIE } from "./sessions.ts";
 import {
   advanceSimulation,
   checkpointSimulation,
@@ -14,10 +16,43 @@ import {
 } from "./simulation.ts";
 import { getState } from "./state.ts";
 
+// Crit 10: `colonyId` is the one fact every mutation trusts for
+// authorization — resolved below, straight from the session cookie, never
+// from anything the client sends in a request body. See CLAUDE.md's Crit 10
+// section.
+declare global {
+  namespace Express {
+    interface Request {
+      colonyId: number;
+    }
+  }
+}
+
 const app = express();
 app.use(express.json());
+
 app.use(express.static("public"));
 app.use(express.static("dist/client"));
+
+// Crit 10 session middleware: resolves (or mints) the caller's own colony
+// from their `sid` cookie before any `/api` route handler runs, and sets the
+// cookie on first contact so the next request from the same browser profile
+// resolves to the same colony. Scoped to `/api` only — static assets and
+// `/readme/` don't need a colony, and never issuing a cookie there avoids
+// minting a throwaway colony for e.g. a crawler fetching `/favicon.ico` with
+// cookies disabled. No passwords/accounts — `sid` is an opaque random token,
+// not an identity claim the client gets to assert the meaning of.
+// `httpOnly` keeps it out of reach of any client-side JS/XSS; `sameSite:
+// "lax"` is enough for a same-origin app with no cross-site form posts to
+// defend against.
+app.use("/api", (req, res, next) => {
+  const { sessionId, colonyId, isNew } = resolveOrCreateColony(req.headers.cookie);
+  req.colonyId = colonyId;
+  if (isNew) {
+    res.cookie(SESSION_COOKIE, sessionId, { httpOnly: true, path: "/", sameSite: "lax" });
+  }
+  next();
+});
 
 app.get("/readme/", (_req, res) => {
   const readme = readFileSync("README.md", "utf8");
@@ -41,19 +76,23 @@ ${escaped}
 `);
 });
 
-app.get("/api/state", (_req, res) => {
-  res.json(getState());
+app.get("/api/state", (req, res) => {
+  res.json(getState(req.colonyId));
 });
 
-app.post("/api/reproduce", (_req, res) => {
-  const { colony } = getState();
-  const result = reproduce(colony.id);
+app.get("/api/log", (_req, res) => {
+  res.json(getLog());
+});
+
+app.post("/api/reproduce", (req, res) => {
+  const result = reproduce(req.colonyId);
   if (!result.ok) {
     res.status(400).json(result);
     return;
   }
-  const state = getState();
-  broadcastState(state);
+  logAction(req.colonyId, "reproduce");
+  const state = getState(req.colonyId);
+  broadcastState();
   res.json(state);
 });
 
@@ -62,25 +101,36 @@ app.post("/api/reproduce", (_req, res) => {
 // the loop. Only when *every* id fails does the whole request 400 — if at
 // least one succeeded, the response is 200 with the resulting state plus
 // `errors` naming exactly which ids didn't go through. See CLAUDE.md.
+//
+// Crit 10: `issue` is always called with the caller's own `colonyId`
+// (resolved server-side from their session, never from the request body) so
+// ownership enforcement lives once, inside simulation.ts's
+// issueMoveCommand/issueGatherCommand/issueAttackCommand, not duplicated
+// here per route. Every attempted batch is logged once, successes and
+// failures together — "who tried what" is the useful signal, not just "who
+// succeeded".
 function runBatchCommand<E extends string>(
   res: express.Response,
+  colonyId: number,
+  action: string,
   workerIds: number[],
-  issue: (workerId: number) => E | null,
+  issue: (workerId: number, colonyId: number) => E | null,
 ): void {
   const errors: Record<number, E> = {};
   for (const workerId of workerIds) {
-    const error = issue(workerId);
+    const error = issue(workerId, colonyId);
     if (error) errors[workerId] = error;
   }
 
   const succeeded = workerIds.length - Object.keys(errors).length;
+  logAction(colonyId, action, { workerIds, errors });
   if (succeeded === 0) {
     res.status(400).json({ error: Object.values(errors)[0], errors });
     return;
   }
 
-  const state = getState();
-  broadcastState(state);
+  const state = getState(colonyId);
+  broadcastState();
   res.json(Object.keys(errors).length > 0 ? { ...state, errors } : state);
 }
 
@@ -99,9 +149,9 @@ app.post("/api/command/move", (req, res) => {
   // lone worker's slot is the exact centre, unchanged from Stage 2). See
   // simulation.ts.
   const destinations = computeGroupDestinations(workerIds, x, y);
-  runBatchCommand(res, workerIds, (workerId) => {
+  runBatchCommand(res, req.colonyId, "move", workerIds, (workerId, colonyId) => {
     const destination = destinations.get(workerId)!;
-    return issueMoveCommand(workerId, destination.x, destination.y);
+    return issueMoveCommand(workerId, destination.x, destination.y, colonyId);
   });
 });
 
@@ -118,7 +168,9 @@ app.post("/api/command/gather", (req, res) => {
     res.status(400).json({ error: "resourceId is required" });
     return;
   }
-  runBatchCommand(res, workerIds, (workerId) => issueGatherCommand(workerId, resourceId));
+  runBatchCommand(res, req.colonyId, "gather", workerIds, (workerId, colonyId) =>
+    issueGatherCommand(workerId, resourceId, colonyId),
+  );
 });
 
 // Stage 6: same batch-command contract as move/gather. Attack is ephemeral
@@ -135,7 +187,9 @@ app.post("/api/command/attack", (req, res) => {
     res.status(400).json({ error: "creatureId is required" });
     return;
   }
-  runBatchCommand(res, workerIds, (workerId) => issueAttackCommand(workerId, creatureId));
+  runBatchCommand(res, req.colonyId, "attack", workerIds, (workerId, colonyId) =>
+    issueAttackCommand(workerId, creatureId, colonyId),
+  );
 });
 
 const port = Number(process.env.PORT ?? 8080);
@@ -145,12 +199,42 @@ const server = app.listen(port, "0.0.0.0", () => {
 
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-function broadcastState(state: ReturnType<typeof getState>): void {
-  const payload = JSON.stringify(state);
+// Crit 10: each connection belongs to a different colony now, so there is no
+// longer one shared JSON payload to fan out — every connection is tagged
+// with its own `colonyId`, resolved once at handshake time from the same
+// session cookie the client's HTTP requests already carry (never from
+// anything the client sends over the socket itself) and cached on the
+// connection for the rest of its lifetime.
+const connectionColonyIds = new Map<WebSocket, number>();
+
+wss.on("connection", (ws, req) => {
+  const { colonyId } = resolveOrCreateColony(req.headers.cookie);
+  connectionColonyIds.set(ws, colonyId);
+  ws.on("close", () => connectionColonyIds.delete(ws));
+  // No immediate send here: a connection's first frame always comes from the
+  // next periodic broadcast below, same as every pre-Crit-10 connection. Two
+  // connections for the same colony opened moments apart must see bit-
+  // identical state (spec/realtime.test.ts, test I) — sending independently
+  // here would let one connection's snapshot land a tick before another's.
+});
+
+// One `getState(colonyId)` call per distinct colony per broadcast tick, not
+// per client — multiple connections sharing a colony get the exact same
+// serialized string, which is what makes "broadcast identically to every
+// open connection" (spec/realtime.test.ts) true by construction rather than
+// by chance timing.
+function broadcastState(): void {
+  const payloads = new Map<number, string>();
   for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(payload);
+    if (client.readyState !== WebSocket.OPEN) continue;
+    const colonyId = connectionColonyIds.get(client);
+    if (colonyId === undefined) continue;
+    let payload = payloads.get(colonyId);
+    if (payload === undefined) {
+      payload = JSON.stringify(getState(colonyId));
+      payloads.set(colonyId, payload);
     }
+    client.send(payload);
   }
 }
 
@@ -164,7 +248,7 @@ setInterval(() => advanceSimulation(1 / SIMULATION.tickHz), 1000 / SIMULATION.ti
 // Only pushes a frame when something actually moved, so an idle world
 // doesn't broadcast identical state forever.
 setInterval(() => {
-  if (consumeDirty()) broadcastState(getState());
+  if (consumeDirty()) broadcastState();
 }, 1000 / SIMULATION.broadcastHz);
 
 // Positions live in memory and are only periodically flushed to SQLite —
