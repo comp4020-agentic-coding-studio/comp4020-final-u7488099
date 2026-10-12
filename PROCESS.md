@@ -1,5 +1,118 @@
 # Process overview
 
+## Stage 7: predators and worker survival
+
+Stage 6b made the ecosystem rich but risk-free: more workers were pure
+upside, nothing could ever go wrong for one. This stage's brief asked for
+exactly one hostile predator ("spider") plus real worker health/death, so
+the loop becomes gather → risk → flee/fight → injury/death → carcass →
+reproduce — with queens explicitly untouched (no HP, no death, no PvP) and
+no colony-elimination path. I started from three read-only passes over the
+existing creature/combat code before writing anything, because the brief's
+own framing was "extend what Stage 5/6 already built, don't replace it,"
+and the inspection confirmed that was fully possible: `creatures.species`
+was already free text, combat was already a generic
+`issueAttackCommand`/`applyDamage`/`killCreature` pipeline, and the one gap
+was that nothing had ever attacked a worker.
+
+Ten commits, each green before the next, roughly following the brief's own
+suggested order. Step 1
+([`27fa8ab`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/27fa8ab))
+gives workers the exact same two-part health-schema contract
+`creatures.health` already uses (inline columns for a fresh DB, a guarded
+`ALTER TABLE` for an existing one, a backfill), threaded through both paths
+that create a worker — reproduction and new-colony minting — so every
+worker starts at full health from creation, not just from backfill. Step 2
+([`dbcbb64`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/dbcbb64))
+adds death itself: a worker's row is simply deleted, which is also the
+entire "what happens to carried resources on death" rule — there's no
+second code path that could duplicate or re-credit them, by construction
+rather than by a guard. Step 3
+([`70a5dd0`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/70a5dd0))
+gives spiders a durable representation and a world population — scattered
+rather than spawn-clustered, and kept further from every colony's spawn
+than resources or aphids are (`SPIDER_CLEAR_RADIUS=400` vs.
+`ANCHOR_CLEAR_RADIUS=120`) — plus the production-safe seeding split the
+brief specifically asked for: a fresh world seeds spiders in the same pass
+as everything else, while an already-populated (pre-Stage-7) world picks
+them up exactly once, idempotently, the next time it boots, with no reset
+and no manual script.
+
+Step 4
+([`003a9ff`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/003a9ff))
+is the AI itself: a new ephemeral `chase` command, the aphid wander state
+machine generalized into a shared species-parameterized `advanceWander`,
+and `advanceSpider`'s aggro scan (ownership-blind, deterministic
+nearest-plus-id-tiebreak target selection) with disengage-on-range and
+attack-on-cooldown. Steps 5 and 6 from the brief's suggested order
+(damage/death wiring and the player-attacks-spider path) turned out to
+already be exercised for free by the generic combat pipeline once spiders
+existed as creatures, so they're folded into step 4's tests rather than
+needing their own commits — confirmed, not assumed, by the tests that
+cover them. Step 7
+([`64dd0a4`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/64dd0a4))
+generalizes carcass/loot lookup off a per-species map instead of a
+hardcoded aphid constant, adds the `spider_died` log line gated on species
+so aphid-combat output is unchanged, and adds the no-PvP regression test
+the brief asked for: proving a worker id can never resolve as an attack
+target against another colony's worker, because the attack path only ever
+looks workers up in the `creatures` table.
+
+Step 8
+([`3f15fc9`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/3f15fc9))
+extended multiplayer/realtime coverage to spiders — shared visibility,
+independent concurrent attacks, injury/death over both HTTP and WebSocket
+— and in the process of writing the concurrent-kill test, surfaced a real
+bug rather than a hypothetical one: a spider's unconstrained ambient wander
+could drift into a colony's spawn and kill freshly-minted, unclaimed
+workers, a de facto colony elimination the brief explicitly forbids. My
+first fix attempt (reject a wander step and hold position) had its own
+failure mode — a spider already inside a clear zone via a chase that ended
+there could camp there indefinitely — so I replaced it with stepping
+directly away from the nearest violating nest, which is RNG-free and
+always makes forward progress. Step 9
+([`1568ee6`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/1568ee6))
+is the client half (spider marker, click radius, worker health bars, a new
+Help "Danger" section) plus a second instance of the same class of bug:
+constraining wander *endpoints* to stay outside a nest's clear zone isn't
+enough, because the straight-line path between two clear endpoints can
+still cut through the zone in between. I found this empirically, by
+correlating the dev log's `colony_claimed {"workerCount":0}` against a
+spider's recent chase history, not by reasoning about it in the abstract.
+The real fix is at the trigger, not the path: `advanceSpider`'s aggro scan
+now skips any worker standing inside a clear zone, so a spider can never
+*initiate* a chase there regardless of how it arrived nearby — a chase
+already in progress is deliberately left unconstrained, so a worker
+fleeing home can still be caught.
+
+Step 10
+([`deb9381`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/deb9381),
+wording clarified in
+[`9d206d9`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/9d206d9))
+is verification and documentation. The brief asked for a measurement, not
+an assumption, of the 10 Hz tick budget at full population — I wrote a
+throwaway script that scaled the world to 93 workers and 62 creatures
+across 31 colonies, had every worker issue a real attack command against a
+spider so the timed workload was actual combat computation rather than
+idle wander, and timed 500 ticks of `advanceSimulation()` with
+`process.hrtime.bigint()`: ~0.11ms/tick average against a 100ms budget,
+roughly 900x headroom, confirming the aggro scan's O(spiders × workers)
+cost is trivial at this scale. For restart/persistence, I judged the
+existing species-agnostic `killWorker`/`loadSimulation()` test coverage
+(Stage 6's generic creature-restart tests plus the dedicated worker-health
+restart test added in step 2) sufficient without a spider-specific
+duplicate, since none of that code branches on species — consistent with
+this project's standing preference against mechanically-generated,
+redundant tests. `CLAUDE.md` gained a full Stage 7 section documenting all
+of the above as explicit invariants (queen immunity and no-PvP as
+structural properties, not guard clauses; the two-layered nest-exclusion
+mechanism and why the first layer alone was insufficient), and `README.md`
+moved predators/worker-death out of "not here yet" into "what's here."
+
+The full suite stands at 134/134 with `pnpm check`/`pnpm check:evidence`
+both green, verified against a freshly reset dev DB immediately before
+each of the last two commits.
+
 ## Stage 6b: playtest world reset, population, and player guidance
 
 Crit 10 made multiplayer real, but the deployed world was still whatever
