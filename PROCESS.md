@@ -1,5 +1,106 @@
 # Process overview
 
+## Stage 6b: playtest world reset, population, and player guidance
+
+Crit 10 made multiplayer real, but the deployed world was still whatever
+Stage 1–6 had left behind after months of iteration and manual testing: a
+single hand-placed 12-node/14-aphid layout, a handful of accumulated test
+colonies with mutated resource counts, and no in-game explanation of any of
+it for a first-time visitor. This stage's bar, from the brief, was explicit
+that it is *not* a new gameplay-system stage — no predators, PvP, worker
+death, respawning, evolution, or buildings — just a one-time reset, denser
+deterministic world content, and player guidance, with every Crit 10
+multiplayer invariant held fixed.
+
+I started from the two load-bearing constraints rather than the feature
+list: the reset mechanism had to be a deliberate, intentionally-invoked
+operation (never automatic on boot/deploy, never an HTTP endpoint a visitor
+could hit), and the new world content had to still make every spawn
+location in the multi-colony architecture viable, not just the original
+single-colony center. Both of those shaped the implementation before any
+code was written.
+
+([`7fd93c4`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/7fd93c4))
+replaces the hand-typed resource/aphid arrays with `buildWorldPopulation()`
+in `balance.ts`: a `mulberry32` PRNG seeded with a fixed literal constant
+(never `Math.random()`/`Date.now()`, so a fresh deploy and a test run
+produce byte-identical coordinates) clusters sugar/biomass/protein/aphids
+around each of the first 10 colony-spiral spawn points — the exact same
+`colonySpiralPosition()` function `createColony()` already used, factored
+out so "likely colony spawn" and "has nearby content" can't drift apart —
+plus a smaller scatter across the whole map so exploring away from any one
+colony still finds things. The same commit adds `resetProductionWorld()` in
+`db.ts` and its CLI wrapper, `scripts/reset-world.ts`, which refuses to do
+anything without a literal `--yes` flag and is never imported from
+`index.ts`, so no boot path or route can trigger it. I chose to preserve
+`action_log` across this reset rather than wipe it along with everything
+else: Crit 10 built that log specifically for accountability, and erasing
+it at the one moment it would most need to show "what happened right before
+the reset" would undercut its own purpose. `resetForTests()` keeps wiping it
+for tests, which have no accountability need and want a genuinely blank
+slate — a deliberate difference between the two functions, documented at
+both call sites.
+
+Fair starting protein was the one piece of Section 5 that needed an actual
+balance decision rather than just generation: `STARTING_PROTEIN =
+REPRODUCE_COST` gives every fresh colony — the original seeded one and any
+Crit-10 mint alike, via a shared `seedColonyResources()`/
+`spawnStartingWorkers()` pair — exactly one reproduction's worth on arrival,
+enough to exercise the full loop immediately without a hunt-and-carry round
+trip first, and deliberately not more than that.
+
+Existing specs needed small, honest adaptations rather than loosened
+assertions: `colony.test.ts`/`simulation.test.ts`
+([`7fcb34f`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/7fcb34f))
+now expect `STARTING_PROTEIN` instead of 0 on a fresh colony, and one
+existing busy-worker test gained an explicit settle-any-stale-command step
+on its "free" candidate — a real race the faster path to 50 protein made
+newly visible, not a workaround for a flaky assertion. The same commit adds
+`spec/world.test.ts`, a dedicated suite for this stage: exact
+formula-derived and seed-pinned counts, every spawn anchor having its own
+nearby content with nothing dropped on the anchor itself, starting state for
+both the seeded and a freshly minted colony, map-wide distribution, the
+reset mechanism verified at both the function level (dirtied sessions/
+colonies/resources, `action_log` untouched) and via a real subprocess
+invocation of `scripts/reset-world.ts` to prove the `--yes` gate is
+load-bearing and not just a documented convention, the simulation layer
+actually loading every seeded aphid, and a `jsdom`-based (no headless
+browser) check that the served page carries the Help markup — following
+`spec/invariants.test.ts`'s existing lightweight-HTTP-plus-DOM pattern
+rather than introducing a new testing dependency.
+
+The in-game guidance itself
+([`42c042d`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/42c042d))
+is a "How to play" button that opens an overlay documenting the game as it
+actually renders — I read `main.ts` and `index.html` first rather than
+writing generic genre boilerplate, so the legend's colours/shapes and the
+quick start's steps match the real client exactly. It never touches `state`
+or issues a command, so it's safe to open at any point mid-drag or
+mid-selection with zero interaction risk.
+
+Documentation
+([`bd83beb`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/bd83beb))
+closed the loop: `CLAUDE.md` gained this stage's invariants (why
+`SPAWN_ANCHOR_COUNT` is exactly 10 — it has to cover every colony index the
+spec suite claims, from `colony.test.ts`'s index 0 through
+`multiplayer.test.ts`'s and `realtime.test.ts`'s indices — the reset's
+preserve/clear boundary, and the Help overlay's role as the primary
+player-facing guide, not this file or the README), and `README.md` was
+rewritten wholesale: it no longer describes the Crit 8/9 10x10-grid demo,
+but the actual continuous multi-colony world, travel/carry/deposit
+gathering, hunting and carcasses, and real session-based multiplayer, while
+keeping the "what good means here" framing and its three cited sources —
+now with a note that the "shared means more than co-presence" claim is
+something a second browser tab can actually go verify, not just a forward
+intention.
+
+With everything above green (`pnpm check`, `pnpm check:evidence`) and
+pushed, I ran the one authorized production reset against the live
+deployment via `pnpm reset:world -- --yes`, verified the post-reset counts
+and behaviour matched this stage's targets, and confirmed a subsequent
+restart did not reset the world again — exactly once, not repeated during
+debugging, per the brief's explicit constraint on that step.
+
 ## Crit 10: real multiplayer — sessions, ownership, and an audit log
 
 Crit 10's bar: two cookie-isolated browser sessions each get their own
