@@ -291,3 +291,9 @@ export const APHID_PROTEIN_VALUE = 30;
 export const WORKER_ATTACK_RANGE = 30;
 export const WORKER_ATTACK_DAMAGE = 10;
 export const WORKER_ATTACK_COOLDOWN = 1;
+
+// Stage 7: workers gain durable health, following the exact precedent
+// APHID_MAX_HEALTH/SPECIES_MAX_HEALTH set for creatures. A spider's
+// SPIDER_ATTACK_DAMAGE is chosen so 3 hits kill an isolated worker, mirroring
+// the "aphid dies in 3 worker hits" balance note above.
+export const WORKER_MAX_HEALTH = 30;

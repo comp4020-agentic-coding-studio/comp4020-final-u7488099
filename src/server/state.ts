@@ -10,15 +10,24 @@ export interface ColonyState {
     queenY: number;
     resources: Record<string, number>;
   };
-  workers: { id: number; x: number; y: number; carrying: Carrying }[];
+  workers: { id: number; x: number; y: number; carrying: Carrying; health: number; maxHealth: number }[];
   // Post-Stage-6b fix: every OTHER colony's workers, visible in the shared
   // world but never controllable by this session — kept as its own field
   // (not merged into `workers`) so "workers = my own colony, fully
   // selectable" stays an invariant the client can rely on structurally,
   // rather than something it has to remember to filter for. colonyId is the
   // public ownership tag the client needs to render these distinctly; no
-  // session/cookie data is ever included here.
-  otherWorkers: { id: number; colonyId: number; x: number; y: number; carrying: Carrying }[];
+  // session/cookie data is ever included here. Stage 7 adds health/maxHealth
+  // here too — just a number, no new privacy concern.
+  otherWorkers: {
+    id: number;
+    colonyId: number;
+    x: number;
+    y: number;
+    carrying: Carrying;
+    health: number;
+    maxHealth: number;
+  }[];
   resourceNodes: {
     id: number;
     x: number;

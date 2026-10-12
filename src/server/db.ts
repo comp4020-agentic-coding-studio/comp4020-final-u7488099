@@ -11,6 +11,7 @@ import {
   STARTING_PROTEIN,
   STARTING_WORKERS,
   SUGAR_NODE_MAX_AMOUNT,
+  WORKER_MAX_HEALTH,
   WORLD,
 } from "./balance.ts";
 
@@ -27,6 +28,7 @@ migrateWorkersCarrying();
 migrateSugarNodesFinite();
 migrateResourceNodeKind();
 migrateCreatureHealth();
+migrateWorkerHealth();
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS worlds (
@@ -51,10 +53,13 @@ db.exec(`
     PRIMARY KEY (colony_id, resource_type)
   );
 
-  -- Worker commands (idle/move/gather/return) are never persisted here —
-  -- they live only in in-memory simulation state. This table only ever gets
-  -- columns that must survive a restart: position, and (Stage 4) carrying —
-  -- NULL/NULL means "not carrying". See CLAUDE.md.
+  -- Worker commands (idle/move/gather/return/attack) are never persisted
+  -- here — they live only in in-memory simulation state. This table only
+  -- ever gets columns that must survive a restart: position, (Stage 4)
+  -- carrying — NULL/NULL means "not carrying" — and (Stage 7) health.
+  -- health/max_health are nullable so a fresh ALTER on an already-deployed
+  -- DB is cheap; backfillWorkerHealth() fills them in immediately. See
+  -- CLAUDE.md.
   CREATE TABLE IF NOT EXISTS workers (
     id INTEGER PRIMARY KEY,
     colony_id INTEGER NOT NULL REFERENCES colonies(id),
@@ -62,6 +67,8 @@ db.exec(`
     y REAL NOT NULL,
     carrying_type TEXT,
     carrying_amount REAL,
+    health REAL,
+    max_health REAL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -124,6 +131,7 @@ db.exec(`
 seedIfEmpty();
 seedCreaturesIfEmpty();
 backfillCreatureHealth();
+backfillWorkerHealth();
 
 // Pre-Stage-1 deployments have a `colonies` table from the Crit 8/9 schema:
 // integer grid coordinates, a flat `protein` column, no `world_id`. That
@@ -206,6 +214,30 @@ function backfillCreatureHealth(): void {
   }
 }
 
+// Stage 7: workers gain durable health. Nullable so the ALTER is cheap;
+// backfillWorkerHealth() immediately fills every row via WORKER_MAX_HEALTH,
+// so "health IS NULL" never persists past one boot. Mirrors
+// migrateCreatureHealth()'s guard pattern exactly.
+function migrateWorkerHealth(): void {
+  const columns = db.prepare("PRAGMA table_info(workers)").all() as { name: string }[];
+  if (columns.length === 0) return; // table doesn't exist yet; CREATE TABLE below defines it with the columns
+  if (columns.some((c) => c.name === "health")) return;
+  db.exec(`
+    ALTER TABLE workers ADD COLUMN health REAL;
+    ALTER TABLE workers ADD COLUMN max_health REAL;
+  `);
+}
+
+// Idempotent: only rows with max_health IS NULL match (brand-new rows from
+// spawnStartingWorkers/reproduce already insert health/max_health directly).
+// Runs every boot, mirroring backfillCreatureHealth().
+function backfillWorkerHealth(): void {
+  db.prepare("UPDATE workers SET health = ?, max_health = ? WHERE max_health IS NULL").run(
+    WORKER_MAX_HEALTH,
+    WORKER_MAX_HEALTH,
+  );
+}
+
 // Pre-Crit-10 this was "the" one global colony. It still seeds exactly the
 // same way (same world-centre queen position, same 3 starting workers) — but
 // as of Crit 10 it starts out unowned, and becomes whichever session asks
@@ -252,14 +284,20 @@ function seedColonyResources(colonyId: number): void {
   for (const type of RESOURCE_TYPES) insertResourceBucket.run(colonyId, type, type === "protein" ? STARTING_PROTEIN : 0);
 }
 
-function spawnStartingWorkers(colonyId: number, queenX: number, queenY: number): { id: number; x: number; y: number }[] {
-  const insertWorker = db.prepare("INSERT INTO workers (colony_id, x, y) VALUES (?, ?, ?)");
-  const workers: { id: number; x: number; y: number }[] = [];
+function spawnStartingWorkers(
+  colonyId: number,
+  queenX: number,
+  queenY: number,
+): { id: number; x: number; y: number; health: number; maxHealth: number }[] {
+  const insertWorker = db.prepare(
+    "INSERT INTO workers (colony_id, x, y, health, max_health) VALUES (?, ?, ?, ?, ?)",
+  );
+  const workers: { id: number; x: number; y: number; health: number; maxHealth: number }[] = [];
   for (let i = 0; i < STARTING_WORKERS; i++) {
     const x = queenX + (i - 1) * 50;
     const y = queenY + 50;
-    const { lastInsertRowid } = insertWorker.run(colonyId, x, y);
-    workers.push({ id: Number(lastInsertRowid), x, y });
+    const { lastInsertRowid } = insertWorker.run(colonyId, x, y, WORKER_MAX_HEALTH, WORKER_MAX_HEALTH);
+    workers.push({ id: Number(lastInsertRowid), x, y, health: WORKER_MAX_HEALTH, maxHealth: WORKER_MAX_HEALTH });
   }
   return workers;
 }
@@ -315,6 +353,7 @@ export function resetForTests(): void {
   seedIfEmpty();
   seedCreaturesIfEmpty();
   backfillCreatureHealth();
+  backfillWorkerHealth();
 }
 
 // Stage 6b: the production-safe, intentionally-invoked counterpart to
@@ -356,6 +395,7 @@ export function resetProductionWorld(): {
     seedIfEmpty();
     seedCreaturesIfEmpty();
     backfillCreatureHealth();
+    backfillWorkerHealth();
   });
   tx();
 
@@ -386,7 +426,7 @@ export function createColony(): {
   colonyId: number;
   queenX: number;
   queenY: number;
-  workers: { id: number; x: number; y: number }[];
+  workers: { id: number; x: number; y: number; health: number; maxHealth: number }[];
 } {
   const world = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number } | undefined;
   if (!world) throw new Error("no world seeded");
@@ -395,7 +435,7 @@ export function createColony(): {
   const { x: queenX, y: queenY } = colonySpiralPosition(index);
 
   let colonyId = 0;
-  let workers: { id: number; x: number; y: number }[] = [];
+  let workers: { id: number; x: number; y: number; health: number; maxHealth: number }[] = [];
   const tx = db.transaction(() => {
     const colonyInfo = db
       .prepare("INSERT INTO colonies (world_id, queen_x, queen_y) VALUES (?, ?, ?)")

@@ -19,7 +19,15 @@ export function parseSessionId(cookieHeader: string | undefined): string | undef
 function mintColony(): number {
   const { colonyId, queenX, queenY, workers } = createColony();
   registerColony(colonyId, queenX, queenY);
-  for (const worker of workers) registerWorker({ id: worker.id, colonyId, x: worker.x, y: worker.y });
+  for (const worker of workers)
+    registerWorker({
+      id: worker.id,
+      colonyId,
+      x: worker.x,
+      y: worker.y,
+      health: worker.health,
+      maxHealth: worker.maxHealth,
+    });
   return colonyId;
 }
 

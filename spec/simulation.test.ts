@@ -36,6 +36,7 @@ const {
   WORKER_ATTACK_RANGE,
   WORKER_ATTACK_DAMAGE,
   WORKER_ATTACK_COOLDOWN,
+  WORKER_MAX_HEALTH,
 } = await import("../src/server/balance.ts");
 
 const TICK_DT = 1 / SIMULATION.tickHz;
@@ -59,8 +60,8 @@ function workerById(id: number) {
 // instead of waiting out real travel time. These never get a `workers` SQL
 // row, which is fine: nothing but checkpointSimulation() reads that table,
 // and these tests never call it.
-function registerTestWorker(id: number, x: number, y: number) {
-  sim.registerWorker({ id, colonyId: colony.id, x, y });
+function registerTestWorker(id: number, x: number, y: number, health: number = WORKER_MAX_HEALTH) {
+  sim.registerWorker({ id, colonyId: colony.id, x, y, health, maxHealth: WORKER_MAX_HEALTH });
   return workerById(id);
 }
 
@@ -171,7 +172,14 @@ describe("gradual movement", () => {
     // settle so later tests' own geometry is the only thing in play.
     expect(sim.issueMoveCommand(worker.id, start.x, start.y, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
-    expect(workerById(worker.id)).toEqual({ id: worker.id, x: start.x, y: start.y, carrying: null });
+    expect(workerById(worker.id)).toEqual({
+      id: worker.id,
+      x: start.x,
+      y: start.y,
+      carrying: null,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+    });
     expect(sim.getWorkerCommand(worker.id)).toBe("idle");
   });
 });
@@ -651,7 +659,14 @@ describe("Stage 4: carry, return, deposit economy", () => {
   it("carrying survives a reload with no checkpoint call, and the worker automatically resumes returning", () => {
     const [worker] = sim.getWorkersForColony(colony.id);
     const [proteinNode] = findNodesByType("protein");
-    sim.registerWorker({ id: worker.id, colonyId: colony.id, x: proteinNode.x, y: proteinNode.y });
+    sim.registerWorker({
+      id: worker.id,
+      colonyId: colony.id,
+      x: proteinNode.x,
+      y: proteinNode.y,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+    });
     expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 
@@ -669,7 +684,14 @@ describe("Stage 4: carry, return, deposit economy", () => {
     const [worker] = sim.getWorkersForColony(colony.id);
     const queen = queenPosition();
     const nodeId = insertNode(queen.x + 20, queen.y, "sugar", null);
-    sim.registerWorker({ id: worker.id, colonyId: colony.id, x: queen.x + 20, y: queen.y });
+    sim.registerWorker({
+      id: worker.id,
+      colonyId: colony.id,
+      x: queen.x + 20,
+      y: queen.y,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+    });
 
     expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT); // claim -> carrying, command "return"
@@ -713,6 +735,53 @@ describe("Stage 4: carry, return, deposit economy", () => {
     expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBe("worker is busy returning resources");
     expect(sim.getWorkerCommand(worker.id)).toBe("return");
     expect(workerById(worker.id)).toEqual(carryingState);
+  });
+});
+
+describe("Stage 7: worker health", () => {
+  it("A: a freshly seeded worker starts at full WORKER_MAX_HEALTH", () => {
+    const [worker] = sim.getWorkersForColony(colony.id);
+    expect(worker.health).toBe(WORKER_MAX_HEALTH);
+    expect(worker.maxHealth).toBe(WORKER_MAX_HEALTH);
+  });
+
+  it("B: a reproduced worker starts at full WORKER_MAX_HEALTH", () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'protein'").run(
+      REPRODUCE_COST,
+      colony.id,
+    );
+    expect(actions.reproduce(colony.id)).toEqual({ ok: true });
+
+    const newWorker = sim.getWorkersForColony(colony.id).at(-1)!;
+    expect(newWorker.health).toBe(WORKER_MAX_HEALTH);
+    expect(newWorker.maxHealth).toBe(WORKER_MAX_HEALTH);
+  });
+
+  it("C: health survives a restart (reload from SQLite)", () => {
+    const [worker] = sim.getWorkersForColony(colony.id);
+    db.prepare("UPDATE workers SET health = ? WHERE id = ?").run(12, worker.id);
+    sim.loadSimulation();
+
+    expect(workerById(worker.id).health).toBe(12);
+    expect(workerById(worker.id).maxHealth).toBe(WORKER_MAX_HEALTH);
+  });
+
+  it("D: a colony minted via Crit-10 session flow gets fresh starting workers at full health", async () => {
+    // Exercises the second call chain (createColony -> spawnStartingWorkers ->
+    // sessions.ts mintColony -> registerWorker) threaded alongside
+    // actions.reproduce()'s own INSERT above.
+    const { createColony } = await import("../src/server/db.ts");
+    const minted = createColony();
+    for (const w of minted.workers) {
+      expect(w.health).toBe(WORKER_MAX_HEALTH);
+      expect(w.maxHealth).toBe(WORKER_MAX_HEALTH);
+    }
+
+    sim.loadSimulation();
+    for (const w of sim.getWorkersForColony(minted.colonyId)) {
+      expect(w.health).toBe(WORKER_MAX_HEALTH);
+      expect(w.maxHealth).toBe(WORKER_MAX_HEALTH);
+    }
   });
 });
 
@@ -1107,7 +1176,14 @@ describe("Stage 6: hunting, combat, carcasses", () => {
   it("restart: health persists but an in-progress attack command does not", () => {
     const [creature] = sim.getCreaturesForWorld(world.id);
     const [worker] = sim.getWorkersForColony(colony.id); // a real seeded worker — survives reload
-    sim.registerWorker({ id: worker.id, colonyId: colony.id, x: creature.x, y: creature.y });
+    sim.registerWorker({
+      id: worker.id,
+      colonyId: colony.id,
+      x: creature.x,
+      y: creature.y,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+    });
     expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
 

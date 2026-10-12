@@ -218,6 +218,10 @@ it("reproduce spends protein and adds a worker at the queen's position", { timeo
 
   const newWorker = after.workers.at(-1);
   expect(newWorker).toMatchObject({ x: after.colony.queenX, y: after.colony.queenY });
+  // Stage 7: a freshly hatched worker starts at full health, same precedent
+  // as freshly seeded aphids.
+  expect(newWorker.health).toBe(newWorker.maxHealth);
+  expect(newWorker.health).toBeGreaterThan(0);
 });
 
 it("rejects reproduce with insufficient protein, without mutating state", async () => {

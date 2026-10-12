@@ -3,7 +3,14 @@ import { APHID_RADIUS, WORKER_RADIUS } from "../server/balance.ts";
 interface ColonyState {
   world: { width: number; height: number };
   colony: { id: number; queenX: number; queenY: number; resources: Record<string, number> };
-  workers: { id: number; x: number; y: number; carrying: { resourceType: string; amount: number } | null }[];
+  workers: {
+    id: number;
+    x: number;
+    y: number;
+    carrying: { resourceType: string; amount: number } | null;
+    health: number;
+    maxHealth: number;
+  }[];
   // Every other colony's workers, visible but never selectable/controllable
   // from this session — see hitTest/selectWorkersInBox, which only ever look
   // at `workers` above, never this.
@@ -13,6 +20,8 @@ interface ColonyState {
     x: number;
     y: number;
     carrying: { resourceType: string; amount: number } | null;
+    health: number;
+    maxHealth: number;
   }[];
   resourceNodes: {
     id: number;

@@ -46,6 +46,11 @@ interface SimWorker {
   y: number;
   carrying: Carrying;
   command: WorkerCommand;
+  // Stage 7: durable health (see db.ts's workers table). Loaded fresh from
+  // SQLite on every loadSimulation(), same precedent as SimCreature's
+  // health/maxHealth — a restart never silently heals an injured worker.
+  health: number;
+  maxHealth: number;
 }
 
 export type MoveCommandError =
@@ -111,7 +116,7 @@ export function loadSimulation(): void {
   // claims, where the worker processed first wins. See CLAUDE.md.
   const rows = db
     .prepare(
-      "SELECT id, colony_id AS colonyId, x, y, carrying_type AS carryingType, carrying_amount AS carryingAmount FROM workers ORDER BY id",
+      "SELECT id, colony_id AS colonyId, x, y, carrying_type AS carryingType, carrying_amount AS carryingAmount, health, max_health AS maxHealth FROM workers ORDER BY id",
     )
     .all() as {
     id: number;
@@ -120,6 +125,8 @@ export function loadSimulation(): void {
     y: number;
     carryingType: string | null;
     carryingAmount: number | null;
+    health: number;
+    maxHealth: number;
   }[];
   for (const row of rows) {
     const carrying: Carrying =
@@ -133,6 +140,8 @@ export function loadSimulation(): void {
       y: row.y,
       carrying,
       command: carrying ? { type: "return" } : { type: "idle" },
+      health: row.health,
+      maxHealth: row.maxHealth,
     });
   }
 
@@ -264,7 +273,14 @@ function advanceResourceRegen(dt: number): void {
 // straight into SQLite). Without this the sim cache and SQLite would diverge
 // the moment a new worker arrived — getState() would never see it move. A
 // freshly hatched worker never starts out carrying anything.
-export function registerWorker(worker: { id: number; colonyId: number; x: number; y: number }): void {
+export function registerWorker(worker: {
+  id: number;
+  colonyId: number;
+  x: number;
+  y: number;
+  health: number;
+  maxHealth: number;
+}): void {
   workers.set(worker.id, { ...worker, carrying: null, command: { type: "idle" } });
 }
 
@@ -278,11 +294,13 @@ export function registerColony(colonyId: number, queenX: number, queenY: number)
   nestPositions.set(colonyId, { x: queenX, y: queenY });
 }
 
-export function getWorkersForColony(colonyId: number): { id: number; x: number; y: number; carrying: Carrying }[] {
+export function getWorkersForColony(
+  colonyId: number,
+): { id: number; x: number; y: number; carrying: Carrying; health: number; maxHealth: number }[] {
   return [...workers.values()]
     .filter((w) => w.colonyId === colonyId)
     .sort((a, b) => a.id - b.id)
-    .map(({ id, x, y, carrying }) => ({ id, x, y, carrying }));
+    .map(({ id, x, y, carrying, health, maxHealth }) => ({ id, x, y, carrying, health, maxHealth }));
 }
 
 // Multiplayer visibility fix: the shared world has exactly one population of
@@ -296,11 +314,11 @@ export function getWorkersForColony(colonyId: number): { id: number; x: number; 
 // relies on it, selection/hit-testing included — stays exactly as it was.
 export function getWorkersExcludingColony(
   colonyId: number,
-): { id: number; colonyId: number; x: number; y: number; carrying: Carrying }[] {
+): { id: number; colonyId: number; x: number; y: number; carrying: Carrying; health: number; maxHealth: number }[] {
   return [...workers.values()]
     .filter((w) => w.colonyId !== colonyId)
     .sort((a, b) => a.id - b.id)
-    .map(({ id, colonyId, x, y, carrying }) => ({ id, colonyId, x, y, carrying }));
+    .map(({ id, colonyId, x, y, carrying, health, maxHealth }) => ({ id, colonyId, x, y, carrying, health, maxHealth }));
 }
 
 export function getWorkerCommand(workerId: number): "idle" | "move" | "gather" | "return" | "attack" {
