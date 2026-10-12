@@ -27,24 +27,194 @@
         color: #777;
         font-size: 0.9rem;
       }
+      .top-row {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        flex-wrap: wrap;
+      }
+      #help-button {
+        font-weight: 600;
+        background: #1565c0;
+        color: white;
+        border: none;
+        border-radius: 999px;
+        padding: 0.4rem 1rem;
+        cursor: pointer;
+      }
+      #help-button:hover {
+        background: #0d47a1;
+      }
+      #help-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.55);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 2rem;
+        z-index: 10;
+      }
+      #help-overlay[hidden] {
+        display: none;
+      }
+      #help-panel {
+        background: white;
+        color: #1a1a1a;
+        max-width: 640px;
+        max-height: 85vh;
+        overflow-y: auto;
+        border-radius: 8px;
+        padding: 1.5rem 2rem;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+      }
+      #help-panel h2 {
+        margin-top: 1.5rem;
+      }
+      #help-panel h2:first-child {
+        margin-top: 0;
+      }
+      #help-close {
+        float: right;
+        background: none;
+        border: none;
+        font-size: 1.5rem;
+        line-height: 1;
+        cursor: pointer;
+        color: #555;
+      }
+      .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        margin: 0.3rem 0;
+      }
+      .legend-swatch {
+        flex: none;
+        width: 20px;
+        height: 20px;
+      }
+      .legend-swatch.circle {
+        border-radius: 50%;
+      }
+      .legend-swatch.diamond {
+        transform: rotate(45deg);
+      }
+      .legend-swatch.ring {
+        border-radius: 50%;
+        background: none;
+        border: 2px dashed #e91e63;
+      }
+      .legend-swatch.dashed {
+        border-radius: 50%;
+        border: 2px dashed #3e2723;
+      }
     </style>
   </head>
   <body>
     <main>
-      <h1>Colony</h1>
+      <div class="top-row">
+        <h1>Colony</h1>
+        <button id="help-button" type="button" aria-haspopup="dialog" aria-controls="help-overlay">
+          ? How to play
+        </button>
+      </div>
       <p id="resources">sugar: 0 · protein: 0 · biomass: 0</p>
-      <p>
-        Click a worker to select it, or left-drag a box to select several. Then click a resource node to gather, or
-        empty ground to send them there.
-      </p>
       <canvas id="world" width="960" height="600"></canvas>
       <p id="hint">
-        Left-drag on the map to box-select workers. Middle- or right-drag to pan. WASD and the arrow keys also pan.
+        Drag a box around workers to select them, then click a resource node, an aphid, or empty ground to command
+        them. Right/middle-drag or WASD/arrows to look around. Click "How to play" above for the full guide.
       </p>
       <button id="reproduce">Reproduce worker (50 protein)</button>
       <p id="status"></p>
       <p><a href="/readme/">About this app</a></p>
     </main>
+
+    <div id="help-overlay" role="dialog" aria-modal="true" aria-labelledby="help-title" hidden>
+      <div id="help-panel">
+        <button id="help-close" type="button" aria-label="Close help">×</button>
+        <h1 id="help-title">How to play</h1>
+
+        <h2>Objective</h2>
+        <p>
+          You command one ant colony living in a large, continuous world shared with other players. Send workers out
+          to gather sugar, biomass, and protein, and to hunt aphids. Carry what they find back to your queen, and
+          spend protein to hatch new workers — there's no fixed win condition, the goal is to grow your colony.
+        </p>
+
+        <h2>Controls</h2>
+        <ul>
+          <li><strong>Left-click a worker</strong> — select just that worker.</li>
+          <li><strong>Left-drag on empty ground</strong> — box-select every worker inside the box.</li>
+          <li><strong>Left-click empty ground</strong> (with workers selected) — send them there.</li>
+          <li>
+            <strong>Left-click a resource node</strong> (sugar/protein/biomass, with workers selected) — they walk
+            over, claim some, and automatically carry it home and deposit it.
+          </li>
+          <li>
+            <strong>Left-click an aphid</strong> (with workers selected) — they chase it down and attack until it
+            dies, leaving behind a protein carcass you then gather like any other node.
+          </li>
+          <li><strong>Middle-drag or right-drag</strong> — pan the camera.</li>
+          <li><strong>WASD or arrow keys</strong> — pan the camera continuously.</li>
+          <li>
+            A worker already carrying resources home ignores new move/gather/attack orders until it deposits —
+            reissue the command once it's free again.
+          </li>
+          <li><strong>Reproduce worker button</strong> — spends 50 protein from your colony to hatch a new worker.</li>
+          <li>
+            <strong>Multiplayer</strong> — every browser session controls its own colony. Other colonies' queens are
+            visible in the shared world, but you can never select or command their workers, and your resources are
+            private to you.
+          </li>
+        </ul>
+
+        <h2>Quick start</h2>
+        <ol>
+          <li>Left-drag a box around your starting workers to select all of them.</li>
+          <li>Click a nearby sugar, biomass, or protein node to send them gathering.</li>
+          <li>Watch the totals at the top update as they carry resources home on their own.</li>
+          <li>Once protein reaches 50, click "Reproduce worker" to hatch a new one.</li>
+          <li>Select some workers and click an aphid to hunt it, then gather the carcass it leaves behind.</li>
+          <li>Pan around with WASD or a right-drag to explore — the world is shared with other colonies.</li>
+        </ol>
+
+        <h2>Legend</h2>
+        <div class="legend-item">
+          <span class="legend-swatch circle" style="background: #ffd54d; border: 2px solid #b8860b"></span> Your queen
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch circle" style="background: #ce93d8; border: 2px solid #6a1b9a"></span> Another
+          colony's queen
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch circle" style="background: #90caf9; border: 2px solid #1565c0"></span> Worker
+        </div>
+        <div class="legend-item"><span class="legend-swatch ring"></span> Selected worker (dashed ring)</div>
+        <div class="legend-item">
+          <span class="legend-swatch circle" style="background: #f4c542; border: 2px solid #2e7d32; width: 12px; height: 12px"></span>
+          Small colored dot on a worker = carrying that resource home
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch diamond" style="background: #7cb342; border: 2px solid #33691e; width: 14px; height: 14px"></span>
+          Aphid (a red bar appears above it when it's been hurt)
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch circle" style="background: #f4c542; border: 2px solid #2e7d32; width: 12px; height: 12px"></span>
+          Sugar node
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch circle" style="background: #90caf9; border: 2px solid #2e7d32; width: 18px; height: 18px"></span>
+          Protein node
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch circle" style="background: #8d6e63; border: 2px solid #2e7d32; width: 24px; height: 24px"></span>
+          Biomass node (largest)
+        </div>
+        <div class="legend-item"><span class="legend-swatch dashed" style="background: #6d4c41"></span> Carcass (gatherable protein left by a killed aphid)</div>
+      </div>
+    </div>
+
     <script type="module" src="/app.js"></script>
   </body>
 </html>

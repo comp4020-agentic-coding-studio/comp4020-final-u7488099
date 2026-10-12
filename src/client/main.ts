@@ -22,6 +22,9 @@ const ctx = canvas.getContext("2d")!;
 const resourcesEl = document.querySelector<HTMLElement>("#resources")!;
 const statusEl = document.querySelector<HTMLElement>("#status")!;
 const reproduceBtn = document.querySelector<HTMLButtonElement>("#reproduce")!;
+const helpButton = document.querySelector<HTMLButtonElement>("#help-button")!;
+const helpOverlay = document.querySelector<HTMLElement>("#help-overlay")!;
+const helpClose = document.querySelector<HTMLButtonElement>("#help-close")!;
 
 const QUEEN_RADIUS = 20;
 const NODE_RADIUS: Record<string, number> = { sugar: 8, protein: 14, biomass: 20 };
@@ -451,6 +454,24 @@ function describeBatchOutcome(total: number, errors: Record<string, string> | un
   if (failed === 0) return `${succeeded} worker${succeeded === 1 ? "" : "s"} ${verb}.`;
   return `${succeeded}/${total} workers ${verb} (${failed} failed).`;
 }
+
+// Stage 6b: discoverable in-game help, opened/closed independently of
+// everything else — never touches `state` or issues a command, so it's safe
+// to open at any time, mid-selection or mid-drag, without side effects.
+function openHelp(): void {
+  helpOverlay.hidden = false;
+}
+function closeHelp(): void {
+  helpOverlay.hidden = true;
+}
+helpButton.addEventListener("click", openHelp);
+helpClose.addEventListener("click", closeHelp);
+helpOverlay.addEventListener("click", (e) => {
+  if (e.target === helpOverlay) closeHelp(); // click on the backdrop, not the panel itself
+});
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !helpOverlay.hidden) closeHelp();
+});
 
 reproduceBtn.addEventListener("click", async () => {
   const res = await fetch("/api/reproduce", { method: "POST" });
