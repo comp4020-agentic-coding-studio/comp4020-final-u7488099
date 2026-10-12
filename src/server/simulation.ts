@@ -1,9 +1,9 @@
 import {
   APHID_IDLE_MAX,
   APHID_IDLE_MIN,
-  APHID_PROTEIN_VALUE,
   APHID_SPEED,
   APHID_WANDER_RADIUS,
+  CREATURE_PROTEIN_VALUE,
   DEPOSIT_RANGE,
   GATHER_RANGE,
   GATHER_YIELD,
@@ -670,12 +670,14 @@ function attemptDeposit(worker: SimWorker): void {
 // Stage 6: health is written synchronously on every hit (not batched into
 // the periodic checkpoint) — same durability-on-mutation precedent as
 // attemptGatherClaim/attemptDeposit's own transactions, just a plain UPDATE
-// since there's nothing else to keep atomic with it until death.
-function applyDamage(creature: SimCreature, amount: number): void {
+// since there's nothing else to keep atomic with it until death. Returns the
+// new carcass's resource-node id if this hit was lethal, else null — lets
+// callers (handleAttackCommand) log which carcass a kill produced.
+function applyDamage(creature: SimCreature, amount: number): number | null {
   creature.health = Math.max(0, creature.health - amount);
   db.prepare("UPDATE creatures SET health = ? WHERE id = ?").run(creature.health, creature.id);
   dirty = true;
-  if (creature.health <= 0) killCreature(creature);
+  return creature.health <= 0 ? killCreature(creature) : null;
 }
 
 // Death and carcass creation commit in one SQLite transaction (§7): a crash
@@ -685,14 +687,21 @@ function applyDamage(creature: SimCreature, amount: number): void {
 // committed result. Carcass is inserted with kind='item' — protein has no
 // entry in RESOURCE_REGEN_RATES, so attemptGatherClaim's existing
 // non-renewable branch already makes it finite and delete-at-zero with no
-// further code. See CLAUDE.md.
-function killCreature(creature: SimCreature): void {
+// further code. Loot is looked up per species (CREATURE_PROTEIN_VALUE),
+// generalized in Stage 7 from what used to be a hardcoded APHID_PROTEIN_VALUE.
+// Returns the new carcass's resource-node id. See CLAUDE.md.
+function killCreature(creature: SimCreature): number {
+  const proteinValue = CREATURE_PROTEIN_VALUE[creature.species];
+  let carcassId!: number;
   const tx = db.transaction(() => {
     db.prepare("DELETE FROM creatures WHERE id = ?").run(creature.id);
-    db.prepare(
-      "INSERT INTO resource_nodes (world_id, x, y, resource_type, amount, max_amount, kind) " +
-        "VALUES (?, ?, ?, 'protein', ?, ?, 'item')",
-    ).run(creature.worldId, creature.x, creature.y, APHID_PROTEIN_VALUE, APHID_PROTEIN_VALUE);
+    const info = db
+      .prepare(
+        "INSERT INTO resource_nodes (world_id, x, y, resource_type, amount, max_amount, kind) " +
+          "VALUES (?, ?, ?, 'protein', ?, ?, 'item')",
+      )
+      .run(creature.worldId, creature.x, creature.y, proteinValue, proteinValue);
+    carcassId = Number(info.lastInsertRowid);
   });
   tx();
   creatures.delete(creature.id);
@@ -705,6 +714,7 @@ function killCreature(creature: SimCreature): void {
     }
   }
   dirty = true;
+  return carcassId;
 }
 
 // Stage 7: worker death. A single DELETE is enough — no transaction, unlike
@@ -784,7 +794,15 @@ function handleAttackCommand(
 
   const cooldownRemaining = Math.max(0, command.cooldownRemaining - dt);
   if (dist <= WORKER_ATTACK_RANGE && cooldownRemaining <= 0) {
-    applyDamage(creature, WORKER_ATTACK_DAMAGE);
+    const creatureId = creature.id;
+    const species = creature.species;
+    const carcassId = applyDamage(creature, WORKER_ATTACK_DAMAGE);
+    // Stage 7: aphid kills deliberately get no new log line (existing
+    // aphid-combat tests/assertions are unaffected) — only a lethal hit on a
+    // spider logs, gated on species.
+    if (carcassId !== null && species === "spider") {
+      logAction(worker.colonyId, "spider_died", { creatureId, carcassId });
+    }
     // killCreature (inside applyDamage) may already have reset this worker
     // to idle if that hit was lethal — only write the cooldown back if the
     // command is still "attack".

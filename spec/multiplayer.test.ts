@@ -211,6 +211,38 @@ it("rejects a session's attempt to command a worker that belongs to someone else
   expect(resOwn.status).toBe(200);
 });
 
+// Stage 7 §6: issueAttackCommand only ever resolves creatureId against the
+// creatures Map, never the workers Map — so passing another colony's worker
+// id as creatureId can only ever be "no such creature" or, in the unlikely
+// event of a numeric id collision across the two independent tables (both
+// start their own id sequence at 1), an unrelated real creature. Either way
+// the actual no-PvP invariant is that Bob's worker itself is never affected
+// — that's what this asserts, rather than a specific status code or error
+// string, since which of those two outcomes occurs depends on id collision
+// and isn't itself the thing worth pinning down.
+it("rejects a session's attempt to attack a worker belonging to someone else's colony — a worker id can never resolve as an attack target", async () => {
+  const alice = createSession();
+  const bob = createSession();
+
+  const aliceState = await getState(alice);
+  const bobState = await getState(bob);
+  const bobWorker = bobState.workers[0];
+  const aliceWorker = aliceState.workers[0];
+
+  await alice("/api/command/attack", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: [aliceWorker.id], creatureId: bobWorker.id }),
+  });
+
+  await new Promise((r) => setTimeout(r, 1500));
+  const bobStateAfter = await getState(bob);
+  const bobWorkerAfter = bobStateAfter.workers.find((w: any) => w.id === bobWorker.id);
+  expect(bobWorkerAfter).toBeDefined();
+  expect(bobWorkerAfter.health).toBe(bobWorker.health);
+  expect(Math.hypot(bobWorkerAfter.x - bobWorker.x, bobWorkerAfter.y - bobWorker.y)).toBeLessThan(5);
+});
+
 it("logs who did what, server-side, in a form queryable over the API and attributable to the acting colony", async () => {
   const alice = createSession();
   const aliceState = await getState(alice);

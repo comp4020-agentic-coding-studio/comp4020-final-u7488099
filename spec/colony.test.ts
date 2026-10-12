@@ -448,3 +448,75 @@ it(
     expect(after.colony.resources.protein).toBeGreaterThan(baselineProtein);
   },
 );
+
+// Stage 7 §26: mirrors the aphid-combat test above, but a spider hits back —
+// every currently idle worker piles onto the fight rather than just one, so
+// the test itself doesn't flake on an occasional unlucky single-worker loss,
+// and so it exercises the "multiple workers, spider damages back mid-fight"
+// case the brief specifically calls out.
+it(
+  "killing a spider leaves a carcass that can be gathered and deposited, surviving exactly one attacker's worth of combat",
+  { timeout: 60000 },
+  async () => {
+    const before = await getState();
+    const spider = before.creatures.find((c: any) => c.species === "spider");
+    expect(spider, "seed should always include at least one spider").toBeDefined();
+    const baselineProtein = before.colony.resources.protein;
+    const attackers = before.workers.filter((w: any) => !w.carrying);
+    expect(attackers.length).toBeGreaterThan(0);
+    const existingItemIds = new Set(
+      before.resourceNodes.filter((n: any) => n.kind === "item").map((n: any) => n.id),
+    );
+
+    const attackRes = await request("/api/command/attack", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerIds: attackers.map((w: any) => w.id), creatureId: spider.id }),
+    });
+    expect(attackRes.status).toBe(200);
+
+    const deadline = Date.now() + 45000;
+    let state = await getState();
+    while (state.creatures.some((c: any) => c.id === spider.id) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 300));
+      state = await getState();
+    }
+    expect(state.creatures.some((c: any) => c.id === spider.id)).toBe(false);
+
+    // Exactly one new carcass — no duplication even with several attackers
+    // potentially landing lethal-adjacent hits in the same tick.
+    const newItemNodes = state.resourceNodes.filter((n: any) => n.kind === "item" && !existingItemIds.has(n.id));
+    expect(newItemNodes).toHaveLength(1);
+    const carcass = newItemNodes[0];
+    expect(carcass.resourceType).toBe("protein");
+    expect(carcass.amount).toBe(carcass.maxAmount);
+
+    // No auto-harvest: gather it explicitly, same as any other resource
+    // node. Prefer one of the surviving attackers (it's already standing at
+    // the kill site, per Stage 6's attacker-idle-sweep) over an arbitrary
+    // idle worker, which could be anywhere on the map.
+    const survivingAttackerIds = new Set(attackers.map((w: any) => w.id));
+    const gatherer =
+      state.workers.find((w: any) => survivingAttackerIds.has(w.id) && !w.carrying) ??
+      state.workers.find((w: any) => !w.carrying);
+    expect(gatherer, "need at least one idle worker left alive to gather the carcass").toBeDefined();
+    const gathererId = gatherer.id;
+    const gatherRes = await request("/api/command/gather", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerIds: [gathererId], resourceId: carcass.id }),
+    });
+    expect(gatherRes.status).toBe(200);
+
+    const depositDeadline = Date.now() + 30000;
+    let after = await getState();
+    let g = after.workers.find((w: any) => w.id === gathererId);
+    while ((after.colony.resources.protein <= baselineProtein || g.carrying) && Date.now() < depositDeadline) {
+      await new Promise((r) => setTimeout(r, 200));
+      after = await getState();
+      g = after.workers.find((w: any) => w.id === gathererId);
+    }
+    expect(g.carrying).toBeNull();
+    expect(after.colony.resources.protein).toBeGreaterThan(baselineProtein);
+  },
+);
