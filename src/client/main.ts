@@ -14,6 +14,7 @@ interface ColonyState {
     kind: "source" | "item";
   }[];
   creatures: { id: number; species: string; x: number; y: number; health: number; maxHealth: number }[];
+  colonies: { id: number; queenX: number; queenY: number }[];
 }
 
 const canvas = document.querySelector<HTMLCanvasElement>("#world")!;
@@ -185,6 +186,14 @@ function draw(): void {
   for (const creature of state.creatures) {
     diamond(creature.x, creature.y, APHID_RADIUS, "#7cb342", "#33691e");
     drawHealthBar(creature.x, creature.y, APHID_RADIUS, creature.health, creature.maxHealth);
+  }
+  // Crit 10: every other colony's queen is part of the shared world this
+  // session can see, drawn in a distinct colour from "your own" gold queen
+  // below so the two are never confused. No workers/resources are rendered
+  // for them — getState() never sends another colony's private economy.
+  for (const colony of state.colonies) {
+    if (colony.id === state.colony.id) continue;
+    circle(colony.queenX, colony.queenY, QUEEN_RADIUS, "#ce93d8", "#6a1b9a");
   }
   circle(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS, "#ffd54d", "#b8860b");
   for (const worker of state.workers) {
@@ -461,12 +470,20 @@ async function refresh(): Promise<void> {
   setState(await res.json());
 }
 
-refresh().catch((err) => {
-  statusEl.textContent = `Failed to load the colony: ${String(err)}`;
-});
-
-const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
-const ws = new WebSocket(`${wsProtocol}//${location.host}/ws`);
-ws.addEventListener("message", (event) => {
-  setState(JSON.parse(event.data as string));
-});
+// Crit 10: the WebSocket connects only after this first fetch resolves, not
+// alongside it. The very first request from a fresh browser profile is what
+// sets the `sid` session cookie; opening the WS connection before that
+// response lands would race the cookie and let the WS handshake go out
+// cookie-less, minting a second, separate colony for the same player. See
+// CLAUDE.md's Crit 10 section.
+refresh()
+  .then(() => {
+    const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${wsProtocol}//${location.host}/ws`);
+    ws.addEventListener("message", (event) => {
+      setState(JSON.parse(event.data as string));
+    });
+  })
+  .catch((err) => {
+    statusEl.textContent = `Failed to load the colony: ${String(err)}`;
+  });
