@@ -1116,14 +1116,16 @@ species, no worker corpses, and no automated colony defenses.
   budget. The spider aggro scan is O(spiders × workers) with no spatial
   index, which this confirms is trivial at the target scale; revisit if
   either population grows by orders of magnitude.
-- **Restart/persistence needed no new worker-health-specific test
-  infrastructure.** `killWorker`/`loadSimulation()` are the same
-  species-agnostic mechanisms already exercised by Stage 6's generic
-  creature-restart tests (ephemeral command resets to idle, durable
-  health/carcass state survives a reload) plus a dedicated worker-health
-  restart test added this stage — none of it branches on species, so
-  existing coverage was judged sufficient without a spider-specific
-  duplicate, consistent with this project's standing preference against
-  mechanically-generated, redundant test coverage.
+- **Restart/persistence needed no *spider*-specific test, on top of what
+  this stage already added for worker health generally.** A dedicated test
+  ("a restart preserves survivor health and a dead worker's absence") was
+  added earlier in this stage for worker health/death specifically; Stage
+  6's existing generic creature-restart tests (ephemeral command resets to
+  idle, durable health/carcass state survives a reload) already exercise
+  the exact same species-agnostic `killWorker`/`loadSimulation()` machinery
+  a spider kill goes through. Since none of that code branches on species, a
+  separate spider-specific restart test would only duplicate coverage —
+  judged unnecessary, consistent with this project's standing preference
+  against mechanically-generated, redundant tests.
 
 
