@@ -13,6 +13,13 @@ const RESOURCE_TYPES = ["sugar", "protein", "biomass"];
 // STARTING_PROTEIN. Sugar/biomass still start at 0.
 const STARTING_PROTEIN = 50;
 
+// Stage 6b: reproducing a worker costs exactly one STARTING_PROTEIN's worth
+// of protein — same literal, named separately here since Stage 8's
+// soft-lock regression test reasons about it as a cost, not a starting
+// balance. Not imported from balance.ts for the same black-box reason as
+// every other constant in this file.
+const REPRODUCE_COST = 50;
+
 // Crit 10: every request in this file now carries a session cookie, so the
 // whole suite exercises exactly one colony throughout (one consistent
 // browser profile), matching this file's pre-Crit-10 single-colony
@@ -518,5 +525,216 @@ it(
     }
     expect(g.carrying).toBeNull();
     expect(after.colony.resources.protein).toBeGreaterThan(baselineProtein);
+  },
+);
+
+// Stage 8 §39/§40/§41: abandonment, restart, and the direct regression test
+// for the motivating production bug (a colony with zero workers and
+// insufficient protein was permanently stuck with no in-game recovery
+// path). This file's one persistent `request` session is deliberately
+// consumed to destruction here, at the very end of the suite — every prior
+// test in this file depends on that colony still being active, so these
+// tests must run last and the colony they abandon is never used again
+// afterward.
+it("abandoning requires no worker or resource — it defeats the colony, destroys resources, and removes every worker", async () => {
+  const before = await getState();
+  expect(before.colony.status).toBe("active");
+
+  const res = await request("/api/abandon", { method: "POST" });
+  expect(res.status).toBe(200);
+  const after = await res.json();
+
+  expect(after.colony.status).toBe("defeated");
+  expect(after.colony.defeatCause).toBe("abandoned");
+  expect(after.workers).toHaveLength(0);
+  for (const type of RESOURCE_TYPES) {
+    expect(after.colony.resources[type]).toBe(0);
+  }
+
+  // The ruin persists in the shared colonies roster, not removed.
+  const roster = after.colonies.find((c: any) => c.id === after.colony.id);
+  expect(roster).toMatchObject({ status: "defeated" });
+});
+
+it("a second abandon attempt on an already-defeated colony is rejected, not re-run", async () => {
+  // Runs immediately after the test above — this session's colony is
+  // already defeated.
+  const res = await request("/api/abandon", { method: "POST" });
+  expect(res.status).toBe(400);
+  const body = await res.json();
+  expect(body.error).toBe("colony already defeated");
+});
+
+it("every mutating command is rejected on a defeated colony, by lifecycle status rather than absence of workers", async () => {
+  const state = await getState();
+  expect(state.colony.status).toBe("defeated");
+  expect(state.workers).toHaveLength(0);
+
+  const moveRes = await request("/api/command/move", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: [1], x: 10, y: 10 }),
+  });
+  expect(moveRes.status).toBe(400);
+
+  const gatherRes = await request("/api/command/gather", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: [1], resourceId: 1 }),
+  });
+  expect(gatherRes.status).toBe(400);
+
+  const attackRes = await request("/api/command/attack", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds: [1], creatureId: 1 }),
+  });
+  expect(attackRes.status).toBe(400);
+
+  const reproduceRes = await request("/api/reproduce", { method: "POST" });
+  expect(reproduceRes.status).toBe(400);
+});
+
+it("Start New Colony is rejected while the current colony is still active", async () => {
+  // A fresh session, still fully active — eligibility is "defeated", not
+  // resource balance, so an active colony must be rejected regardless of
+  // its resource state.
+  const activeSession = createSession();
+  await activeSession("/api/state"); // mint the session's colony first
+  const res = await activeSession("/api/start-new-colony", { method: "POST" });
+  expect(res.status).toBe(400);
+  const body = await res.json();
+  expect(body.error).toBe("colony still active");
+});
+
+it(
+  "Start New Colony on a defeated session produces a fresh, full-health, standard-resource colony in the same session, while the old colony remains a visible ruin",
+  async () => {
+    const defeatedBefore = await getState();
+    expect(defeatedBefore.colony.status).toBe("defeated");
+    const oldColonyId = defeatedBefore.colony.id;
+
+    const res = await request("/api/start-new-colony", { method: "POST" });
+    expect(res.status).toBe(200);
+    const after = await res.json();
+
+    // New identity, not a resurrection of the old one.
+    expect(after.colony.id).not.toBe(oldColonyId);
+    expect(after.colony.status).toBe("active");
+    expect(after.colony.defeatCause).toBeNull();
+    expect(after.colony.queenHealth).toBe(after.colony.queenMaxHealth);
+
+    // Standard Stage 6b starting state — immediately playable.
+    expect(after.workers).toHaveLength(3);
+    expect(after.colony.resources.protein).toBe(STARTING_PROTEIN);
+    expect(after.colony.resources.sugar).toBe(0);
+    expect(after.colony.resources.biomass).toBe(0);
+
+    // Spawned somewhere in-bounds, not colliding with the old ruin.
+    expect(after.colony.queenX).toBeGreaterThanOrEqual(0);
+    expect(after.colony.queenX).toBeLessThanOrEqual(after.world.width);
+    expect(after.colony.queenY).toBeGreaterThanOrEqual(0);
+    expect(after.colony.queenY).toBeLessThanOrEqual(after.world.height);
+
+    // The old colony is still present in the shared roster, as a ruin —
+    // never deleted, never claimable again.
+    const oldRoster = after.colonies.find((c: any) => c.id === oldColonyId);
+    expect(oldRoster).toMatchObject({ status: "defeated" });
+    const newRoster = after.colonies.find((c: any) => c.id === after.colony.id);
+    expect(newRoster).toMatchObject({ status: "active" });
+
+    // Same session, fetched again, sees the new colony directly — no need
+    // to resubmit start-new-colony.
+    const refetched = await getState();
+    expect(refetched.colony.id).toBe(after.colony.id);
+
+    // Immediately playable: a move command on the new colony's own worker
+    // succeeds.
+    const worker = after.workers[0];
+    const moveRes = await request("/api/command/move", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerIds: [worker.id], x: worker.x, y: worker.y }),
+    });
+    expect(moveRes.status).toBe(200);
+  },
+);
+
+// Stage 8 §41: the direct regression test for the real production bug this
+// stage exists to fix — a colony with zero workers and less than
+// REPRODUCE_COST protein had no in-game recovery path whatsoever before
+// Abandon Colony existed. This drives a brand-new session's colony into
+// exactly that state, confirms it's genuinely stuck, then confirms Abandon
+// -> Start New Colony recovers it into an immediately playable colony.
+it(
+  "soft-lock regression: a colony with zero workers and insufficient protein cannot recover via gameplay, but Abandon -> Start New Colony fully recovers it",
+  { timeout: 60000 },
+  async () => {
+    const stuckRequest = createSession();
+    const seeded = await (await stuckRequest("/api/state")).json();
+    // A fresh colony starts with exactly REPRODUCE_COST protein (Stage 6b) —
+    // spend it on one extra worker first so the colony ends up genuinely
+    // below REPRODUCE_COST, not merely at it, once every worker is dead.
+    expect(seeded.colony.resources.protein).toBe(REPRODUCE_COST);
+    const reproduceSeedRes = await stuckRequest("/api/reproduce", { method: "POST" });
+    expect(reproduceSeedRes.status).toBe(200);
+
+    // Kill every starting worker by walking it directly onto a nearby
+    // spider's position, forcing aggro, and waiting for it to die. The
+    // *nearest* spider, not merely the first one enumerated — spiders are
+    // scattered across the whole map, and this colony's spawn point isn't
+    // guaranteed to be close to whichever spider id happens to sort first,
+    // which otherwise makes this test's travel time (and its 30s-per-worker
+    // deadline) depend on spider-population layout rather than the thing
+    // it's meant to test.
+    let state = await (await stuckRequest("/api/state")).json();
+    while (state.workers.length > 0) {
+      const worker = state.workers[0];
+      const spiders = state.creatures.filter((c: any) => c.species === "spider");
+      expect(spiders.length, "seed should always include at least one spider").toBeGreaterThan(0);
+      const spider = spiders.reduce((best: any, c: any) =>
+        Math.hypot(c.x - worker.x, c.y - worker.y) < Math.hypot(best.x - worker.x, best.y - worker.y) ? c : best,
+      );
+      await stuckRequest("/api/command/move", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workerIds: [worker.id], x: spider.x, y: spider.y }),
+      });
+      const deadline = Date.now() + 30000;
+      while (state.workers.some((w: any) => w.id === worker.id) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 300));
+        state = await (await stuckRequest("/api/state")).json();
+      }
+    }
+    expect(state.workers).toHaveLength(0);
+    expect(state.colony.resources.protein).toBeLessThan(REPRODUCE_COST);
+    expect(state.colony.status).toBe("active"); // the queen herself is untouched
+
+    // No in-game recovery: reproduce fails (insufficient protein), and there
+    // are no workers left to gather more.
+    const reproduceRes = await stuckRequest("/api/reproduce", { method: "POST" });
+    expect(reproduceRes.status).toBe(400);
+
+    // Abandon -> Start New Colony recovers it.
+    const abandonRes = await stuckRequest("/api/abandon", { method: "POST" });
+    expect(abandonRes.status).toBe(200);
+    const abandoned = await abandonRes.json();
+    expect(abandoned.colony.status).toBe("defeated");
+
+    const restartRes = await stuckRequest("/api/start-new-colony", { method: "POST" });
+    expect(restartRes.status).toBe(200);
+    const restarted = await restartRes.json();
+    expect(restarted.colony.status).toBe("active");
+    expect(restarted.workers).toHaveLength(3);
+    expect(restarted.colony.resources.protein).toBe(STARTING_PROTEIN);
+
+    // And it's genuinely playable again.
+    const worker = restarted.workers[0];
+    const moveRes = await stuckRequest("/api/command/move", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerIds: [worker.id], x: worker.x, y: worker.y }),
+    });
+    expect(moveRes.status).toBe(200);
   },
 );

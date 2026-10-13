@@ -45,6 +45,11 @@ const {
   SPIDER_ATTACK_DAMAGE,
   SPIDER_ATTACK_COOLDOWN,
   SPIDER_IDLE_MAX,
+  QUEEN_MAX_HEALTH,
+  QUEEN_REGEN_DELAY,
+  QUEEN_REGEN_RATE,
+  QUEEN_AGGRO_RANGE,
+  QUEEN_DISENGAGE_RANGE,
 } = await import("../src/server/balance.ts");
 
 const TICK_DT = 1 / SIMULATION.tickHz;
@@ -1517,5 +1522,437 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     sim.loadSimulation(); // resource nodes aren't cached in memory — nothing here should change them
 
     expect(nodeRow(carcass.id)?.amount).toBe(carcass.amount);
+  });
+});
+
+describe("Stage 8: queen health", () => {
+  it("A: a fresh/seeded colony starts at full QUEEN_MAX_HEALTH, active", () => {
+    const snapshot = sim.getColonySnapshot(colony.id);
+    expect(snapshot).toMatchObject({ health: QUEEN_MAX_HEALTH, maxHealth: QUEEN_MAX_HEALTH, status: "active" });
+  });
+
+  it("B: a createColony()-minted colony also starts at full health, active", async () => {
+    const { createColony } = await import("../src/server/db.ts");
+    const other = createColony();
+    sim.registerColony(other.colonyId, other.queenX, other.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
+
+    const snapshot = sim.getColonySnapshot(other.colonyId);
+    expect(snapshot).toMatchObject({ health: QUEEN_MAX_HEALTH, maxHealth: QUEEN_MAX_HEALTH, status: "active" });
+  });
+
+  it("C: queen health and status survive a reload", () => {
+    sim.applyDamageToQueen(colony.id, 40, 999);
+    sim.loadSimulation();
+
+    const snapshot = sim.getColonySnapshot(colony.id);
+    expect(snapshot).toMatchObject({ health: QUEEN_MAX_HEALTH - 40, status: "active" });
+  });
+
+  it("D: applyDamageToQueen writes health synchronously to the colonies table, not just in memory", () => {
+    sim.applyDamageToQueen(colony.id, 25, 999);
+
+    const row = db.prepare("SELECT queen_health AS queenHealth FROM colonies WHERE id = ?").get(colony.id) as {
+      queenHealth: number;
+    };
+    expect(row.queenHealth).toBe(QUEEN_MAX_HEALTH - 25);
+  });
+
+  it("E: regen does not begin until QUEEN_REGEN_DELAY seconds have passed without damage", () => {
+    sim.applyDamageToQueen(colony.id, 50, 999);
+
+    sim.advanceSimulation(QUEEN_REGEN_DELAY - 1);
+    expect(sim.getColonySnapshot(colony.id)?.health).toBe(QUEEN_MAX_HEALTH - 50);
+
+    sim.advanceSimulation(2); // crosses the delay threshold
+    expect(sim.getColonySnapshot(colony.id)!.health).toBeGreaterThan(QUEEN_MAX_HEALTH - 50);
+  });
+
+  it("F: regen proceeds at QUEEN_REGEN_RATE per second once the delay has elapsed", () => {
+    sim.applyDamageToQueen(colony.id, 50, 999);
+    sim.advanceSimulation(QUEEN_REGEN_DELAY + 1);
+
+    const before = sim.getColonySnapshot(colony.id)!.health;
+    sim.advanceSimulation(1);
+    const after = sim.getColonySnapshot(colony.id)!.health;
+
+    expect(after - before).toBeCloseTo(QUEEN_REGEN_RATE, 5);
+  });
+
+  it("G: regen caps at maxHealth, never overshooting", () => {
+    sim.applyDamageToQueen(colony.id, 1, 999);
+    sim.advanceSimulation(QUEEN_REGEN_DELAY + 1000);
+
+    expect(sim.getColonySnapshot(colony.id)?.health).toBe(QUEEN_MAX_HEALTH);
+  });
+
+  it("H: taking fresh damage resets the regen delay clock", () => {
+    sim.applyDamageToQueen(colony.id, 50, 999);
+    sim.advanceSimulation(QUEEN_REGEN_DELAY - 1); // almost regenerating
+
+    sim.applyDamageToQueen(colony.id, 10, 999); // fresh hit resets the clock
+    sim.advanceSimulation(2); // would have started regenerating if the clock hadn't reset
+
+    expect(sim.getColonySnapshot(colony.id)?.health).toBe(QUEEN_MAX_HEALTH - 60);
+  });
+
+  it("I: a defeated colony never regenerates, even damage-free for a long time", () => {
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 999); // lethal — defeats the colony
+    expect(sim.getColonySnapshot(colony.id)?.status).toBe("defeated");
+
+    sim.advanceSimulation(QUEEN_REGEN_DELAY + 1000);
+
+    expect(sim.getColonySnapshot(colony.id)?.health).toBe(0);
+  });
+});
+
+describe("Stage 8: spider queen-targeting", () => {
+  it("A: a worker within SPIDER_AGGRO_RANGE is preferred over a closer queen", () => {
+    // Far from any queen's nest-clear zone, so only the worker-aggro scan
+    // can possibly fire — isolates "worker beats queen" from the separate
+    // nest-exclusion mechanic covered elsewhere.
+    const farX = queenPosition().x + 5000;
+    const farY = queenPosition().y + 5000;
+    const spiderId = insertSpider(farX, farY);
+    sim.loadSimulation();
+    const worker = registerTestWorker(15001, farX, farY + SPIDER_AGGRO_RANGE - 10);
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase");
+    expect(sim.getCreatureChaseTarget(spiderId)).toBe(worker.id);
+    expect(sim.getCreatureChaseQueenTarget(spiderId)).toBeNull();
+  });
+
+  it("B: with no qualifying worker nearby, a spider falls back to targeting a queen within QUEEN_AGGRO_RANGE", () => {
+    for (const w of sim.getWorkersForColony(colony.id)) {
+      sim.applyDamageToWorker(w.id, WORKER_MAX_HEALTH, 999999);
+    }
+    const spiderId = insertSpider(queenPosition().x, queenPosition().y + QUEEN_AGGRO_RANGE - 10);
+    sim.loadSimulation();
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase-queen");
+    expect(sim.getCreatureChaseQueenTarget(spiderId)).toBe(colony.id);
+  });
+
+  it("C: a queen outside QUEEN_AGGRO_RANGE is not targeted", () => {
+    for (const w of sim.getWorkersForColony(colony.id)) {
+      sim.applyDamageToWorker(w.id, WORKER_MAX_HEALTH, 999999);
+    }
+    const spiderId = insertSpider(queenPosition().x, queenPosition().y + QUEEN_AGGRO_RANGE + 50);
+    sim.loadSimulation();
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureCommand(spiderId)).not.toBe("chase-queen");
+  });
+
+  it("D: of two equidistant active queens in range, the spider targets the one with the lower colony id", async () => {
+    for (const w of sim.getWorkersForColony(colony.id)) {
+      sim.applyDamageToWorker(w.id, WORKER_MAX_HEALTH, 999999);
+    }
+    const { createColony } = await import("../src/server/db.ts");
+    const otherA = createColony();
+    const otherB = createColony();
+    sim.registerColony(otherA.colonyId, otherA.queenX, otherA.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
+    sim.registerColony(otherB.colonyId, otherB.queenX, otherB.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
+
+    const midX = (otherA.queenX + otherB.queenX) / 2;
+    const midY = (otherA.queenY + otherB.queenY) / 2;
+    const spiderId = insertSpider(midX, midY);
+    sim.loadSimulation();
+
+    // Reposition both to be exactly equidistant from the spider's spawn point.
+    const dist = 50;
+    db.prepare("UPDATE colonies SET queen_x = ?, queen_y = ? WHERE id = ?").run(midX + dist, midY, otherA.colonyId);
+    db.prepare("UPDATE colonies SET queen_x = ?, queen_y = ? WHERE id = ?").run(midX - dist, midY, otherB.colonyId);
+    sim.loadSimulation();
+
+    sim.advanceSimulation(TICK_DT);
+
+    const lowerId = Math.min(otherA.colonyId, otherB.colonyId);
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase-queen");
+    expect(sim.getCreatureChaseQueenTarget(spiderId)).toBe(lowerId);
+  });
+
+  it("E: chase-queen re-reads the colony's live position every tick, not a captured one", () => {
+    for (const w of sim.getWorkersForColony(colony.id)) {
+      sim.applyDamageToWorker(w.id, WORKER_MAX_HEALTH, 999999);
+    }
+    const spiderId = insertSpider(queenPosition().x, queenPosition().y + QUEEN_AGGRO_RANGE - 10);
+    sim.loadSimulation();
+
+    sim.advanceSimulation(TICK_DT);
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase-queen");
+
+    // Move the queen (still within disengage range) via the in-memory
+    // registration API — NOT raw SQL + loadSimulation(), which would reset
+    // the spider's chase-queen command back to idle — and confirm the
+    // spider's next step closes distance toward the *new* position.
+    const newY = queenPosition().y + QUEEN_DISENGAGE_RANGE - 20;
+    const snapshot = sim.getColonySnapshot(colony.id)!;
+    sim.registerColony(colony.id, snapshot.x, newY, snapshot.health, snapshot.maxHealth);
+    const before = Math.hypot(
+      sim.getCreaturesForWorld(world.id).find((c) => c.id === spiderId)!.x - snapshot.x,
+      sim.getCreaturesForWorld(world.id).find((c) => c.id === spiderId)!.y - newY,
+    );
+
+    sim.advanceSimulation(TICK_DT);
+
+    const spider = sim.getCreaturesForWorld(world.id).find((c) => c.id === spiderId)!;
+    const after = Math.hypot(spider.x - snapshot.x, spider.y - newY);
+    expect(after).toBeLessThan(before);
+  });
+
+  it("F: chase-queen drops to idle immediately once the target colony is defeated", () => {
+    for (const w of sim.getWorkersForColony(colony.id)) {
+      sim.applyDamageToWorker(w.id, WORKER_MAX_HEALTH, 999999);
+    }
+    const spiderId = insertSpider(queenPosition().x, queenPosition().y + QUEEN_AGGRO_RANGE - 10);
+    sim.loadSimulation();
+
+    sim.advanceSimulation(TICK_DT);
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase-queen");
+
+    sim.defeatColony(colony.id, "abandoned");
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureCommand(spiderId)).not.toBe("chase-queen");
+  });
+
+  it("G: a spider disengages from a queen once beyond QUEEN_DISENGAGE_RANGE", () => {
+    for (const w of sim.getWorkersForColony(colony.id)) {
+      sim.applyDamageToWorker(w.id, WORKER_MAX_HEALTH, 999999);
+    }
+    const spiderId = insertSpider(queenPosition().x, queenPosition().y + QUEEN_AGGRO_RANGE - 10);
+    sim.loadSimulation();
+
+    sim.advanceSimulation(TICK_DT);
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase-queen");
+
+    // Move the queen out of range, relative to the spider's actual current
+    // position (it closed some distance during the first tick) — via the
+    // in-memory registration API, NOT raw SQL + loadSimulation(), which
+    // would reset the spider's chase-queen command back to idle before
+    // disengage is ever exercised.
+    const spiderY = sim.getCreaturesForWorld(world.id).find((c) => c.id === spiderId)!.y;
+    const snapshot = sim.getColonySnapshot(colony.id)!;
+    sim.registerColony(colony.id, snapshot.x, spiderY + QUEEN_DISENGAGE_RANGE + 50, snapshot.health, snapshot.maxHealth);
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureCommand(spiderId)).not.toBe("chase-queen");
+  });
+
+  it("H: a spider in range attacks the queen on cooldown, dealing SPIDER_ATTACK_DAMAGE per hit, via applyDamageToQueen", () => {
+    for (const w of sim.getWorkersForColony(colony.id)) {
+      sim.applyDamageToWorker(w.id, WORKER_MAX_HEALTH, 999999);
+    }
+    const spiderId = insertSpider(queenPosition().x, queenPosition().y + SPIDER_ATTACK_RANGE - 5);
+    sim.loadSimulation();
+
+    sim.advanceSimulation(TICK_DT); // idle -> chase-queen, no hit yet
+    expect(sim.getColonySnapshot(colony.id)?.health).toBe(QUEEN_MAX_HEALTH);
+
+    sim.advanceSimulation(TICK_DT); // already in range, cooldown elapsed — first hit lands
+    expect(sim.getColonySnapshot(colony.id)?.health).toBe(QUEEN_MAX_HEALTH - SPIDER_ATTACK_DAMAGE);
+
+    sim.advanceSimulation(TICK_DT); // still on cooldown — no second hit yet
+    expect(sim.getColonySnapshot(colony.id)?.health).toBe(QUEEN_MAX_HEALTH - SPIDER_ATTACK_DAMAGE);
+
+    sim.advanceSimulation(SPIDER_ATTACK_COOLDOWN); // cooldown elapses — second hit lands
+    expect(sim.getColonySnapshot(colony.id)?.health).toBe(QUEEN_MAX_HEALTH - SPIDER_ATTACK_DAMAGE * 2);
+    expect(spiderId).toBeGreaterThan(0);
+  });
+
+  it("I: a spider's queen target selection ignores colony ownership — any active colony's queen qualifies", async () => {
+    for (const w of sim.getWorkersForColony(colony.id)) {
+      sim.applyDamageToWorker(w.id, WORKER_MAX_HEALTH, 999999);
+    }
+    const { createColony } = await import("../src/server/db.ts");
+    const other = createColony();
+    sim.registerColony(other.colonyId, other.queenX, other.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
+
+    const spiderId = insertSpider(other.queenX, other.queenY + QUEEN_AGGRO_RANGE - 10);
+    sim.loadSimulation();
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase-queen");
+    expect(sim.getCreatureChaseQueenTarget(spiderId)).toBe(other.colonyId);
+  });
+
+  it("J: a defeated colony's queen is never targeted, even standing exactly where she died", () => {
+    for (const w of sim.getWorkersForColony(colony.id)) {
+      sim.applyDamageToWorker(w.id, WORKER_MAX_HEALTH, 999999);
+    }
+    sim.defeatColony(colony.id, "abandoned");
+    const spiderId = insertSpider(queenPosition().x, queenPosition().y);
+    sim.loadSimulation();
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getCreatureCommand(spiderId)).not.toBe("chase-queen");
+  });
+});
+
+describe("Stage 8: colony defeat", () => {
+  it("A: lethal queen damage transitions the colony to defeated with the correct cause", () => {
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+
+    const snapshot = sim.getColonySnapshot(colony.id);
+    expect(snapshot).toMatchObject({ status: "defeated", health: 0 });
+    expect(sim.isColonyActive(colony.id)).toBe(false);
+
+    const row = db
+      .prepare("SELECT status AS status, defeat_cause AS defeatCause FROM colonies WHERE id = ?")
+      .get(colony.id) as { status: string; defeatCause: string };
+    expect(row).toMatchObject({ status: "defeated", defeatCause: "spider" });
+  });
+
+  it("B: defeat removes every worker from the sim map and the workers table", () => {
+    const workerIds = sim.getWorkersForColony(colony.id).map((w) => w.id);
+    expect(workerIds.length).toBeGreaterThan(0);
+
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+
+    expect(sim.getWorkersForColony(colony.id)).toHaveLength(0);
+    for (const id of workerIds) {
+      expect(db.prepare("SELECT * FROM workers WHERE id = ?").get(id)).toBeUndefined();
+    }
+  });
+
+  it("C: defeat deletes the colony's stored resources", () => {
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+
+    const rows = db.prepare("SELECT * FROM colony_resources WHERE colony_id = ?").all(colony.id);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("D: defeat sweeps any spider chasing one of the removed workers back to idle", () => {
+    // Positioned well outside SPIDER_CLEAR_RADIUS of the queen's nest, so
+    // the worker-aggro scan actually sees it instead of falling through to
+    // queen-targeting (the real seeded workers spawn too close to qualify).
+    const farX = queenPosition().x + 5000;
+    const farY = queenPosition().y + 5000;
+    const spiderId = insertSpider(farX, farY);
+    sim.loadSimulation();
+    const worker = registerTestWorker(15002, farX, farY);
+    sim.advanceSimulation(TICK_DT);
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase");
+    expect(sim.getCreatureChaseTarget(spiderId)).toBe(worker.id);
+
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+
+    expect(sim.getCreatureCommand(spiderId)).not.toBe("chase");
+  });
+
+  it("E: defeat sweeps any spider chasing this queen back to idle", () => {
+    for (const w of sim.getWorkersForColony(colony.id)) {
+      sim.applyDamageToWorker(w.id, WORKER_MAX_HEALTH, 999999);
+    }
+    const spiderId = insertSpider(queenPosition().x, queenPosition().y + QUEEN_AGGRO_RANGE - 10);
+    sim.loadSimulation();
+    sim.advanceSimulation(TICK_DT);
+    expect(sim.getCreatureCommand(spiderId)).toBe("chase-queen");
+
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+
+    expect(sim.getCreatureCommand(spiderId)).not.toBe("chase-queen");
+  });
+
+  it("F: defeat is logged exactly once, with cause and creatureId, even under a duplicate/concurrent call", () => {
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+    sim.defeatColony(colony.id, "spider", 777); // simulated duplicate/concurrent trigger — must be a no-op
+
+    const rows = db
+      .prepare("SELECT detail FROM action_log WHERE colony_id = ? AND action = 'colony_defeated'")
+      .all(colony.id) as { detail: string }[];
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0].detail)).toMatchObject({ cause: "spider", creatureId: 777 });
+  });
+
+  it("G: a second lethal hit (or explicit defeatColony call) against an already-defeated colony is a true no-op", () => {
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+    expect(() => sim.applyDamageToQueen(colony.id, 50, 778)).not.toThrow();
+    expect(() => sim.defeatColony(colony.id, "abandoned")).not.toThrow();
+
+    const row = db
+      .prepare("SELECT status AS status, defeat_cause AS defeatCause FROM colonies WHERE id = ?")
+      .get(colony.id) as { status: string; defeatCause: string };
+    expect(row).toMatchObject({ status: "defeated", defeatCause: "spider" }); // unchanged by the later abandon attempt
+  });
+
+  it("H: a restart preserves defeated status and zero health", () => {
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+    sim.loadSimulation();
+
+    expect(sim.getColonySnapshot(colony.id)).toMatchObject({ status: "defeated", health: 0 });
+  });
+
+  it("I: a restart does not resurrect the colony's deleted workers or resources", () => {
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+    sim.loadSimulation();
+
+    expect(sim.getWorkersForColony(colony.id)).toHaveLength(0);
+    expect(db.prepare("SELECT * FROM colony_resources WHERE colony_id = ?").all(colony.id)).toHaveLength(0);
+  });
+
+  it("J: actions.abandon() runs the identical pipeline, with cause 'abandoned', distinct from a spider kill", () => {
+    const result = actions.abandon(colony.id);
+
+    expect(result).toEqual({ ok: true });
+    expect(sim.isColonyActive(colony.id)).toBe(false);
+    expect(sim.getWorkersForColony(colony.id)).toHaveLength(0);
+
+    const row = db
+      .prepare("SELECT status AS status, defeat_cause AS defeatCause FROM colonies WHERE id = ?")
+      .get(colony.id) as { status: string; defeatCause: string };
+    expect(row).toMatchObject({ status: "defeated", defeatCause: "abandoned" });
+  });
+
+  it("K: actions.abandon() on an already-defeated colony fails cleanly instead of re-running the pipeline", () => {
+    actions.abandon(colony.id);
+    const second = actions.abandon(colony.id);
+
+    expect(second).toEqual({ ok: false, error: "colony already defeated" });
+  });
+
+  it("L: a defeated colony rejects move/gather/attack commands and reproduce, via lifecycle status", () => {
+    const [worker] = sim.getWorkersForColony(colony.id);
+    const workerId = worker.id;
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+
+    // The worker itself is gone, but the point of this test is that the
+    // rejection comes from colony status, not "worker not found" — confirmed
+    // by also checking reproduce(), which never looks at a worker id at all.
+    expect(sim.issueMoveCommand(workerId, 10, 10, colony.id)).toBe("colony defeated");
+    expect(sim.issueGatherCommand(workerId, 1, colony.id)).toBe("colony defeated");
+    expect(sim.issueAttackCommand(workerId, 1, colony.id)).toBe("colony defeated");
+    expect(actions.reproduce(colony.id)).toEqual({ ok: false, error: "colony defeated" });
+  });
+
+  it("M: a colony's defeat has no effect on an unrelated active colony's workers, resources, or status", async () => {
+    const { createColony } = await import("../src/server/db.ts");
+    const other = createColony();
+    sim.registerColony(other.colonyId, other.queenX, other.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
+    for (const worker of other.workers) {
+      sim.registerWorker({
+        id: worker.id,
+        colonyId: other.colonyId,
+        x: worker.x,
+        y: worker.y,
+        health: worker.health,
+        maxHealth: worker.maxHealth,
+      });
+    }
+    const otherWorkerCount = sim.getWorkersForColony(other.colonyId).length;
+
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+
+    expect(sim.isColonyActive(other.colonyId)).toBe(true);
+    expect(sim.getWorkersForColony(other.colonyId)).toHaveLength(otherWorkerCount);
+    expect(sim.getColonySnapshot(other.colonyId)?.status).toBe("active");
   });
 });

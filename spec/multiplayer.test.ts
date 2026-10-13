@@ -352,3 +352,89 @@ it("logs who did what, server-side, in a form queryable over the API and attribu
     true,
   );
 });
+
+// Stage 8 §42: the full two-session colony-defeat/restart lifecycle. Uses
+// Alice's own Abandon Colony action to trigger defeat deterministically —
+// per Stage 8's design, abandon() runs the exact same defeatColony()
+// pipeline a lethal spider hit does (see spec/simulation.test.ts's
+// "Stage 8: colony defeat" tests J/K for the direct proof those two paths
+// share one implementation), so exercising it here is a faithful stand-in
+// for "Alice's queen died" without the flakiness of waiting on real spider
+// combat to land a kill in a black-box HTTP test.
+it(
+  "a colony's defeat and restart are visible to another session as a shared-world fact, without affecting that session's own colony or letting it control the defeated/restarted colony",
+  async () => {
+    const alice = createSession();
+    const bob = createSession();
+
+    const aliceBefore = await getState(alice);
+    const bobBefore = await getState(bob);
+    expect(aliceBefore.colony.status).toBe("active");
+    expect(bobBefore.colony.status).toBe("active");
+
+    // Every lifecycle route (abandon, start-new-colony) resolves strictly
+    // from the caller's own session, never a body/query parameter — there is
+    // structurally no colony id for Bob to even attempt to forge against
+    // Alice's colony. What's left to verify is the shared-world behavior
+    // once Alice abandons her own.
+
+    // Alice abandons her own colony — the defeat-pipeline stand-in for a
+    // natural queen death.
+    const aliceAbandonRes = await alice("/api/abandon", { method: "POST" });
+    expect(aliceAbandonRes.status).toBe(200);
+    const aliceAbandoned = await aliceAbandonRes.json();
+    expect(aliceAbandoned.colony.status).toBe("defeated");
+    expect(aliceAbandoned.colony.defeatCause).toBe("abandoned");
+    const oldAliceColonyId = aliceAbandoned.colony.id;
+
+    // Bob's own session is wholly unaffected: still active, same colony,
+    // own workers/resources untouched.
+    const bobAfterAliceDefeat = await getState(bob);
+    expect(bobAfterAliceDefeat.colony.id).toBe(bobBefore.colony.id);
+    expect(bobAfterAliceDefeat.colony.status).toBe("active");
+    expect(bobAfterAliceDefeat.workers.length).toBeGreaterThan(0);
+
+    // Bob can see Alice's colony persist as a visible ruin in the shared
+    // roster, and sees her workers gone from the shared otherWorkers list —
+    // the shared world reflects the defeat, it does not reset.
+    const aliceRuinFromBob = bobAfterAliceDefeat.colonies.find((c: any) => c.id === oldAliceColonyId);
+    expect(aliceRuinFromBob).toMatchObject({ status: "defeated" });
+    expect(bobAfterAliceDefeat.otherWorkers.some((w: any) => w.colonyId === oldAliceColonyId)).toBe(false);
+
+    // The rest of the shared world (resource nodes, creatures) is unchanged
+    // for Bob by Alice's defeat.
+    expect(bobAfterAliceDefeat.resourceNodes.map((n: any) => n.id).sort()).toEqual(
+      bobBefore.resourceNodes.map((n: any) => n.id).sort(),
+    );
+    expect(bobAfterAliceDefeat.creatures.map((c: any) => c.id).sort()).toEqual(
+      bobBefore.creatures.map((c: any) => c.id).sort(),
+    );
+
+    // Bob cannot restart Alice's defeated colony through his own session —
+    // his session's own colony is still active, so his own restart attempt
+    // is rejected on his own behalf, never touching Alice's ruin.
+    const bobRestartRes = await bob("/api/start-new-colony", { method: "POST" });
+    expect(bobRestartRes.status).toBe(400);
+    const bobAfterRestartAttempt = await getState(bob);
+    expect(bobAfterRestartAttempt.colony.id).toBe(bobBefore.colony.id);
+    expect(bobAfterRestartAttempt.colony.status).toBe("active");
+
+    // Alice starts a new colony — visible live to Bob as a brand-new active
+    // colony in the shared roster, while her old colony remains a ruin.
+    const aliceRestartRes = await alice("/api/start-new-colony", { method: "POST" });
+    expect(aliceRestartRes.status).toBe(200);
+    const aliceRestarted = await aliceRestartRes.json();
+    expect(aliceRestarted.colony.id).not.toBe(oldAliceColonyId);
+    expect(aliceRestarted.colony.status).toBe("active");
+
+    const bobAfterAliceRestart = await getState(bob);
+    const newAliceColonyFromBob = bobAfterAliceRestart.colonies.find((c: any) => c.id === aliceRestarted.colony.id);
+    expect(newAliceColonyFromBob).toMatchObject({ status: "active" });
+    const oldAliceRuinStillThere = bobAfterAliceRestart.colonies.find((c: any) => c.id === oldAliceColonyId);
+    expect(oldAliceRuinStillThere).toMatchObject({ status: "defeated" });
+
+    // Bob's own colony, resources, and workers are untouched throughout.
+    expect(bobAfterAliceRestart.colony.id).toBe(bobBefore.colony.id);
+    expect(bobAfterAliceRestart.colony.status).toBe("active");
+  },
+);

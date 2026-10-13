@@ -20,6 +20,7 @@ process.env.DB_PATH = DB_PATH;
 const { db, resetForTests, resetProductionWorld, createColony, getUnclaimedColonyId, saveSession } = await import(
   "../src/server/db.ts"
 );
+const { logAction, getWorldEvents } = await import("../src/server/log.ts");
 const sim = await import("../src/server/simulation.ts");
 const {
   WORLD,
@@ -355,6 +356,57 @@ describe("spider population (Stage 7)", () => {
   });
 });
 
+// --- Stage 8 §43: world event feed, derived from action_log -----------------
+
+describe("world event feed (Stage 8, §43)", () => {
+  it("is bounded to the requested limit (default 6), newest-first, mapped through fixed safe message templates — never raw detail or session/cookie data", () => {
+    resetForTests();
+
+    logAction(1, "colony_created", { workerCount: 3 }); // not a feed action — must not appear
+    logAction(1, "worker_died", { cause: "old age" }); // cause != "spider" — must not appear
+    logAction(1, "worker_died", { cause: "spider", workerId: 42 });
+    logAction(1, "spider_died", { creatureId: 99, carcassId: 7 });
+    logAction(1, "colony_defeated", { cause: "spider", creatureId: 99 });
+    logAction(2, "colony_defeated", { cause: "abandoned" });
+    logAction(2, "colony_started", { previousColonyId: 1 });
+
+    const events = getWorldEvents();
+    expect(events.length).toBe(5); // the colony_created and non-spider worker_died rows are excluded
+
+    // Newest-first: the most recently logged action_log row (colony_started)
+    // is first, the oldest feed-eligible row (worker_died/spider) is last.
+    expect(events[0].message).toBe("A new colony has emerged.");
+    expect(events[1].message).toBe("Colony 2 was abandoned.");
+    expect(events[2].message).toBe("Colony 1 has fallen.");
+    expect(events[3].message).toBe("A spider was killed.");
+    expect(events[4].message).toBe("Colony 1 lost a worker to a spider.");
+
+    // No raw detail (worker/creature/carcass ids), no sid/cookie value, ever
+    // appears in a feed message — only colony ids, which are already public.
+    for (const event of events) {
+      expect(event.message).not.toMatch(/\d{2,}/); // no bare multi-digit ids beyond a small colony id
+      expect(event.message).not.toMatch(/sid|cookie|session/i);
+    }
+  });
+
+  it("is capped at a small size (<= 6) even with far more eligible history, and a caller-supplied limit is honored", () => {
+    resetForTests();
+    for (let i = 0; i < 20; i++) logAction(1, "colony_started", { previousColonyId: i });
+
+    expect(getWorldEvents().length).toBeLessThanOrEqual(6);
+    expect(getWorldEvents(3).length).toBe(3);
+    expect(getWorldEvents(20).length).toBe(20);
+  });
+
+  it("does not grow or change from ordinary per-tick movement activity — only the four named lifecycle/death actions ever appear", () => {
+    resetForTests();
+    logAction(1, "gather", {});
+    logAction(1, "reproduce", {});
+    logAction(1, "colony_claimed", { workerCount: 3 });
+    expect(getWorldEvents()).toEqual([]);
+  });
+});
+
 // --- Section 16G (full regression suite green) is not a property of this file
 // alone — it's `pnpm test` passing across every spec/*.test.ts file together.
 
@@ -400,6 +452,15 @@ describe("in-game help (Section 16H)", () => {
     expect(overlayText).toMatch(/flee|run/i);
     expect(overlayText).toMatch(/health/i);
     expect(overlayText).toMatch(/death|dies|died/i);
+
+    // Stage 8: queen survival, colony defeat, restarting, and the explicit
+    // no-PvP clarification must all be documented.
+    expect(overlayText).toMatch(/queen.{0,80}(killed|dies|dying)/i);
+    expect(overlayText).toMatch(/abandon/i);
+    expect(overlayText).toMatch(/ruin/i);
+    expect(overlayText).toMatch(/start new colony/i);
+    expect(overlayText).toMatch(/never.{0,20}reset.{0,40}shared world|shared world.{0,40}(never|not).{0,20}reset/i);
+    expect(overlayText).toMatch(/no player-vs-player|cannot attack another player/i);
   });
 
   it("the client bundle wires up opening and closing the help overlay", async () => {

@@ -505,3 +505,114 @@ it(
     }
   },
 );
+
+// Stage 8: a colony's defeat and its eventual restart must reach every open
+// connection, not just its own, via the shared public `colonies` roster.
+// Uses colony A's own Abandon Colony action as a deterministic stand-in for
+// a natural queen death — see spec/multiplayer.test.ts's identical rationale
+// (abandon() and a lethal spider hit share the exact same defeatColony()
+// pipeline, per spec/simulation.test.ts's "Stage 8: colony defeat" J/K
+// tests) — rather than waiting on real spider combat to kill a queen within
+// a black-box test's time budget.
+it(
+  "another colony's defeat, resulting ruin, and eventual restart are all visible live, via the shared colonies roster, to a different open connection",
+  { timeout: 60000 },
+  async () => {
+    const colonyA = createOtherSession();
+    const colonyB = createOtherSession();
+
+    const aState = await colonyA.request("/api/state").then((r) => r.json());
+    const wsB = await colonyB.connect();
+    try {
+      async function waitForColonyStatus(ws: WebSocket, colonyId: number, status: string): Promise<any> {
+        const deadline = Date.now() + 20000;
+        while (Date.now() < deadline) {
+          const message = await nextMessage(ws, 20000);
+          const roster = message.colonies.find((c: any) => c.id === colonyId);
+          if (roster && roster.status === status) return message;
+        }
+        throw new Error(`no broadcast frame showed colony ${colonyId} with status ${status}`);
+      }
+
+      const abandonRes = await colonyA.request("/api/abandon", { method: "POST" });
+      expect(abandonRes.status).toBe(200);
+
+      const ruinMessage = await waitForColonyStatus(wsB, aState.colony.id, "defeated");
+      expect(ruinMessage.colonies.find((c: any) => c.id === aState.colony.id)).toMatchObject({ status: "defeated" });
+      // Alice's workers disappear from B's shared otherWorkers view too.
+      expect(ruinMessage.otherWorkers.some((w: any) => w.colonyId === aState.colony.id)).toBe(false);
+
+      const restartRes = await colonyA.request("/api/start-new-colony", { method: "POST" });
+      expect(restartRes.status).toBe(200);
+      const restarted = await restartRes.json();
+      expect(restarted.colony.id).not.toBe(aState.colony.id);
+
+      const newColonyMessage = await waitForColonyStatus(wsB, restarted.colony.id, "active");
+      expect(newColonyMessage.colonies.find((c: any) => c.id === restarted.colony.id)).toMatchObject({
+        status: "active",
+      });
+      // The old ruin is still present and still defeated, even after A's
+      // restart.
+      expect(newColonyMessage.colonies.find((c: any) => c.id === aState.colony.id)).toMatchObject({
+        status: "defeated",
+      });
+    } finally {
+      wsB.close();
+    }
+  },
+);
+
+// Stage 8: this file's module-scope session/colony is shared by every test
+// above — abandoning it here, last, is deliberate so no earlier test in this
+// file is left operating on a defeated colony. Confirms the defeat itself
+// (status, resources, and worker removal) and the restart that follows are
+// each broadcast directly to the acting colony's own open connection, not
+// just readable via GET /api/state.
+it(
+  "a colony's own defeat and subsequent restart are each broadcast directly to its own open WebSocket connection",
+  { timeout: 60000 },
+  async () => {
+    const before = await getState();
+    expect(before.colony.status).toBe("active");
+
+    const ws = await connect();
+    try {
+      const abandonRes = await request("/api/abandon", { method: "POST" });
+      expect(abandonRes.status).toBe(200);
+
+      const defeatDeadline = Date.now() + 20000;
+      let defeatMessage: any;
+      while (Date.now() < defeatDeadline) {
+        const message = await nextMessage(ws, 20000);
+        if (message.colony.status === "defeated") {
+          defeatMessage = message;
+          break;
+        }
+      }
+      expect(defeatMessage, "no broadcast frame showed the colony defeated").toBeDefined();
+      expect(defeatMessage.colony.defeatCause).toBe("abandoned");
+      expect(defeatMessage.workers).toHaveLength(0);
+      for (const type of ["sugar", "protein", "biomass"]) {
+        expect(defeatMessage.colony.resources[type]).toBe(0);
+      }
+
+      const restartRes = await request("/api/start-new-colony", { method: "POST" });
+      expect(restartRes.status).toBe(200);
+      const restarted = await restartRes.json();
+
+      const restartDeadline = Date.now() + 20000;
+      let restartMessage: any;
+      while (Date.now() < restartDeadline) {
+        const message = await nextMessage(ws, 20000);
+        if (message.colony.id === restarted.colony.id && message.colony.status === "active") {
+          restartMessage = message;
+          break;
+        }
+      }
+      expect(restartMessage, "no broadcast frame showed the restarted colony active").toBeDefined();
+      expect(restartMessage.workers.length).toBeGreaterThan(0);
+    } finally {
+      ws.close();
+    }
+  },
+);
