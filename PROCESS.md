@@ -1,5 +1,107 @@
 # Process overview
 
+## Stage 8: queen survival, colony defeat & restart
+
+Stage 7 made individual workers mortal but left the colony itself immortal:
+a colony that lost every worker and couldn't scrape together 50 protein had
+no way back — and that wasn't hypothetical, it was my own deployed colony,
+stuck exactly that way. This stage's brief asked for the symmetric fix on
+both ends: give the queen real health so a colony can actually be defeated
+(by a spider, environmentally, never by another player), and give the
+player an explicit, always-available way out (Abandon Colony → Start New
+Colony) so a bad outcome is never permanent — without the shared world ever
+resetting for anyone else in it. I started the same way as Stage 7: two
+read-only passes over `simulation.ts`/`db.ts`/`sessions.ts` before writing
+anything, specifically to find the existing idioms to extend rather than
+invent new ones. That paid off directly — Stage 7's worker-health schema
+pattern (inline columns + guarded `ALTER TABLE` + backfill), its
+synchronous-damage discipline, and its nest-exclusion-asymmetry precedent
+(a chase can enter a zone ambient wander never would) all transferred onto
+the queen with no new idiom needed.
+
+Five commits, each green before the next. The first
+([`653ceb5`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/653ceb5))
+is the core lifecycle: the colony schema gains `status`/`queen_health`/
+`queen_max_health`/`defeat_cause`/`defeated_at` via the exact Stage 7
+migration shape; the in-memory `nestPositions` map (a Stage 7 leftover
+that only ever stored a position) is promoted to a proper `SimColony`
+cache carrying health and status, which is what makes "a ruin protects
+nothing" a one-line filter rather than a special case; spider targeting
+gets a queen-aggro fallback that only runs once the existing worker scan
+finds nothing, with its own named constants and deliberately no
+nest-exclusion gate, so a queen is only ever threatened by a spider that
+already chased or wandered its way in — never by a global "nearest
+colony" search. `defeatColony()` is the one new function both a lethal hit
+and a manual abandon call into: a single `UPDATE ... WHERE status='active'`
+guard makes it idempotent by construction, so a race between two lethal
+hits in the same tick, or a hit landing the same tick as a manual abandon,
+still runs the worker/resource cleanup exactly once — proven in a test, not
+just reasoned about.
+
+The second
+([`d45aac1`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/d45aac1))
+is the player-facing half of the same mechanism: `abandon()` is a two-line
+wrapper that calls `defeatColony()` with a different cause, which is the
+entire guarantee that manual and environmental defeat can never drift
+apart into two different cleanup paths. `startNewColony()` re-points a
+session's existing row (an upsert, not a new history table — the old
+colony simply persists, unreferenced, as the ruin) and is gated on the
+session's *current* colony being defeated, never on resource balance, per
+the brief. Writing this commit is also where I found a real bug rather
+than a hypothetical one: the WebSocket broadcast loop cached a
+connection's `colonyId` once at handshake, which was invisible and
+harmless before Stage 8 (a session's colony never used to change) but
+would have meant an already-open tab kept broadcasting a now-defeated
+colony forever after a restart. The fix was to cache `sessionId` instead
+and re-resolve `colonyId` fresh on every broadcast tick — same cost, one
+extra indexed lookup per connection per tick. I only found this by writing
+the realtime restart test first and watching it fail against the old
+caching, not by auditing the code for it in the abstract.
+
+The third
+([`036a992`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/036a992))
+is the client: health bars on every visible queen (reusing Stage 7's
+`drawHealthBar` verbatim), a muted non-interactive ruin marker for a
+defeated colony, an Abandon Colony confirmation modal using the brief's
+exact required wording, and a defeat overlay with a Start New Colony
+button that recenters the camera and clears selection on success with no
+page reload anywhere in the flow. The fourth
+([`fd839a2`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/fd839a2))
+is the test suite: queen health/regen/targeting at the simulation level,
+the defeat transaction's exactly-once guarantee and cleanup, the soft-lock
+regression this whole stage exists to fix (zero workers, insufficient
+protein, abandon, restart, playable again), two-session isolation
+(one colony falling never touches another's state), and live WebSocket
+broadcast of the full damage→defeat→ruin→restart sequence to both the
+acting and an observing connection. The fifth
+([`49d545a`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/49d545a))
+documents all of it in `CLAUDE.md` as explicit invariants — including the
+WebSocket bug and fix, named as a bug fix, not folded silently into "how
+it works" — and moves queen death/defeat/restart and the new world event
+feed from `README.md`'s "not here yet" into "what's here."
+
+The full suite stands at 178/178, with `pnpm check`/`pnpm check:evidence`
+both green. Two tests (a worker-injury realtime assertion and a cross-colony
+attack-rejection assertion, both pre-existing from Stage 6/7, neither
+touched this stage) failed once each under full-suite timing load; I
+confirmed both are pre-existing flakiness, not a Stage 8 regression, by
+reproducing the realtime one against a clean checkout of the pre-Stage-8
+commit and by rerunning the attack-rejection one in isolation, where it
+passed — then re-ran the full suite clean before committing documentation.
+A throwaway script measured `advanceSimulation()` at full population (30
+colonies, 93 workers, 10 spiders, under live attack commands including real
+colony defeats occurring mid-measurement) at ~0.19ms/tick average, still
+roughly 500x headroom under the 100ms budget — higher than Stage 7's
+0.11ms baseline, which I attribute to the added queen-regen scan plus the
+actual combat-driven defeats happening during the window, not a design
+concern.
+
+The brief's required acceptance evidence — recovering my own real,
+deployed, soft-locked colony through the live Abandon Colony flow, with no
+manual repair and no special-casing in code — is deployment-stage work,
+not implementation-stage work, and is reported separately once that's
+done, per the brief's own framing of it as post-deploy verification.
+
 ## Stage 7: predators and worker survival
 
 Stage 6b made the ecosystem rich but risk-free: more workers were pure
