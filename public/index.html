@@ -109,14 +109,105 @@
         border-radius: 50%;
         border: 2px dashed #3e2723;
       }
+      #abandon-button {
+        font-weight: 600;
+        background: #b71c1c;
+        color: white;
+        border: none;
+        border-radius: 999px;
+        padding: 0.4rem 1rem;
+        cursor: pointer;
+      }
+      #abandon-button:hover {
+        background: #7f0000;
+      }
+      #abandon-button:disabled,
+      #reproduce:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      #queen-health {
+        font-size: 0.9rem;
+        color: #555;
+      }
+      #world-events {
+        margin-block: 0.5rem;
+        padding: 0.5rem 0.75rem;
+        background: #f3f3f3;
+        border-radius: 6px;
+        font-size: 0.85rem;
+        color: #444;
+        max-width: 960px;
+      }
+      #world-events h3 {
+        margin: 0 0 0.3rem;
+        font-size: 0.85rem;
+        color: #777;
+      }
+      #world-events ul {
+        margin: 0;
+        padding-left: 1.1rem;
+      }
+      #abandon-overlay,
+      #defeat-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.55);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 2rem;
+        z-index: 20;
+      }
+      #abandon-overlay[hidden],
+      #defeat-overlay[hidden] {
+        display: none;
+      }
+      #abandon-panel,
+      #defeat-panel {
+        background: white;
+        color: #1a1a1a;
+        max-width: 480px;
+        border-radius: 8px;
+        padding: 1.5rem 2rem;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+      }
+      .modal-actions {
+        display: flex;
+        gap: 0.75rem;
+        justify-content: flex-end;
+        margin-top: 1.5rem;
+      }
+      .modal-actions button {
+        padding: 0.5rem 1rem;
+        border-radius: 6px;
+        border: none;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      #abandon-cancel {
+        background: #e0e0e0;
+      }
+      #abandon-confirm {
+        background: #b71c1c;
+        color: white;
+      }
+      #start-new-colony {
+        background: #2e7d32;
+        color: white;
+      }
     </style>
   </head>
   <body>
     <main>
       <div class="top-row">
         <h1>Colony</h1>
+        <span id="queen-health"></span>
         <button id="help-button" type="button" aria-haspopup="dialog" aria-controls="help-overlay">
           ? How to play
+        </button>
+        <button id="abandon-button" type="button" aria-haspopup="dialog" aria-controls="abandon-overlay">
+          Abandon Colony
         </button>
       </div>
       <p id="resources">sugar: 0 · protein: 0 · biomass: 0</p>
@@ -127,6 +218,10 @@
       </p>
       <button id="reproduce">Reproduce worker (50 protein)</button>
       <p id="status"></p>
+      <div id="world-events">
+        <h3>World events</h3>
+        <ul id="world-events-list"></ul>
+      </div>
       <p><a href="/readme/">About this app</a></p>
     </main>
 
@@ -167,6 +262,11 @@
             colonies' queens and workers are visible, moving in real time, but you can never select or command them,
             and your resources are private to you.
           </li>
+          <li>
+            <strong>There is no player-vs-player combat.</strong> You cannot attack another player's queen or
+            workers, and nothing you do can take or destroy another colony's resources. The only threat to your
+            colony is a spider.
+          </li>
         </ul>
 
         <h2>Danger</h2>
@@ -194,6 +294,41 @@
           <li>
             A killed spider leaves behind a protein carcass, just like an aphid — gather it explicitly like any
             other resource node.
+          </li>
+        </ul>
+
+        <h2>Colony Survival</h2>
+        <ul>
+          <li>
+            <strong>Your queen can be killed.</strong> A spider that wanders or chases a fleeing worker close enough
+            to your queen will attack her too — a red health bar appears above her once she's hurt, and she slowly
+            regenerates health after a while undisturbed.
+          </li>
+          <li>
+            <strong>If your queen dies, your colony falls.</strong> All of your workers are removed and your stored
+            resources are destroyed. Your old colony remains in the shared world as a non-interactive ruin — it is
+            never deleted, looted, or rebuilt.
+          </li>
+          <li>
+            <strong>You can also abandon your colony voluntarily</strong> at any time via the "Abandon Colony"
+            button — useful if you're stuck with no workers and not enough resources to recover. It has exactly the
+            same effect as the queen being killed.
+          </li>
+        </ul>
+
+        <h2>Restarting</h2>
+        <ul>
+          <li>
+            Once your colony has fallen (by death or abandonment), a "Start New Colony" button lets you begin again
+            immediately, in the same shared world and the same browser session — no reload, no new link.
+          </li>
+          <li>
+            Your new colony spawns fresh, with full health and the standard starting workers and resources,
+            somewhere else in the world, clear of other colonies, ruins, and spiders.
+          </li>
+          <li>
+            Starting a new colony never resets the shared world — every other colony, resource, and creature carries
+            on exactly as it was.
           </li>
         </ul>
 
@@ -252,6 +387,35 @@
           Biomass node (largest)
         </div>
         <div class="legend-item"><span class="legend-swatch dashed" style="background: #6d4c41"></span> Carcass (gatherable protein left by a killed aphid)</div>
+        <div class="legend-item">
+          <span class="legend-swatch circle" style="background: #9e9e9e; border: 2px solid #616161"></span> A fallen
+          colony's ruin — not interactive, not selectable
+        </div>
+      </div>
+    </div>
+
+    <div id="abandon-overlay" role="dialog" aria-modal="true" aria-labelledby="abandon-title" hidden>
+      <div id="abandon-panel">
+        <h2 id="abandon-title">Abandon this colony?</h2>
+        <p>
+          Your queen and workers will be lost and your stored resources will be destroyed. The shared world will
+          NOT reset. Your old colony will remain as a ruin.
+        </p>
+        <div class="modal-actions">
+          <button id="abandon-cancel" type="button">CANCEL</button>
+          <button id="abandon-confirm" type="button">ABANDON COLONY</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="defeat-overlay" role="dialog" aria-modal="true" aria-labelledby="defeat-title" hidden>
+      <div id="defeat-panel">
+        <h2 id="defeat-title">Your colony has fallen</h2>
+        <p id="defeat-message"></p>
+        <p>The shared world continues on. Your old colony remains behind as a ruin — other players may encounter it.</p>
+        <div class="modal-actions">
+          <button id="start-new-colony" type="button">Start New Colony</button>
+        </div>
       </div>
     </div>
 

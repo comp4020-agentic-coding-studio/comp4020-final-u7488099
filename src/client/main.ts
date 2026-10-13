@@ -2,7 +2,16 @@ import { APHID_RADIUS, SPIDER_RADIUS, WORKER_RADIUS } from "../server/balance.ts
 
 interface ColonyState {
   world: { width: number; height: number };
-  colony: { id: number; queenX: number; queenY: number; resources: Record<string, number> };
+  colony: {
+    id: number;
+    queenX: number;
+    queenY: number;
+    resources: Record<string, number>;
+    queenHealth: number;
+    queenMaxHealth: number;
+    status: "active" | "defeated";
+    defeatCause: string | null;
+  };
   workers: {
     id: number;
     x: number;
@@ -33,7 +42,15 @@ interface ColonyState {
     kind: "source" | "item";
   }[];
   creatures: { id: number; species: string; x: number; y: number; health: number; maxHealth: number }[];
-  colonies: { id: number; queenX: number; queenY: number }[];
+  colonies: {
+    id: number;
+    queenX: number;
+    queenY: number;
+    health: number;
+    maxHealth: number;
+    status: "active" | "defeated";
+  }[];
+  worldEvents: { message: string }[];
 }
 
 const canvas = document.querySelector<HTMLCanvasElement>("#world")!;
@@ -44,6 +61,15 @@ const reproduceBtn = document.querySelector<HTMLButtonElement>("#reproduce")!;
 const helpButton = document.querySelector<HTMLButtonElement>("#help-button")!;
 const helpOverlay = document.querySelector<HTMLElement>("#help-overlay")!;
 const helpClose = document.querySelector<HTMLButtonElement>("#help-close")!;
+const queenHealthEl = document.querySelector<HTMLElement>("#queen-health")!;
+const worldEventsListEl = document.querySelector<HTMLElement>("#world-events-list")!;
+const abandonButton = document.querySelector<HTMLButtonElement>("#abandon-button")!;
+const abandonOverlay = document.querySelector<HTMLElement>("#abandon-overlay")!;
+const abandonCancel = document.querySelector<HTMLButtonElement>("#abandon-cancel")!;
+const abandonConfirm = document.querySelector<HTMLButtonElement>("#abandon-confirm")!;
+const defeatOverlay = document.querySelector<HTMLElement>("#defeat-overlay")!;
+const defeatMessageEl = document.querySelector<HTMLElement>("#defeat-message")!;
+const startNewColonyButton = document.querySelector<HTMLButtonElement>("#start-new-colony")!;
 
 const QUEEN_RADIUS = 20;
 const NODE_RADIUS: Record<string, number> = { sugar: 8, protein: 14, biomass: 20 };
@@ -175,6 +201,32 @@ function drawHealthBar(wx: number, wy: number, r: number, health: number, maxHea
   ctx.restore();
 }
 
+// Stage 8: a defeated colony's queen is a non-interactive "ruin" — a muted,
+// desaturated marker with a small crack mark, instead of the normal filled
+// circle. Never passed to hitTest/onCanvasClick, consistent with it never
+// appearing in any command-target resolution.
+function drawRuin(wx: number, wy: number, r: number): void {
+  const [sx, sy] = worldToScreen(wx, wy);
+  if (sx < -r || sy < -r || sx > canvas.width + r || sy > canvas.height + r) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(sx, sy, r, 0, Math.PI * 2);
+  ctx.fillStyle = "#9e9e9e";
+  ctx.fill();
+  ctx.strokeStyle = "#616161";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(sx - r * 0.4, sy - r * 0.6);
+  ctx.lineTo(sx + r * 0.1, sy + r * 0.1);
+  ctx.lineTo(sx - r * 0.1, sy + r * 0.1);
+  ctx.lineTo(sx + r * 0.4, sy + r * 0.6);
+  ctx.strokeStyle = "#424242";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.restore();
+}
+
 // Dashed ring, drawn on top of (not instead of) the worker's own circle, so
 // selection never changes a worker's actual rendered colour.
 function drawSelectionRing(wx: number, wy: number, r: number): void {
@@ -249,14 +301,24 @@ function draw(): void {
   // never sends another colony's economy.
   for (const colony of state.colonies) {
     if (colony.id === state.colony.id) continue;
+    if (colony.status === "defeated") {
+      drawRuin(colony.queenX, colony.queenY, QUEEN_RADIUS);
+      continue;
+    }
     circle(colony.queenX, colony.queenY, QUEEN_RADIUS, "#ce93d8", "#6a1b9a");
+    drawHealthBar(colony.queenX, colony.queenY, QUEEN_RADIUS, colony.health, colony.maxHealth);
   }
   for (const worker of state.otherWorkers) {
     circle(worker.x, worker.y, WORKER_RADIUS, "#ce93d8", "#6a1b9a");
     if (worker.carrying) drawCarryingBadge(worker.x, worker.y, WORKER_RADIUS, worker.carrying.resourceType);
     drawHealthBar(worker.x, worker.y, WORKER_RADIUS, worker.health, worker.maxHealth);
   }
-  circle(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS, "#ffd54d", "#b8860b");
+  if (state.colony.status === "defeated") {
+    drawRuin(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS);
+  } else {
+    circle(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS, "#ffd54d", "#b8860b");
+    drawHealthBar(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS, state.colony.queenHealth, state.colony.queenMaxHealth);
+  }
   for (const worker of state.workers) {
     circle(worker.x, worker.y, WORKER_RADIUS, "#90caf9", "#1565c0");
     if (selectedWorkerIds.has(worker.id)) drawSelectionRing(worker.x, worker.y, WORKER_RADIUS + 4);
@@ -274,8 +336,56 @@ function renderResourceCounts(): void {
     .join(" · ");
 }
 
+function renderQueenHealth(): void {
+  if (!state) return;
+  queenHealthEl.textContent =
+    state.colony.status === "active"
+      ? `Queen health: ${Math.round(state.colony.queenHealth)}/${state.colony.queenMaxHealth}`
+      : "Queen health: —";
+}
+
+function renderWorldEvents(): void {
+  if (!state) return;
+  worldEventsListEl.replaceChildren(
+    ...state.worldEvents.map((event) => {
+      const li = document.createElement("li");
+      li.textContent = event.message;
+      return li;
+    }),
+  );
+}
+
+// Stage 8: tracks the colony id the defeat overlay was last shown/hidden
+// for, so a Start New Colony response (a *different* colony id, also
+// active) doesn't get misread as "still the same defeated colony."
+let lastSeenColonyId: number | null = null;
+
+function renderLifecycle(): void {
+  if (!state) return;
+  const isDefeated = state.colony.status === "defeated";
+  defeatOverlay.hidden = !isDefeated;
+  abandonButton.disabled = isDefeated;
+  reproduceBtn.disabled = isDefeated;
+  if (isDefeated) {
+    defeatMessageEl.textContent =
+      state.colony.defeatCause === "abandoned"
+        ? "You abandoned this colony. Your queen and workers are gone, and your stored resources were lost."
+        : "Your queen was killed. Your workers are gone, and your stored resources were lost.";
+  }
+  // A successful Start New Colony response lands here with a fresh, active
+  // colony id different from the one the overlay was showing — recentre the
+  // camera and drop any stale selection, same as a brand-new session's first
+  // load, but without a page reload.
+  if (lastSeenColonyId !== null && lastSeenColonyId !== state.colony.id) {
+    selectedWorkerIds = new Set();
+    cameraInitialised = false;
+  }
+  lastSeenColonyId = state.colony.id;
+}
+
 function setState(next: ColonyState): void {
   state = next;
+  renderLifecycle();
   if (!cameraInitialised) {
     camera.x = next.colony.queenX;
     camera.y = next.colony.queenY;
@@ -283,6 +393,8 @@ function setState(next: ColonyState): void {
     cameraInitialised = true;
   }
   renderResourceCounts();
+  renderQueenHealth();
+  renderWorldEvents();
 }
 
 // --- WASD / arrow-key panning ------------------------------------------
@@ -531,6 +643,49 @@ helpOverlay.addEventListener("click", (e) => {
 });
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !helpOverlay.hidden) closeHelp();
+});
+
+// Stage 8: same discoverable-modal convention as the Help overlay (hidden
+// attribute toggle, Escape/backdrop-click-to-close) — opening it never
+// touches `state` or issues a command. Only the explicit "Abandon Colony"
+// confirm button inside it calls the server.
+function openAbandonModal(): void {
+  abandonOverlay.hidden = false;
+}
+function closeAbandonModal(): void {
+  abandonOverlay.hidden = true;
+}
+abandonButton.addEventListener("click", openAbandonModal);
+abandonCancel.addEventListener("click", closeAbandonModal);
+abandonOverlay.addEventListener("click", (e) => {
+  if (e.target === abandonOverlay) closeAbandonModal();
+});
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !abandonOverlay.hidden) closeAbandonModal();
+});
+
+abandonConfirm.addEventListener("click", async () => {
+  const res = await fetch("/api/abandon", { method: "POST" });
+  const body = await res.json();
+  closeAbandonModal();
+  if (!res.ok) {
+    statusEl.textContent = body.error ?? "abandon failed";
+    return;
+  }
+  selectedWorkerIds = new Set();
+  statusEl.textContent = "Colony abandoned.";
+  setState(body);
+});
+
+startNewColonyButton.addEventListener("click", async () => {
+  const res = await fetch("/api/start-new-colony", { method: "POST" });
+  const body = await res.json();
+  if (!res.ok) {
+    statusEl.textContent = body.error ?? "start new colony failed";
+    return;
+  }
+  statusEl.textContent = "A new colony has begun.";
+  setState(body);
 });
 
 reproduceBtn.addEventListener("click", async () => {
