@@ -1,6 +1,14 @@
 import { RESOURCE_TYPES } from "./balance.ts";
 import { db } from "./db.ts";
-import { getCreaturesForWorld, getWorkersExcludingColony, getWorkersForColony, type Carrying } from "./simulation.ts";
+import {
+  getAllColonies,
+  getColonySnapshot,
+  getCreaturesForWorld,
+  getWorkersExcludingColony,
+  getWorkersForColony,
+  type Carrying,
+} from "./simulation.ts";
+import { getWorldEvents } from "./log.ts";
 
 export interface ColonyState {
   world: { width: number; height: number };
@@ -9,6 +17,10 @@ export interface ColonyState {
     queenX: number;
     queenY: number;
     resources: Record<string, number>;
+    queenHealth: number;
+    queenMaxHealth: number;
+    status: "active" | "defeated";
+    defeatCause: string | null;
   };
   workers: { id: number; x: number; y: number; carrying: Carrying; health: number; maxHealth: number }[];
   // Post-Stage-6b fix: every OTHER colony's workers, visible in the shared
@@ -41,7 +53,12 @@ export interface ColonyState {
   // Crit 10: every colony in the shared world, id + queen position only — no
   // resource ledger, which is private to its own owner. Lets a session see
   // that other players exist and where, without exposing their economy.
-  colonies: { id: number; queenX: number; queenY: number }[];
+  // Stage 8 adds health/maxHealth/status — still no resources — so the
+  // client can draw other queens' health bars and distinguish ruins.
+  colonies: { id: number; queenX: number; queenY: number; health: number; maxHealth: number; status: "active" | "defeated" }[];
+  // Stage 8: a small (<=6), curated, public feed — see log.ts's
+  // getWorldEvents. No session/cookie data, never raw action_log detail.
+  worldEvents: { message: string }[];
 }
 
 export function getState(colonyId: number): ColonyState {
@@ -51,9 +68,15 @@ export function getState(colonyId: number): ColonyState {
   if (!world) throw new Error("no world seeded");
 
   const colonyRow = db
-    .prepare("SELECT id, queen_x AS queenX, queen_y AS queenY FROM colonies WHERE id = ?")
-    .get(colonyId) as { id: number; queenX: number; queenY: number } | undefined;
+    .prepare("SELECT id, queen_x AS queenX, queen_y AS queenY, defeat_cause AS defeatCause FROM colonies WHERE id = ?")
+    .get(colonyId) as { id: number; queenX: number; queenY: number; defeatCause: string | null } | undefined;
   if (!colonyRow) throw new Error("no such colony");
+
+  // Stage 8: health/status come from the live in-memory cache, not this raw
+  // SQL row — queen_health is only checkpointed periodically (see
+  // simulation.ts's applyDamageToQueen/advanceQueenRegen split), so reading
+  // it straight from SQLite here could show stale regen progress.
+  const snapshot = getColonySnapshot(colonyRow.id);
 
   const resourceRows = db
     .prepare("SELECT resource_type AS resourceType, amount FROM colony_resources WHERE colony_id = ?")
@@ -74,17 +97,34 @@ export function getState(colonyId: number): ColonyState {
 
   const creatures = getCreaturesForWorld(world.id);
 
-  const colonies = db
-    .prepare("SELECT id, queen_x AS queenX, queen_y AS queenY FROM colonies ORDER BY id")
-    .all() as ColonyState["colonies"];
+  const colonies: ColonyState["colonies"] = getAllColonies().map(({ id, x, y, health, maxHealth, status }) => ({
+    id,
+    queenX: x,
+    queenY: y,
+    health,
+    maxHealth,
+    status,
+  }));
+
+  const worldEvents = getWorldEvents();
 
   return {
     world: { width: world.width, height: world.height },
-    colony: { id: colonyRow.id, queenX: colonyRow.queenX, queenY: colonyRow.queenY, resources },
+    colony: {
+      id: colonyRow.id,
+      queenX: colonyRow.queenX,
+      queenY: colonyRow.queenY,
+      resources,
+      queenHealth: snapshot?.health ?? 0,
+      queenMaxHealth: snapshot?.maxHealth ?? 0,
+      status: snapshot?.status ?? "defeated",
+      defeatCause: colonyRow.defeatCause,
+    },
     workers,
     otherWorkers,
     resourceNodes,
     creatures,
     colonies,
+    worldEvents,
   };
 }

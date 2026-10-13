@@ -1,10 +1,11 @@
 import express from "express";
 import { readFileSync } from "node:fs";
 import { WebSocket, WebSocketServer } from "ws";
-import { reproduce } from "./actions.ts";
+import { abandon, reproduce } from "./actions.ts";
 import { SIMULATION } from "./balance.ts";
+import { getColonyForSession } from "./db.ts";
 import { getLog, logAction } from "./log.ts";
-import { resolveOrCreateColony, SESSION_COOKIE } from "./sessions.ts";
+import { resolveOrCreateColony, SESSION_COOKIE, startNewColony } from "./sessions.ts";
 import {
   advanceSimulation,
   checkpointSimulation,
@@ -19,11 +20,14 @@ import { getState } from "./state.ts";
 // Crit 10: `colonyId` is the one fact every mutation trusts for
 // authorization — resolved below, straight from the session cookie, never
 // from anything the client sends in a request body. See CLAUDE.md's Crit 10
-// section.
+// section. `sessionId` (Stage 8) is needed only by startNewColony, which
+// must re-point the caller's own session row — also always resolved
+// server-side, never accepted from the request body.
 declare global {
   namespace Express {
     interface Request {
       colonyId: number;
+      sessionId: string;
     }
   }
 }
@@ -48,6 +52,7 @@ app.use(express.static("dist/client"));
 app.use("/api", (req, res, next) => {
   const { sessionId, colonyId, isNew } = resolveOrCreateColony(req.headers.cookie);
   req.colonyId = colonyId;
+  req.sessionId = sessionId;
   if (isNew) {
     res.cookie(SESSION_COOKIE, sessionId, { httpOnly: true, path: "/", sameSite: "lax" });
   }
@@ -92,6 +97,36 @@ app.post("/api/reproduce", (req, res) => {
   }
   logAction(req.colonyId, "reproduce");
   const state = getState(req.colonyId);
+  broadcastState();
+  res.json(state);
+});
+
+// Stage 8: the manual counterpart to a lethal spider hit — same
+// authoritative defeatColony() pipeline underneath (see actions.ts), same
+// session-resolved-colonyId shape every other route already uses. Does NOT
+// require the caller to have a worker or any resources, per §36.
+app.post("/api/abandon", (req, res) => {
+  const result = abandon(req.colonyId);
+  if (!result.ok) {
+    res.status(400).json(result);
+    return;
+  }
+  const state = getState(req.colonyId);
+  broadcastState();
+  res.json(state);
+});
+
+// Stage 8: eligibility is "valid session + defeated current colony", not
+// resource balance (§14) — startNewColony() itself enforces this and logs
+// colony_started. The new colony id is never accepted from the request
+// body; it's whatever startNewColony() mints/claims server-side.
+app.post("/api/start-new-colony", (req, res) => {
+  const result = startNewColony(req.sessionId, req.colonyId);
+  if (!result.ok) {
+    res.status(400).json(result);
+    return;
+  }
+  const state = getState(result.colonyId);
   broadcastState();
   res.json(state);
 });
@@ -201,16 +236,28 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 
 // Crit 10: each connection belongs to a different colony now, so there is no
 // longer one shared JSON payload to fan out — every connection is tagged
-// with its own `colonyId`, resolved once at handshake time from the same
+// with its owning `sessionId`, resolved once at handshake time from the same
 // session cookie the client's HTTP requests already carry (never from
-// anything the client sends over the socket itself) and cached on the
-// connection for the rest of its lifetime.
-const connectionColonyIds = new Map<WebSocket, number>();
+// anything the client sends over the socket itself).
+//
+// Stage 8: the *session* id is cached, not the colony id. A session's
+// `sid` cookie never changes for the lifetime of a connection, but which
+// colony it currently owns can — Start New Colony re-points a session's row
+// to a fresh colony id (sessions.ts) without touching its cookie. Caching
+// `colonyId` itself (the pre-Stage-8 design) meant an already-open socket
+// kept broadcasting a now-defeated colony's state forever after a restart,
+// since nothing ever re-resolved it. Re-deriving `colonyId` from the cached
+// `sessionId` on every broadcast tick (one indexed `sessions` lookup per
+// connection, same cost as the per-request HTTP resolution already does) is
+// what lets a restart appear over the live socket with no reload. See
+// spec/realtime.test.ts's "a colony's own defeat and subsequent restart are
+// each broadcast directly to its own open WebSocket connection".
+const connectionSessionIds = new Map<WebSocket, string>();
 
 wss.on("connection", (ws, req) => {
-  const { colonyId } = resolveOrCreateColony(req.headers.cookie);
-  connectionColonyIds.set(ws, colonyId);
-  ws.on("close", () => connectionColonyIds.delete(ws));
+  const { sessionId } = resolveOrCreateColony(req.headers.cookie);
+  connectionSessionIds.set(ws, sessionId);
+  ws.on("close", () => connectionSessionIds.delete(ws));
   // No immediate send here: a connection's first frame always comes from the
   // next periodic broadcast below, same as every pre-Crit-10 connection. Two
   // connections for the same colony opened moments apart must see bit-
@@ -227,7 +274,9 @@ function broadcastState(): void {
   const payloads = new Map<number, string>();
   for (const client of wss.clients) {
     if (client.readyState !== WebSocket.OPEN) continue;
-    const colonyId = connectionColonyIds.get(client);
+    const sessionId = connectionSessionIds.get(client);
+    if (sessionId === undefined) continue;
+    const colonyId = getColonyForSession(sessionId);
     if (colonyId === undefined) continue;
     let payload = payloads.get(colonyId);
     if (payload === undefined) {

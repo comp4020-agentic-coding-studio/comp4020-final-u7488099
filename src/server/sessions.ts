@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { createColony, getColonyForSession, getUnclaimedColonyId, saveSession } from "./db.ts";
+import { COLONY_SPACING, QUEEN_MAX_HEALTH, SPIDER_CLEAR_RADIUS } from "./balance.ts";
+import { createColony, db, getColonyForSession, getUnclaimedColonyId, saveSession } from "./db.ts";
 import { logAction } from "./log.ts";
-import { getWorkersForColony, registerColony, registerWorker } from "./simulation.ts";
+import { getSpiderPositions, getWorkersForColony, isColonyActive, registerColony, registerWorker } from "./simulation.ts";
 
 export const SESSION_COOKIE = "sid";
 
@@ -16,9 +17,28 @@ export function parseSessionId(cookieHeader: string | undefined): string | undef
   return undefined;
 }
 
+// Stage 8: every existing colony's position — active *and* defeated — plus
+// every live spider's current position, so a freshly minted colony never
+// spawns on top of an active queen, an old ruin, or a wandering predator.
+// Colonies get the larger COLONY_SPACING clearance (the same spacing
+// successive colonies already keep from each other on the spiral); spiders
+// get SPIDER_CLEAR_RADIUS, reusing the exact same "safe distance from a
+// predator" constant Stage 7's nest-exclusion already uses. See
+// createColony()'s `avoid` param in db.ts.
+function buildSpawnAvoidance(): { x: number; y: number; radius: number }[] {
+  const colonyPositions = db.prepare("SELECT queen_x AS x, queen_y AS y FROM colonies").all() as {
+    x: number;
+    y: number;
+  }[];
+  return [
+    ...colonyPositions.map((p) => ({ ...p, radius: COLONY_SPACING })),
+    ...getSpiderPositions().map((p) => ({ ...p, radius: SPIDER_CLEAR_RADIUS })),
+  ];
+}
+
 function mintColony(): number {
-  const { colonyId, queenX, queenY, workers } = createColony();
-  registerColony(colonyId, queenX, queenY);
+  const { colonyId, queenX, queenY, workers } = createColony(buildSpawnAvoidance());
+  registerColony(colonyId, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
   for (const worker of workers)
     registerWorker({
       id: worker.id,
@@ -29,6 +49,44 @@ function mintColony(): number {
       maxHealth: worker.maxHealth,
     });
   return colonyId;
+}
+
+// Shared by both resolveOrCreateColony (a session with no row yet) and
+// startNewColony (Stage 8: a defeated session restarting) — claims whatever
+// colony is currently sitting unclaimed, or mints a fresh one, saves the
+// session's ownership of it immediately, then re-tops-up the spare
+// invariant. Never mints two spares: the "ensure a spare exists" check runs
+// once, after this session's own claim is already persisted.
+//
+// saveSession must happen *before* the spare check, not after it, in this
+// same function — not left to the caller. getUnclaimedColonyId() has no way
+// to tell "claimed in memory a moment ago" from "still genuinely unclaimed"
+// except by querying the `sessions` table itself; if this session's own
+// claim isn't saved yet when that query runs, it sees its own
+// about-to-be-claimed colony as the available spare and skips minting a
+// real one — leaving the shared world with zero unclaimed colonies until
+// the *next* session lazily mints its own, which is too late for *this*
+// session's already-serialized response to ever have listed it. (A real
+// regression caught by spec/multiplayer.test.ts's "shows both sessions the
+// same shared world..." and otherWorkers-visibility tests.)
+function claimColonyForSession(sessionId: string): { colonyId: number; claimedExisting: boolean } {
+  let colonyId = getUnclaimedColonyId();
+  const claimedExisting = colonyId !== undefined;
+  if (colonyId === undefined) colonyId = mintColony();
+
+  saveSession(sessionId, colonyId);
+
+  // Always keep one spare, unclaimed colony ready in the world. Without
+  // this, a session's own `colonies` roster (state.ts) could never include
+  // the colony the *next* session is about to claim — that colony simply
+  // wouldn't exist yet at the moment this session's response is serialized.
+  // Pre-minting it here means it's already a visible part of the shared
+  // world the instant this request returns, exactly like any other colony.
+  // See spec/multiplayer.test.ts's "shows both sessions the same shared
+  // world..." test and CLAUDE.md's Crit 10 section.
+  if (getUnclaimedColonyId() === undefined) mintColony();
+
+  return { colonyId, claimedExisting };
 }
 
 // Crit 10's core authorization seam: resolves the caller's own colony id from
@@ -50,24 +108,32 @@ export function resolveOrCreateColony(cookieHeader: string | undefined): { sessi
   // colony (continuity with the pre-Crit-10 single colony) instead of
   // minting a brand-new one on top of it — see getUnclaimedColonyId(). Every
   // later new session claims whatever colony is currently sitting unclaimed.
-  let colonyId = getUnclaimedColonyId();
-  const claimedExisting = colonyId !== undefined;
-  if (colonyId === undefined) colonyId = mintColony();
+  const { colonyId, claimedExisting } = claimColonyForSession(sessionId);
 
-  saveSession(sessionId, colonyId);
   logAction(colonyId, claimedExisting ? "colony_claimed" : "colony_created", {
     workerCount: getWorkersForColony(colonyId).length,
   });
 
-  // Always keep one spare, unclaimed colony ready in the world. Without
-  // this, a session's own `colonies` roster (state.ts) could never include
-  // the colony the *next* session is about to claim — that colony simply
-  // wouldn't exist yet at the moment this session's response is serialized.
-  // Pre-minting it here means it's already a visible part of the shared
-  // world the instant this request returns, exactly like any other colony.
-  // See spec/multiplayer.test.ts's "shows both sessions the same shared
-  // world..." test and CLAUDE.md's Crit 10 section.
-  if (getUnclaimedColonyId() === undefined) mintColony();
-
   return { sessionId, colonyId, isNew: true };
+}
+
+// Stage 8: the explicit, player-initiated "Start New Colony" action for a
+// session whose current colony has just been defeated (by a spider or by
+// their own abandonment — see actions.ts's abandon()). Eligibility is a
+// valid session plus a defeated current colony — NOT resource balance, per
+// §14 — so even a zero-worker, zero-protein session can always recover.
+//
+// saveSession is an upsert (see db.ts): this re-points the same session's
+// single row to the new colony id. The session's identity (its `sid`
+// cookie) never changes; only which colony it currently controls does. The
+// old, defeated colony row is left exactly as-is — it's already a visible,
+// non-controllable ruin the instant this returns (per §15's "no history
+// table needed").
+export function startNewColony(sessionId: string, currentColonyId: number): { ok: true; colonyId: number } | { ok: false; error: string } {
+  if (isColonyActive(currentColonyId)) return { ok: false, error: "colony still active" };
+
+  const { colonyId } = claimColonyForSession(sessionId);
+  logAction(colonyId, "colony_started", { previousColonyId: currentColonyId });
+
+  return { ok: true, colonyId };
 }
