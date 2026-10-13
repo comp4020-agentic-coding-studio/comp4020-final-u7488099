@@ -1128,4 +1128,205 @@ species, no worker corpses, and no automated colony defenses.
   judged unnecessary, consistent with this project's standing preference
   against mechanically-generated, redundant tests.
 
+## Stage 8: queen survival, colony defeat & restart
+
+Stage 7 made individual workers vulnerable but left the colony itself
+immortal — a colony that lost every worker and had insufficient protein to
+reproduce was permanently soft-locked, with no in-game recovery. Stage 8
+closes that loop on both ends: the queen herself can now be damaged and
+killed (environmentally, by spiders — still never by another player), and
+symmetrically, a player can always recover from a bad outcome via an
+explicit, player-controlled Abandon Colony → Start New Colony flow. The
+shared world itself never resets from any individual colony's defeat or
+restart — only that one colony's own state is lost, and it remains behind
+as a visible, non-interactable ruin.
+
+- **Colony lifecycle lives on the `colonies` row itself, not a parallel
+  table.** `status` (`'active' | 'defeated'`), `queen_health`,
+  `queen_max_health`, `defeat_cause`, `defeated_at` are new nullable columns
+  (`migrateColonyLifecycle()`/`backfillColonyLifecycle()`, mirroring Stage
+  7's worker-health migration guard-and-backfill pattern exactly — SQLite
+  can't retroactively add a `NOT NULL`/`DEFAULT` to an existing column, so
+  the backfill is what actually guarantees no row is ever left with a NULL
+  status in practice, not the `CREATE TABLE`'s own constraint). Every fresh
+  colony insert (`seedIfEmpty`, `createColony`) sets
+  `status='active', queen_health=queen_max_health=QUEEN_MAX_HEALTH`
+  explicitly, same as Stage 7 did for fresh worker health.
+- **Session→colony is one current mapping per session, re-pointed on
+  restart — not a history table.** `saveSession()` became an upsert
+  (`ON CONFLICT(id) DO UPDATE SET colony_id = excluded.colony_id`). Starting
+  a new colony simply re-points a session's one existing row to a fresh
+  colony id; the old, now-defeated colony row is never deleted, so it
+  persists unreferenced in `colonies` as a de facto historical ruin. This
+  was chosen deliberately over a separate history/log table — nothing
+  needs to query "every colony a session has ever had," only "which colony
+  does this session currently control."
+- **The in-memory colony cache (`simulation.ts`'s `colonies` Map) replaced
+  the old narrow `nestPositions` Map.** Every consumer of what used to be
+  queen position lookups (`isClearOfNests`, `resolveTarget`'s `return`
+  command resolution) now reads from this richer `SimColony` cache
+  (`x, y, health, maxHealth, status, timeSinceLastDamage`). `status`
+  filters out defeated colonies from `isClearOfNests`/
+  `nearestViolatingNest` — a ruin protects nothing. `timeSinceLastDamage`
+  is ephemeral, like every other in-flight simulation state: it resets to 0
+  on every `loadSimulation()`, so a just-restarted queen simply waits out
+  one more regen delay before healing, never an immediate burst on reload.
+- **Queen damage is synchronous-write; queen regen is checkpoint-batched —
+  the same durability split this project already draws between combat and
+  passive/position state.** `applyDamageToQueen` writes `queen_health` to
+  SQLite immediately on every hit, exactly like `applyDamageToWorker`.
+  Passive regen (`advanceQueenRegen`, run once per tick) only updates the
+  in-memory value; those increments ride along in the existing periodic
+  `checkpointSimulation()` flush instead of writing every tick. Losing at
+  most one checkpoint interval of regen progress on an ungraceful crash is
+  harmless, the same argument already used for worker/creature position.
+  `QUEEN_MAX_HEALTH` (200), `QUEEN_REGEN_DELAY` (10s undamaged before
+  regen starts), `QUEEN_REGEN_RATE` (2 HP/s) are named constants in
+  `balance.ts`, same discipline as every other tunable number in this
+  codebase.
+- **Spider queen-targeting is strictly a fallback behind worker-targeting,
+  and deliberately ownership-blind — same as worker-targeting already
+  was.** `advanceSpider`'s existing worker-aggro scan runs first,
+  unchanged; only if it finds no valid worker does a second scan run,
+  against `colonies.values()` filtered to active, within
+  `QUEEN_AGGRO_RANGE` (200), nearest-then-id tie-break — the exact same
+  shape as the worker scan's own tie-break. `QUEEN_AGGRO_RANGE`/
+  `QUEEN_DISENGAGE_RANGE` (300) are their own named constants (not reused
+  from the worker ones), even though initially equal in value, so queen
+  and worker tuning can move independently later. A new `chase-queen`
+  `CreatureCommand` variant is purely additive alongside the existing
+  `chase` — never a rename — and follows the identical live-lookup
+  discipline (`colonies.get(targetColonyId)` fresh every tick, never a
+  captured position): if the target no longer exists or is no longer
+  active, the spider drops to idle immediately, which is the entire
+  mechanism behind "spiders never attack a ruin" and "a spider stops
+  targeting a queen the instant she's defeated."
+- **The queen-aggro scan deliberately applies no `isClearOfNests` gate —
+  this is intentional, not an oversight, and mirrors an asymmetry Stage 7
+  already established for worker chases.** `isClearOfNests` exists to keep
+  a spider's *ambient wander/aggro-scan* out of a nest's safe zone; reaching
+  a queen at all requires already being inside that zone by definition, so
+  a spider can only ever "notice" a queen as the natural result of having
+  wandered or chased its way in — never from across the map via a special
+  distance check. This is exactly the same reasoning Stage 7 documented for
+  why a chase already in progress bypasses `isClearOfNests` for workers.
+- **`defeatColony(colonyId, cause, creatureId?)` is the single
+  authoritative, idempotent entry point for ending a colony's life —
+  reached from both a lethal queen hit and manual abandonment. No second
+  reset system exists anywhere.** Idempotency is enforced by the database,
+  not caller discipline: `UPDATE colonies SET status='defeated', ... WHERE
+  id=? AND status='active'` affects zero rows on a second call (e.g. two
+  simultaneous lethal hits in the same tick, or a race between a hit and a
+  manual abandon), so everything after that guard — worker/resource
+  deletion, the in-memory sweep, logging — runs exactly once no matter how
+  many triggers fire concurrently. Inside one `db.transaction()`: every
+  worker row for that colony is deleted (cascading its carried resources
+  for free, the same rule Stage 7 established for a single worker's death)
+  and `colony_resources` is wiped (stored resources are lost). After the
+  transaction commits: the in-memory `workers` Map drops those ids, every
+  spider chasing one of them (or chasing this queen directly) is swept back
+  to idle (mirrors `killWorker`'s own attacker-idle sweep), and the
+  in-memory `SimColony` entry flips to `status: "defeated", health: 0` —
+  position is kept, since that's the ruin's marker. Exactly one
+  `colony_defeated` log line is written, guaranteed by the same guard.
+- **Abandonment is not a second pipeline — it's `defeatColony` called with
+  a different cause, and nothing else.** `actions.ts`'s `abandon(colonyId)`
+  only checks the colony is still active, then calls
+  `defeatColony(colonyId, "abandoned")`. It deliberately does NOT require
+  the caller to have a worker or any resources — a colony stuck at zero
+  workers and insufficient protein to reproduce must still be abandonable,
+  which is the entire point of this feature existing. The client's
+  confirmation modal uses the exact wording in `public/index.html`'s
+  abandon-overlay markup — don't reword it without a reason, since it's
+  the one place a player is told what they're about to lose.
+- **Authorization against a defeated colony comes from lifecycle status
+  itself, never incidentally from "no workers exist to find."** Each of
+  `issueMoveCommand`/`issueGatherCommand`/`issueAttackCommand`
+  (`simulation.ts`) and `reproduce()`/`abandon()` (`actions.ts`) checks
+  `isColonyActive(ownerColonyId)` before any worker/resource lookup,
+  returning a `"colony defeated"` error otherwise. This matters because a
+  defeated colony's workers are deleted by `defeatColony` anyway — without
+  this explicit check, rejection would just happen to fall out of "no such
+  worker," which is the wrong invariant to depend on (e.g. it would say
+  nothing about `reproduce()`, which never looks at workers at all).
+- **Start New Colony's eligibility is "valid session + defeated current
+  colony" — never resource balance.** `startNewColony(sessionId,
+  currentColonyId)` (`sessions.ts`) guards only `isColonyActive`, rejecting
+  with `"colony still active"` if the caller's current colony hasn't been
+  defeated yet (this is what stops a client from starting unlimited
+  colonies while one remains active). On success it reuses the exact same
+  `claimColonyForSession` helper `resolveOrCreateColony` already uses
+  (factored out of what used to be inlined there) — claim-unclaimed-or-mint,
+  `saveSession` upsert, re-top-up the spare invariant — then logs
+  `colony_started` with `previousColonyId`. Abandon and Start New Colony are
+  always two separate requests; nothing auto-creates a new colony in the
+  same request that defeats the old one.
+- **The spare, unclaimed colony invariant (Crit 10) gained an
+  `status = 'active'` filter, closing a new edge case that only exists once
+  colonies can be defeated.** `getUnclaimedColonyId()`'s query now requires
+  `c.status = 'active'` — without this, a spider could kill a spare colony's
+  queen before any session claims it, and that defeated spare would
+  otherwise be silently handed out as someone's "fresh" starting colony. A
+  defeated, unclaimed spare is simply invisible to future claims now; the
+  very next claim attempt mints a brand-new one in its place, same as the
+  pre-Stage-8 "mint if none unclaimed" behavior.
+- **A fresh colony's spawn point avoids every existing colony/ruin position
+  and every live spider, via a small bounded retry — not a new world-gen
+  system.** `createColony()` gained an optional `avoid: {x,y,radius}[]`
+  parameter; `pickSpawnPosition` tries successive spiral indices
+  (`SPAWN_RETRY_ATTEMPTS = 20`) until one clears every avoidance entry,
+  falling back to the plain spiral position if none do within the bound —
+  deterministic, bounded, never an open-ended search. `sessions.ts`'s
+  `buildSpawnAvoidance()` builds this list from every colony's position
+  (active *and* defeated — a new colony must avoid landing on a ruin too)
+  plus every live spider's current position (`getSpiderPositions()`, a new
+  `simulation.ts` export). Accepted, documented tradeoff: repeated
+  abandon/restart cycles push new colonies further out on the same
+  golden-angle spiral over time, same as repeated ordinary colony creation
+  already did pre-Stage-8 — not solved here, and not worth solving with a
+  bigger system for what this project needs.
+- **The WebSocket broadcast loop must re-resolve a connection's colony on
+  every tick, not cache it once at handshake — this was a real bug, not a
+  hypothetical.** Pre-Stage-8, a connection cached `colonyId` once at
+  `wss.on("connection", ...)` from the session cookie, which was safe only
+  because a session's colony never changed for the life of a connection.
+  Stage 8 breaks that assumption: Start New Colony re-points a session's
+  `colony_id` without touching its cookie or closing any open socket, so an
+  already-open connection that still cached the old `colonyId` would
+  broadcast a now-defeated colony's state forever after a restart — no
+  reload ever showed the new colony. The fix caches `sessionId` instead
+  (immutable for the connection's life) and calls `getColonyForSession
+  (sessionId)` fresh inside `broadcastState()` every tick — one indexed
+  `sessions` lookup per connection, the same cost the per-request HTTP
+  middleware already pays. This is what makes a restart appear live over an
+  already-open socket with no reload. See `spec/realtime.test.ts`'s
+  restart-broadcast test; don't reintroduce colonyId caching at the
+  connection level without re-checking this.
+- **The world event feed is derived from the existing `action_log`, not a
+  new table or a chat system.** `log.ts`'s `getWorldEvents(limit = 6)` is a
+  bounded, indexed, newest-first query over exactly four action types
+  (`worker_died` with `cause: "spider"`, `spider_died`, `colony_defeated`,
+  `colony_started`), mapped through a small fixed set of safe public
+  message templates — never raw `detail` JSON, never a colony→session
+  mapping, never free text. Folded into `getState()`'s existing response as
+  `worldEvents`; no new endpoint or client polling cycle. Per-hit queen
+  damage is deliberately never logged to `action_log` (it would be pure
+  noise at 10Hz) — the realtime broadcast already surfaces it live without
+  a durable log entry per hit, same reasoning Stage 7 used for not logging
+  the same for workers.
+- **No PvP, reaffirmed structurally, not just by convention.** Everything
+  that made this true through Stage 7 is untouched: `issueAttackCommand`
+  still only ever resolves `creatureId` against the `creatures` Map, never
+  `workers`; queen-targeting is spider AI only, with zero code path by
+  which a player action could ever damage another player's queen. Starting
+  a new colony and abandoning one are both always resolved from the
+  caller's own server-side session — never a colony id accepted from a
+  request body — so a client can never abandon or restart someone else's
+  colony.
+- **Explicitly out of scope, same as the brief:** no PvP, no player attacks
+  on foreign queens/workers, no resource stealing, no defensive buildings,
+  no soldier caste, no queen movement, no eggs/larvae, no automated
+  defense, no spider nests, no predator reproduction, no hunger/ecology, no
+  evolution, no fog of war, no multiple worlds, no ruin looting, no ruin
+  decay.
 

@@ -68,25 +68,42 @@ co-presence.
   their own, chase it down, and attack. Workers have real, permanent health
   — injury and death are visible and final, with no revive — but can fight
   back (select and click a spider, same as hunting an aphid) or be moved to
-  safety. A killed spider leaves a protein carcass just like an aphid. Your
-  queen is never at risk, and there's still no player-vs-player combat.
+  safety. A killed spider leaves a protein carcass just like an aphid. There
+  is still no player-vs-player combat — you can never attack another
+  colony's workers or queen.
+- **Queen health, colony defeat, and restarting.** Your queen has her own
+  health bar and will slowly regenerate if left undamaged for a while, but a
+  spider that wanders or chases its way close enough can attack her directly
+  — if her health runs out, the colony is defeated: the queen becomes a
+  non-interactive ruin, every remaining worker is lost, and stored resources
+  are gone. You can also choose to abandon a struggling colony yourself at
+  any time, with an explicit confirmation, which uses the exact same
+  pipeline as a natural defeat. Either way, a defeated colony's ruin stays
+  visible in the shared world, and you can start a fresh, full-health colony
+  elsewhere in that same world whenever you're ready — the shared world
+  itself never resets, no matter how many colonies rise and fall in it.
+- **A small world event feed** surfaces a handful of recent, significant
+  events — a worker lost to a spider, a colony falling or being abandoned, a
+  new colony emerging — to everyone in the shared world, without exposing
+  any session, cookie, or per-player identity.
 - **Realtime and durable.** Every mutation is computed server-side and
   pushed to every open tab over WebSocket within about a second; everything
   that matters after a restart — colonies, workers, resources, creatures,
-  sessions — lives in SQLite, not server memory.
+  sessions, and colony lifecycle state — lives in SQLite, not server memory.
 - An in-game **"How to play" overlay**, opened from a button next to the
   title, documents the controls and a quick-start for a first-time visitor
   with no outside explanation needed.
 
 ## What's deliberately not here yet
 
-No queen damage or death, no PvP, no worker corpses (a dead worker is simply
-removed), no multiple predator species, no aphid respawning, no evolution, no
-buildings or territory, no automated colony defenses, no formal biomes or
-runtime procedural spawning (the world's content is seeded once,
-deterministically, not generated live). No art pass beyond simple
-shape/colour readability. Each of these is a layer to add on top of what's
-here, not a rewrite of it.
+No PvP (still no way to attack another player's workers or queen, ever), no
+worker corpses (a dead worker is simply removed), no ruin looting or decay,
+no multiple predator species, no aphid respawning, no evolution, no
+buildings or territory, no automated colony defenses, no soldier caste, no
+queen movement, no eggs/larvae, no formal biomes or runtime procedural
+spawning (the world's content is seeded once, deterministically, not
+generated live). No art pass beyond simple shape/colour readability. Each of
+these is a layer to add on top of what's here, not a rewrite of it.
 
 ## Stack
 
