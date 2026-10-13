@@ -10,6 +10,10 @@ import {
   GOLDEN_ANGLE,
   GROUP_DESTINATION_SPACING,
   MIN_SEPARATION,
+  QUEEN_AGGRO_RANGE,
+  QUEEN_DISENGAGE_RANGE,
+  QUEEN_REGEN_DELAY,
+  QUEEN_REGEN_RATE,
   RESOURCE_REGEN_RATES,
   SEPARATION_STRENGTH,
   SPIDER_AGGRO_RANGE,
@@ -68,9 +72,18 @@ export type MoveCommandError =
   | "no such worker"
   | "invalid coordinates"
   | "coordinates out of bounds"
-  | "worker is busy returning resources";
-export type GatherCommandError = "no such worker" | "no such resource node" | "worker is busy returning resources";
-export type AttackCommandError = "no such worker" | "no such creature" | "worker is busy returning resources";
+  | "worker is busy returning resources"
+  | "colony defeated";
+export type GatherCommandError =
+  | "no such worker"
+  | "no such resource node"
+  | "worker is busy returning resources"
+  | "colony defeated";
+export type AttackCommandError =
+  | "no such worker"
+  | "no such creature"
+  | "worker is busy returning resources"
+  | "colony defeated";
 
 // Stage 5: a neutral creature (first species: aphid). Stage 6 makes it
 // interactable: health/maxHealth are durable (see db.ts's creatures table),
@@ -94,20 +107,40 @@ interface SimCreature {
 // (see loadSimulation). targetWorkerId is looked up live in workers.get()
 // every tick, never a captured position, exactly like a worker's own
 // "attack" command looks up its creature target live. See CLAUDE.md.
+// Stage 8: chase-queen is a fourth ephemeral variant, additive alongside the
+// existing worker-targeting "chase" — never a rename. Same live-lookup
+// discipline: targetColonyId is looked up fresh in colonies.get() every
+// tick, never a captured position.
 type CreatureCommand =
   | { type: "idle"; remaining: number }
   | { type: "wander"; targetX: number; targetY: number }
-  | { type: "chase"; targetWorkerId: number; cooldownRemaining: number };
+  | { type: "chase"; targetWorkerId: number; cooldownRemaining: number }
+  | { type: "chase-queen"; targetColonyId: number; cooldownRemaining: number };
 
 const creatures = new Map<number, SimCreature>();
 
 const workers = new Map<number, SimWorker>();
 let worldBounds = { width: 0, height: 0 };
-// Queen/nest position per colony, cached once per loadSimulation() — nothing
-// ever updates colonies.queen_x/y after seeding, so this is safe to treat as
-// immutable for the life of the process. Used to resolve a `return`
-// command's target without a query on every tick.
-const nestPositions = new Map<number, { x: number; y: number }>();
+
+// Stage 8: replaces the old narrow nestPositions (Map<id,{x,y}>) with a full
+// colony cache — adds durable health/maxHealth/status, plus an ephemeral
+// timeSinceLastDamage that (like worker/creature wander state) resets on
+// every loadSimulation() rather than surviving a restart, so a just-
+// restarted queen simply waits out one more regen delay before healing,
+// never an immediate burst. Position (x, y) is still treated as immutable
+// for the life of the process — nothing ever updates queen_x/y after
+// seeding, defeat included (a ruin keeps its original spot).
+interface SimColony {
+  id: number;
+  x: number;
+  y: number;
+  health: number;
+  maxHealth: number;
+  status: "active" | "defeated";
+  timeSinceLastDamage: number;
+}
+
+const colonies = new Map<number, SimColony>();
 let dirty = false;
 
 // Loads authoritative state from SQLite — the last checkpoint, or the
@@ -121,13 +154,30 @@ export function loadSimulation(): void {
     | undefined;
   worldBounds = world ?? { width: 0, height: 0 };
 
-  nestPositions.clear();
-  const colonyRows = db.prepare("SELECT id, queen_x AS x, queen_y AS y FROM colonies").all() as {
+  colonies.clear();
+  const colonyRows = db
+    .prepare(
+      "SELECT id, queen_x AS x, queen_y AS y, status, queen_health AS health, queen_max_health AS maxHealth FROM colonies",
+    )
+    .all() as {
     id: number;
     x: number;
     y: number;
+    status: string;
+    health: number;
+    maxHealth: number;
   }[];
-  for (const row of colonyRows) nestPositions.set(row.id, { x: row.x, y: row.y });
+  for (const row of colonyRows) {
+    colonies.set(row.id, {
+      id: row.id,
+      x: row.x,
+      y: row.y,
+      health: row.health,
+      maxHealth: row.maxHealth,
+      status: row.status === "defeated" ? "defeated" : "active",
+      timeSinceLastDamage: 0,
+    });
+  }
 
   workers.clear();
   // ORDER BY id makes Map insertion order (and therefore advanceSimulation's
@@ -238,7 +288,8 @@ const WANDER_PARAMS: Record<string, { speed: number; wanderRadius: number; idleM
 // worker that wandered out and is now fleeing home is legitimate predation,
 // not ambient camping.
 function isClearOfNests(x: number, y: number, clearRadius: number): boolean {
-  for (const nest of nestPositions.values()) {
+  for (const nest of colonies.values()) {
+    if (nest.status !== "active") continue; // a ruin protects nothing
     if (Math.hypot(nest.x - x, nest.y - y) <= clearRadius) return false;
   }
   return true;
@@ -251,7 +302,8 @@ function isClearOfNests(x: number, y: number, clearRadius: number): boolean {
 function nearestViolatingNest(x: number, y: number, clearRadius: number): { x: number; y: number } | null {
   let nearest: { x: number; y: number } | null = null;
   let nearestDist = Infinity;
-  for (const nest of nestPositions.values()) {
+  for (const nest of colonies.values()) {
+    if (nest.status !== "active") continue;
     const dist = Math.hypot(nest.x - x, nest.y - y);
     if (dist <= clearRadius && dist < nearestDist) {
       nearest = nest;
@@ -359,10 +411,18 @@ function advanceWander(creature: SimCreature, dt: number): void {
 // SPIDER_AGGRO_RANGE, tie-broken explicitly by ascending worker id for
 // determinism (an explicit id comparison, not reliance on Map iteration
 // order — registerWorker() appends in call order, not id order, so only
-// a fresh loadSimulation() happens to iterate ascending). Queens are
-// structurally unreachable here: they live only in the colonies table,
-// never in the workers Map, so this scan can never select one — no guard
-// code needed.
+// a fresh loadSimulation() happens to iterate ascending).
+//
+// Stage 8: only if that scan finds no worker does a second, queen-aggro scan
+// run (§7's required priority: nearest worker first, queen only as a
+// fallback). The queen scan deliberately applies no isClearOfNests gate —
+// unlike the worker scan above, which exists to keep a spider's *ambient
+// wander* out of a nest's safe zone. A spider can only ever end up near a
+// queen in the first place by having wandered or chased its way inside that
+// zone (see isClearOfNests' doc comment) — by construction, not by a special
+// distance check, so a queen is "noticed" only as the natural result of
+// already being close, never from across the map. Ownership plays no part in
+// either scan — ownership must not affect targeting (§7).
 function advanceSpider(spider: SimCreature, dt: number): void {
   const command = spider.command;
   if (command.type === "chase") {
@@ -403,6 +463,49 @@ function advanceSpider(spider: SimCreature, dt: number): void {
     return;
   }
 
+  if (command.type === "chase-queen") {
+    // Live lookup every tick, same discipline as "chase" above. A queen that
+    // no longer exists or is no longer active (just died, or this is a stale
+    // command surviving past a defeat somehow) means drop to idle
+    // immediately — a ruin is never a valid target, and a spider never
+    // attacks a dead queen (§28).
+    const target = colonies.get(command.targetColonyId);
+    if (!target || target.status !== "active") {
+      spider.command = { type: "idle", remaining: pickIdleDuration(spider, WANDER_PARAMS.spider) };
+      return;
+    }
+
+    const dx = target.x - spider.x;
+    const dy = target.y - spider.y;
+    const dist = Math.hypot(dx, dy);
+
+    if (dist > QUEEN_DISENGAGE_RANGE) {
+      spider.command = { type: "idle", remaining: pickIdleDuration(spider, WANDER_PARAMS.spider) };
+      return;
+    }
+
+    if (dist > SPIDER_ATTACK_RANGE) {
+      const step = Math.min(SPIDER_SPEED * dt, dist - SPIDER_ATTACK_RANGE + ARRIVAL_EPSILON);
+      spider.x = clamp(spider.x + (dx / dist) * step, 0, worldBounds.width);
+      spider.y = clamp(spider.y + (dy / dist) * step, 0, worldBounds.height);
+      dirty = true;
+    }
+
+    const cooldownRemaining = Math.max(0, command.cooldownRemaining - dt);
+    if (dist <= SPIDER_ATTACK_RANGE && cooldownRemaining <= 0) {
+      applyDamageToQueen(target.id, SPIDER_ATTACK_DAMAGE, spider.id);
+      // applyDamageToQueen's defeatColony sweep may already have reset this
+      // spider to idle if that hit was lethal — only write the cooldown
+      // back if the command is still "chase-queen".
+      if (spider.command.type === "chase-queen") {
+        spider.command = { ...spider.command, cooldownRemaining: SPIDER_ATTACK_COOLDOWN };
+      }
+    } else if (spider.command.type === "chase-queen") {
+      spider.command = { ...spider.command, cooldownRemaining };
+    }
+    return;
+  }
+
   let nearest: SimWorker | null = null;
   let nearestDist = Infinity;
   for (const worker of workers.values()) {
@@ -435,6 +538,25 @@ function advanceSpider(spider: SimCreature, dt: number): void {
   }
   if (nearest) {
     spider.command = { type: "chase", targetWorkerId: nearest.id, cooldownRemaining: 0 };
+    return;
+  }
+
+  // Queen-aggro fallback (§7): only reached when no worker qualified above.
+  // Nearest-then-colony-id tie-break, deliberately no isClearOfNests gate —
+  // see the function-level doc comment.
+  let nearestQueen: SimColony | null = null;
+  let nearestQueenDist = Infinity;
+  for (const colony of colonies.values()) {
+    if (colony.status !== "active") continue;
+    const dist = Math.hypot(colony.x - spider.x, colony.y - spider.y);
+    if (dist > QUEEN_AGGRO_RANGE) continue;
+    if (dist < nearestQueenDist || (dist === nearestQueenDist && nearestQueen !== null && colony.id < nearestQueen.id)) {
+      nearestQueen = colony;
+      nearestQueenDist = dist;
+    }
+  }
+  if (nearestQueen) {
+    spider.command = { type: "chase-queen", targetColonyId: nearestQueen.id, cooldownRemaining: 0 };
     return;
   }
 
@@ -501,13 +623,23 @@ export function registerWorker(worker: {
 }
 
 // Crit 10: registers a colony created outside the simulation (createColony()
-// inserts it straight into SQLite). Without this, nestPositions wouldn't know
-// where a freshly-minted colony's queen is until the next full
-// loadSimulation() (i.e. restart) — a brand-new session's worker could never
-// resolve a "return" command target in the meantime. Mirrors registerWorker
-// above for the same reason.
-export function registerColony(colonyId: number, queenX: number, queenY: number): void {
-  nestPositions.set(colonyId, { x: queenX, y: queenY });
+// inserts it straight into SQLite). Without this, the in-memory colonies
+// cache wouldn't know where a freshly-minted colony's queen is until the
+// next full loadSimulation() (i.e. restart) — a brand-new session's worker
+// could never resolve a "return" command target in the meantime. Mirrors
+// registerWorker above for the same reason. Stage 8: every freshly minted
+// colony starts active at full health — see db.ts's createColony(), which
+// always inserts the same values this is called with.
+export function registerColony(colonyId: number, queenX: number, queenY: number, health: number, maxHealth: number): void {
+  colonies.set(colonyId, {
+    id: colonyId,
+    x: queenX,
+    y: queenY,
+    health,
+    maxHealth,
+    status: "active",
+    timeSinceLastDamage: 0,
+  });
 }
 
 export function getWorkersForColony(
@@ -517,6 +649,14 @@ export function getWorkersForColony(
     .filter((w) => w.colonyId === colonyId)
     .sort((a, b) => a.id - b.id)
     .map(({ id, x, y, carrying, health, maxHealth }) => ({ id, x, y, carrying, health, maxHealth }));
+}
+
+// Stage 8: live spider positions, for sessions.ts to fold into createColony()'s
+// `avoid` list when picking a Start New Colony spawn point — a fresh queen
+// must not spawn on top of a wandering predator. Positions only (no id/health)
+// since this is purely a collision-avoidance input, not a public API.
+export function getSpiderPositions(): { x: number; y: number }[] {
+  return [...creatures.values()].filter((c) => c.species === "spider").map(({ x, y }) => ({ x, y }));
 }
 
 // Multiplayer visibility fix: the shared world has exactly one population of
@@ -545,8 +685,9 @@ export function getWorkerCommand(workerId: number): "idle" | "move" | "gather" |
 
 // Stage 7: mirrors getWorkerCommand — the test entry point for introspecting
 // a creature's AI state (idle/wander/chase) without exposing the whole
-// CreatureCommand union on getCreaturesForWorld's public shape.
-export function getCreatureCommand(creatureId: number): "idle" | "wander" | "chase" {
+// CreatureCommand union on getCreaturesForWorld's public shape. Stage 8 adds
+// "chase-queen" as a fourth possible value, purely additive.
+export function getCreatureCommand(creatureId: number): "idle" | "wander" | "chase" | "chase-queen" {
   const creature = creatures.get(creatureId);
   if (!creature) throw new Error(`no such creature: ${creatureId}`);
   return creature.command.type;
@@ -562,6 +703,14 @@ export function getCreatureChaseTarget(creatureId: number): number | null {
   return creature.command.type === "chase" ? creature.command.targetWorkerId : null;
 }
 
+// Stage 8: the live colony id a spider is currently chasing as a queen
+// target, or null — the chase-queen counterpart to getCreatureChaseTarget.
+export function getCreatureChaseQueenTarget(creatureId: number): number | null {
+  const creature = creatures.get(creatureId);
+  if (!creature) throw new Error(`no such creature: ${creatureId}`);
+  return creature.command.type === "chase-queen" ? creature.command.targetColonyId : null;
+}
+
 // Crit 10: `ownerColonyId` is the caller's own colony, resolved server-side
 // from their session — never a client-supplied value. A worker that exists
 // but belongs to someone else's colony is reported identically to a
@@ -574,6 +723,10 @@ export function issueMoveCommand(
   y: number,
   ownerColonyId: number,
 ): MoveCommandError | null {
+  // Stage 8: checked before any worker lookup — a defeated colony has no
+  // workers left anyway, but authorization must come from lifecycle status
+  // itself, not incidentally fall out of "no workers to find" (see §23).
+  if (!isColonyActive(ownerColonyId)) return "colony defeated";
   const worker = workers.get(workerId);
   if (!worker || worker.colonyId !== ownerColonyId) return "no such worker";
   if (worker.carrying) return "worker is busy returning resources";
@@ -600,6 +753,7 @@ export function issueGatherCommand(
   resourceId: number,
   ownerColonyId: number,
 ): GatherCommandError | null {
+  if (!isColonyActive(ownerColonyId)) return "colony defeated";
   const worker = workers.get(workerId);
   if (!worker || worker.colonyId !== ownerColonyId) return "no such worker";
   if (worker.carrying) return "worker is busy returning resources";
@@ -622,6 +776,7 @@ export function issueAttackCommand(
   creatureId: number,
   ownerColonyId: number,
 ): AttackCommandError | null {
+  if (!isColonyActive(ownerColonyId)) return "colony defeated";
   const worker = workers.get(workerId);
   if (!worker || worker.colonyId !== ownerColonyId) return "no such worker";
   if (worker.carrying) return "worker is busy returning resources";
@@ -852,6 +1007,121 @@ export function applyDamageToWorker(workerId: number, amount: number, spiderId: 
   if (worker.health <= 0) killWorker(worker, "spider", spiderId);
 }
 
+export function isColonyActive(colonyId: number): boolean {
+  return colonies.get(colonyId)?.status === "active";
+}
+
+// Stage 8: state.ts's two colony-shaped reads — one colony's own full
+// in-memory snapshot (health reflects any not-yet-checkpointed regen, unlike
+// a raw SQL read) and the shared, public roster every session sees. Both
+// read from the same `colonies` Map that authorization/combat already treat
+// as authoritative, so the client's queen health bar/ruin styling can never
+// show a value that's behind what issueMoveCommand etc. are enforcing
+// against.
+export function getColonySnapshot(
+  colonyId: number,
+): { id: number; x: number; y: number; health: number; maxHealth: number; status: "active" | "defeated" } | undefined {
+  const colony = colonies.get(colonyId);
+  if (!colony) return undefined;
+  const { id, x, y, health, maxHealth, status } = colony;
+  return { id, x, y, health, maxHealth, status };
+}
+
+export function getAllColonies(): {
+  id: number;
+  x: number;
+  y: number;
+  health: number;
+  maxHealth: number;
+  status: "active" | "defeated";
+}[] {
+  return [...colonies.values()]
+    .sort((a, b) => a.id - b.id)
+    .map(({ id, x, y, health, maxHealth, status }) => ({ id, x, y, health, maxHealth, status }));
+}
+
+// Stage 8: the single authoritative, idempotent entry point for ending a
+// colony's life — reached from both a lethal queen hit (applyDamageToQueen)
+// and manual abandonment (actions.ts's abandon()). No second reset system:
+// every lifecycle-ending path funnels through here.
+//
+// The `AND status = 'active'` guard is what makes this safe to call more
+// than once (e.g. two spiders landing a simultaneous lethal hit in the same
+// tick, or a race between a lethal hit and a manual abandon): a second call
+// against an already-defeated colony updates zero rows and returns
+// immediately, before any worker/resource deletion or logging — exactly-
+// once is enforced by the database, not by caller discipline.
+export function defeatColony(colonyId: number, cause: string, creatureId?: number): void {
+  const result = db
+    .prepare("UPDATE colonies SET status = 'defeated', defeat_cause = ?, defeated_at = datetime('now') WHERE id = ? AND status = 'active'")
+    .run(cause, colonyId);
+  if (result.changes === 0) return; // already defeated — no-op
+
+  const workerIds = [...workers.values()].filter((w) => w.colonyId === colonyId).map((w) => w.id);
+  const tx = db.transaction(() => {
+    db.prepare("DELETE FROM workers WHERE colony_id = ?").run(colonyId);
+    db.prepare("DELETE FROM colony_resources WHERE colony_id = ?").run(colonyId);
+  });
+  tx();
+
+  for (const id of workerIds) workers.delete(id);
+  // Any spider chasing one of this colony's now-deleted workers, or chasing
+  // this colony's queen directly, recovers to idle rather than holding a
+  // dangling target — mirrors killWorker's own attacker-idle-sweep.
+  for (const creature of creatures.values()) {
+    const command = creature.command;
+    const chasingDeadWorker = command.type === "chase" && workerIds.includes(command.targetWorkerId);
+    const chasingThisQueen = command.type === "chase-queen" && command.targetColonyId === colonyId;
+    if (chasingDeadWorker || chasingThisQueen) {
+      creature.command = { type: "idle", remaining: pickIdleDuration(creature, WANDER_PARAMS[creature.species]) };
+    }
+  }
+
+  const colony = colonies.get(colonyId);
+  if (colony) {
+    colony.status = "defeated";
+    colony.health = 0;
+  }
+
+  dirty = true;
+  logAction(colonyId, "colony_defeated", { cause, creatureId });
+}
+
+// Mirrors applyDamageToWorker's durability discipline (synchronous write on
+// every hit) but for a colony's queen. A no-op if the colony is missing or
+// already defeated — a dead/ruined queen can never be damaged again. Lethal
+// damage hands off to defeatColony(), the single authoritative end-of-life
+// transaction.
+export function applyDamageToQueen(colonyId: number, amount: number, spiderId: number): void {
+  const colony = colonies.get(colonyId);
+  if (!colony || colony.status !== "active") return;
+  colony.health = Math.max(0, colony.health - amount);
+  colony.timeSinceLastDamage = 0;
+  db.prepare("UPDATE colonies SET queen_health = ? WHERE id = ?").run(colony.health, colony.id);
+  dirty = true;
+  if (colony.health <= 0) defeatColony(colonyId, "spider", spiderId);
+}
+
+// Stage 8: passive queen regeneration, called once per tick from
+// advanceSimulation. Mirrors the project's existing position-vs-combat
+// durability split: damage is synchronous-write (above), but these small
+// per-tick increments are NOT written to SQLite here — they ride along in
+// the periodic checkpointSimulation() flush instead, same as worker/creature
+// position. Losing at most one checkpoint interval of regen progress on an
+// ungraceful crash is harmless.
+function advanceQueenRegen(dt: number): void {
+  for (const colony of colonies.values()) {
+    if (colony.status !== "active" || colony.health >= colony.maxHealth) continue;
+    colony.timeSinceLastDamage += dt;
+    if (colony.timeSinceLastDamage < QUEEN_REGEN_DELAY) continue;
+    const next = Math.min(colony.maxHealth, colony.health + QUEEN_REGEN_RATE * dt);
+    if (next !== colony.health) {
+      colony.health = next;
+      dirty = true;
+    }
+  }
+}
+
 // Stage 6: chase + attack resolution. Unlike move/gather/return, "in range"
 // here is a continuous check, never a one-shot arrival — the target keeps
 // moving and the attack never "completes" — so this gets its own branch
@@ -1009,7 +1279,7 @@ function resolveTarget(
     return { x: command.lastKnownX, y: command.lastKnownY, arrivalRange: GATHER_RANGE };
   }
   // command.type === "return"
-  const nest = nestPositions.get(worker.colonyId)!;
+  const nest = colonies.get(worker.colonyId)!;
   return { x: nest.x, y: nest.y, arrivalRange: DEPOSIT_RANGE };
 }
 
@@ -1060,6 +1330,7 @@ function resolveArrival(worker: SimWorker, command: WorkerCommand): void {
 export function advanceSimulation(dt: number): void {
   advanceResourceRegen(dt);
   advanceCreatures(dt);
+  advanceQueenRegen(dt);
 
   const grid = buildSpatialGrid();
 
@@ -1151,11 +1422,18 @@ export function consumeDirty(): boolean {
 export function checkpointSimulation(): void {
   const update = db.prepare("UPDATE workers SET x = ?, y = ? WHERE id = ?");
   const updateCreature = db.prepare("UPDATE creatures SET x = ?, y = ? WHERE id = ?");
-  const tx = db.transaction((workerList: SimWorker[], creatureList: SimCreature[]) => {
+  // Stage 8: queen health's passive regen deliberately isn't written on
+  // every tick (see advanceQueenRegen) — it rides along in this existing
+  // periodic flush instead, same batched-write treatment position already
+  // gets. Combat damage (applyDamageToQueen) stays its own synchronous
+  // write, unaffected by this.
+  const updateColonyHealth = db.prepare("UPDATE colonies SET queen_health = ? WHERE id = ?");
+  const tx = db.transaction((workerList: SimWorker[], creatureList: SimCreature[], colonyList: SimColony[]) => {
     for (const w of workerList) update.run(w.x, w.y, w.id);
     for (const c of creatureList) updateCreature.run(c.x, c.y, c.id);
+    for (const col of colonyList) updateColonyHealth.run(col.health, col.id);
   });
-  tx([...workers.values()], [...creatures.values()]);
+  tx([...workers.values()], [...creatures.values()], [...colonies.values()].filter((c) => c.status === "active"));
 }
 
 loadSimulation();

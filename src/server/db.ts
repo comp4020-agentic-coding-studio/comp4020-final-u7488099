@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import {
   APHID_SEED_POSITIONS,
   colonySpiralPosition,
+  QUEEN_MAX_HEALTH,
   RESOURCE_NODES,
   RESOURCE_TYPES,
   SPECIES_MAX_HEALTH,
@@ -42,6 +43,7 @@ migrateSugarNodesFinite();
 migrateResourceNodeKind();
 migrateCreatureHealth();
 migrateWorkerHealth();
+migrateColonyLifecycle();
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS worlds (
@@ -51,11 +53,21 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  -- Stage 8: colonies gain a durable lifecycle. status/queen_health/
+  -- queen_max_health are nullable so a fresh ALTER on an already-deployed DB
+  -- is cheap; backfillColonyLifecycle() fills them in immediately.
+  -- defeat_cause/defeated_at stay NULL for every colony that's never been
+  -- defeated. See CLAUDE.md.
   CREATE TABLE IF NOT EXISTS colonies (
     id INTEGER PRIMARY KEY,
     world_id INTEGER NOT NULL REFERENCES worlds(id),
     queen_x REAL NOT NULL,
     queen_y REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    queen_health REAL,
+    queen_max_health REAL,
+    defeat_cause TEXT,
+    defeated_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -146,6 +158,7 @@ seedCreaturesIfEmpty();
 seedSpidersIfMissing();
 backfillCreatureHealth();
 backfillWorkerHealth();
+backfillColonyLifecycle();
 
 // Pre-Stage-1 deployments have a `colonies` table from the Crit 8/9 schema:
 // integer grid coordinates, a flat `protein` column, no `world_id`. That
@@ -252,6 +265,40 @@ function backfillWorkerHealth(): void {
   );
 }
 
+// Stage 8: colonies gain a durable lifecycle (status/queen health/defeat
+// info). Nullable so the ALTER is cheap; backfillColonyLifecycle()
+// immediately fills every pre-existing row via QUEEN_MAX_HEALTH and
+// status='active' (every colony that exists before this migration ships is,
+// by definition, still an ordinary undefeated colony). Mirrors
+// migrateWorkerHealth()'s guard pattern exactly. Note: SQLite can't
+// retroactively apply a NOT NULL/DEFAULT constraint to an already-existing
+// column via ALTER TABLE, so `status` stays nullable here even though the
+// CREATE TABLE above declares it NOT NULL DEFAULT 'active' for fresh DBs —
+// the backfill below is what actually guarantees no row is ever left with a
+// NULL status in practice.
+function migrateColonyLifecycle(): void {
+  const columns = db.prepare("PRAGMA table_info(colonies)").all() as { name: string }[];
+  if (columns.length === 0) return; // table doesn't exist yet; CREATE TABLE below defines it with the columns
+  if (columns.some((c) => c.name === "status")) return;
+  db.exec(`
+    ALTER TABLE colonies ADD COLUMN status TEXT;
+    ALTER TABLE colonies ADD COLUMN queen_health REAL;
+    ALTER TABLE colonies ADD COLUMN queen_max_health REAL;
+    ALTER TABLE colonies ADD COLUMN defeat_cause TEXT;
+    ALTER TABLE colonies ADD COLUMN defeated_at TEXT;
+  `);
+}
+
+// Idempotent: only rows with status IS NULL match (brand-new rows from
+// seedIfEmpty/createColony already insert status/health directly). Runs
+// every boot, mirroring backfillWorkerHealth().
+function backfillColonyLifecycle(): void {
+  db.prepare("UPDATE colonies SET status = 'active', queen_health = ?, queen_max_health = ? WHERE status IS NULL").run(
+    QUEEN_MAX_HEALTH,
+    QUEEN_MAX_HEALTH,
+  );
+}
+
 // Pre-Crit-10 this was "the" one global colony. It still seeds exactly the
 // same way (same world-centre queen position, same 3 starting workers) — but
 // as of Crit 10 it starts out unowned, and becomes whichever session asks
@@ -272,8 +319,10 @@ function seedIfEmpty(): void {
   const queenX = WORLD.width / 2;
   const queenY = WORLD.height / 2;
   const { lastInsertRowid: colonyRowId } = db
-    .prepare("INSERT INTO colonies (world_id, queen_x, queen_y) VALUES (?, ?, ?)")
-    .run(worldId, queenX, queenY);
+    .prepare(
+      "INSERT INTO colonies (world_id, queen_x, queen_y, status, queen_health, queen_max_health) VALUES (?, ?, ?, 'active', ?, ?)",
+    )
+    .run(worldId, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
   const colonyId = Number(colonyRowId);
 
   seedColonyResources(colonyId);
@@ -321,9 +370,17 @@ function spawnStartingWorkers(
 // it. createColony()'s golden-angle index (COUNT(*) FROM colonies) already
 // accounts for this colony existing, so the first *freshly minted* colony
 // correctly lands at spiral index 1, not 0.
+// Stage 8: the `status = 'active'` filter closes an edge case that didn't
+// exist before colonies could be defeated — a never-claimed spare colony
+// killed by a spider before any session claims it must not be handed out as
+// someone's "fresh" colony. A defeated, unclaimed spare is simply invisible
+// here; the very next claim attempt mints a brand-new one in its place (see
+// sessions.ts), same as today's "mint if none unclaimed" behavior.
 export function getUnclaimedColonyId(): number | undefined {
   const row = db
-    .prepare("SELECT c.id AS id FROM colonies c LEFT JOIN sessions s ON s.colony_id = c.id WHERE s.colony_id IS NULL LIMIT 1")
+    .prepare(
+      "SELECT c.id AS id FROM colonies c LEFT JOIN sessions s ON s.colony_id = c.id WHERE s.colony_id IS NULL AND c.status = 'active' LIMIT 1",
+    )
     .get() as { id: number } | undefined;
   return row?.id;
 }
@@ -399,6 +456,7 @@ export function resetForTests(): void {
   seedCreaturesIfEmpty();
   backfillCreatureHealth();
   backfillWorkerHealth();
+  backfillColonyLifecycle();
 }
 
 // Stage 6b: the production-safe, intentionally-invoked counterpart to
@@ -441,6 +499,7 @@ export function resetProductionWorld(): {
     seedCreaturesIfEmpty();
     backfillCreatureHealth();
     backfillWorkerHealth();
+    backfillColonyLifecycle();
   });
   tx();
 
@@ -467,7 +526,24 @@ export function resetProductionWorld(): {
 // of stacking — colony index 0 (the very first colony any world ever seeds)
 // lands at radius 0, exactly (width/2, height/2), the pre-Crit-10
 // single-colony seed position, unchanged.
-export function createColony(): {
+// Stage 8: `avoid` lets a caller (sessions.ts's Start New Colony path) keep a
+// fresh spawn off every existing colony/ruin position and every live spider —
+// a bounded retry over successive spiral indices, never an open-ended search
+// (per the brief's "no full procedural world system"). Falls back to the
+// plain spiral position for `index` if nothing clears within the bound, so
+// colony creation can never fail outright over a crowded world.
+const SPAWN_RETRY_ATTEMPTS = 20;
+
+function pickSpawnPosition(index: number, avoid: { x: number; y: number; radius: number }[]): { x: number; y: number } {
+  for (let attempt = 0; attempt < SPAWN_RETRY_ATTEMPTS; attempt++) {
+    const candidate = colonySpiralPosition(index + attempt);
+    const blocked = avoid.some((a) => Math.hypot(candidate.x - a.x, candidate.y - a.y) < a.radius);
+    if (!blocked) return candidate;
+  }
+  return colonySpiralPosition(index);
+}
+
+export function createColony(avoid: { x: number; y: number; radius: number }[] = []): {
   colonyId: number;
   queenX: number;
   queenY: number;
@@ -477,14 +553,16 @@ export function createColony(): {
   if (!world) throw new Error("no world seeded");
 
   const { n: index } = db.prepare("SELECT COUNT(*) AS n FROM colonies").get() as { n: number };
-  const { x: queenX, y: queenY } = colonySpiralPosition(index);
+  const { x: queenX, y: queenY } = pickSpawnPosition(index, avoid);
 
   let colonyId = 0;
   let workers: { id: number; x: number; y: number; health: number; maxHealth: number }[] = [];
   const tx = db.transaction(() => {
     const colonyInfo = db
-      .prepare("INSERT INTO colonies (world_id, queen_x, queen_y) VALUES (?, ?, ?)")
-      .run(world.id, queenX, queenY);
+      .prepare(
+        "INSERT INTO colonies (world_id, queen_x, queen_y, status, queen_health, queen_max_health) VALUES (?, ?, ?, 'active', ?, ?)",
+      )
+      .run(world.id, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
     colonyId = Number(colonyInfo.lastInsertRowid);
 
     seedColonyResources(colonyId);
@@ -504,6 +582,14 @@ export function getColonyForSession(sessionId: string): number | undefined {
   return row?.colonyId;
 }
 
+// Stage 8: an upsert, not a plain INSERT — Start New Colony re-points an
+// existing session's single row to a fresh colony id (see sessions.ts). The
+// old colony row is never deleted, so it persists unreferenced as a ruin;
+// this is the entire "a session owns a sequence of colonies over time"
+// design — one current colony per session, no separate history table.
 export function saveSession(sessionId: string, colonyId: number): void {
-  db.prepare("INSERT INTO sessions (id, colony_id) VALUES (?, ?)").run(sessionId, colonyId);
+  db.prepare("INSERT INTO sessions (id, colony_id) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET colony_id = excluded.colony_id").run(
+    sessionId,
+    colonyId,
+  );
 }

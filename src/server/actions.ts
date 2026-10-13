@@ -1,10 +1,16 @@
 import { REPRODUCE_COST, WORKER_MAX_HEALTH } from "./balance.ts";
 import { db } from "./db.ts";
-import { registerWorker } from "./simulation.ts";
+import { defeatColony, isColonyActive, registerWorker } from "./simulation.ts";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
 
 export function reproduce(colonyId: number): ActionResult {
+  // Stage 8: a defeated colony has no queen left to reproduce from — checked
+  // by lifecycle status itself, not incidentally via "no colony_resources
+  // row" (the row is deleted on defeat, but that's not what's being tested
+  // here; see §23).
+  if (!isColonyActive(colonyId)) return { ok: false, error: "colony defeated" };
+
   const colony = db
     .prepare("SELECT queen_x AS queenX, queen_y AS queenY FROM colonies WHERE id = ?")
     .get(colonyId) as { queenX: number; queenY: number } | undefined;
@@ -37,5 +43,17 @@ export function reproduce(colonyId: number): ActionResult {
     health: WORKER_MAX_HEALTH,
     maxHealth: WORKER_MAX_HEALTH,
   });
+  return { ok: true };
+}
+
+// Stage 8: the manual, player-initiated counterpart to a lethal spider hit.
+// Deliberately calls the exact same authoritative defeatColony() transaction
+// a queen's death uses — no second reset system (§20) — differing only in
+// the cause recorded. Does NOT require the player to have a worker or any
+// resources: a colony soft-locked at zero workers/protein must still be
+// abandonable, which is the entire point of this feature (§36).
+export function abandon(colonyId: number): ActionResult {
+  if (!isColonyActive(colonyId)) return { ok: false, error: "colony already defeated" };
+  defeatColony(colonyId, "abandoned");
   return { ok: true };
 }

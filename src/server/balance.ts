@@ -371,3 +371,25 @@ export const SPIDER_DISENGAGE_RANGE = 300;
 export const SPIDER_ATTACK_RANGE = 30;
 export const SPIDER_ATTACK_DAMAGE = 10;
 export const SPIDER_ATTACK_COOLDOWN = 1;
+
+// Stage 8: the queen gains her own durable health pool, following the exact
+// precedent WORKER_MAX_HEALTH set. 200 means a lone spider (10 dmg/hit,
+// 1s cooldown) takes 20s of uninterrupted attack to kill an undefended
+// queen — long enough that a player who notices has a real chance to
+// intervene, but short enough that an abandoned colony is genuinely at risk.
+export const QUEEN_MAX_HEALTH = 200;
+
+// A queen stops taking damage and, after a delay with no further hits,
+// begins slowly regenerating — same idle/cooldown-driven feel as combat
+// elsewhere, not a new mechanic. Own named constants (not reused from
+// worker/spider ones) so queen tuning can move independently later.
+export const QUEEN_REGEN_DELAY = 10;
+export const QUEEN_REGEN_RATE = 2;
+
+// A spider only ever notices a queen after wandering/chasing its way
+// inside this range (see simulation.ts's advanceSpider queen-aggro scan
+// for why no nest-exclusion gate applies here). Own named constants,
+// distinct from SPIDER_AGGRO_RANGE/SPIDER_DISENGAGE_RANGE, even though
+// initially equal in value.
+export const QUEEN_AGGRO_RANGE = 200;
+export const QUEEN_DISENGAGE_RANGE = 300;
