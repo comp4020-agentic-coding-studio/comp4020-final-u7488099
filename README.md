@@ -93,17 +93,36 @@ co-presence.
 - An in-game **"How to play" overlay**, opened from a button next to the
   title, documents the controls and a quick-start for a first-time visitor
   with no outside explanation needed.
+- **Evolution and colony specialisation.** At three peak-population
+  milestones a colony reaches by growing (5, 10, and 20 workers, ever, even
+  if some are later lost), the player picks one permanent trait per
+  milestone from three branches — Foraging, Survival, Brood — mixable
+  freely with no prerequisites and no way to unpick a choice later. Traits
+  durably change how that colony's workers gather, move, fight, and
+  reproduce; choosing one takes effect immediately for every worker the
+  colony already has, not just future ones. Previously every colony that
+  grew to the same size played identically; now two colonies that grew the
+  same way can end up meaningfully different, by player choice, and that
+  difference persists for as long as the colony does. A colony's evolution
+  is part of its permanent history: if it's defeated, its ruin remembers
+  everything it ever chose and the peak size it reached, visible to everyone
+  in the shared world, while a fresh colony started afterward begins with a
+  genuinely blank slate. This is Juul's *emergence* made concrete — the same
+  small, fixed set of rules producing colonies that diverge from each other
+  in ways nobody scripted, purely from the choices players make as they
+  grow.
 
 ## What's deliberately not here yet
 
 No PvP (still no way to attack another player's workers or queen, ever), no
 worker corpses (a dead worker is simply removed), no ruin looting or decay,
-no multiple predator species, no aphid respawning, no evolution, no
-buildings or territory, no automated colony defenses, no soldier caste, no
-queen movement, no eggs/larvae, no formal biomes or runtime procedural
-spawning (the world's content is seeded once, deterministically, not
-generated live). No art pass beyond simple shape/colour readability. Each of
-these is a layer to add on top of what's here, not a rewrite of it.
+no multiple predator species, no aphid respawning, no respec or un-evolving,
+no soldier/scout castes or genetics, no buildings or territory, no automated
+colony defenses, no queen movement, no eggs/larvae, no formal biomes or
+runtime procedural spawning (the world's content is seeded once,
+deterministically, not generated live). No art pass beyond simple
+shape/colour readability, and no balancing pass on evolution's percentages.
+Each of these is a layer to add on top of what's here, not a rewrite of it.
 
 ## Stack
 

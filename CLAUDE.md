@@ -1330,3 +1330,172 @@ as a visible, non-interactable ruin.
   evolution, no fog of war, no multiple worlds, no ruin looting, no ruin
   decay.
 
+## Stage 9: evolution & colony specialisation
+
+Stage 8 made colony growth survivable but still purely numerical — gather,
+reproduce, do the same things with more workers, with no strategic
+differentiation between colonies regardless of how they grew or how long
+they've survived. Stage 9 attaches a permanent, player-chosen identity to a
+colony's *lineage*, not its session: at three peak-population milestones
+(5/10/20 workers), the player picks one of three permanent traits per tier
+(Foraging/Survival/Brood), freely mixable across tiers with no
+prerequisites and no respec, which durably modify existing mechanics —
+carry yield, gather timing, movement speed, worker max health, attack
+damage, and reproduction cost. Still no PvP, no production reset, and no
+new creature/building/caste system.
+
+- **Evolution belongs to the colony's lineage, not the session or the
+  player.** `peak_population` and `evolution_tier1/2/3` live on the
+  `colonies` row itself, the exact same place Stage 8's lifecycle columns
+  live, with the exact same migration shape (`migrateColonyEvolution()`/
+  `backfillColonyEvolution()` mirror `migrateColonyLifecycle()`/
+  `backfillColonyLifecycle()` precisely — guarded `ALTER TABLE`, no-op if
+  already present). A session re-pointing to a new colony (Start New
+  Colony) gets none of the old colony's evolution, because nothing ever
+  copies these columns between colony rows — the same "no inheritance path
+  exists because no code path copies it" argument Stage 8 already
+  established for queen health/status.
+- **Peak population is monotonic and is the only eligibility signal —
+  current population never relocks a tier.** `maybeUpdatePeakPopulation()`
+  (`simulation.ts`) only ever raises `peak_population`, called from
+  `reproduce()` right after a new worker is registered (the only path that
+  increases a colony's worker count). Losing workers to a spider never
+  lowers it, and `selectEvolution()`'s eligibility check
+  (`peak_population >= tierThreshold(tier)`) reads this durable counter,
+  never `getWorkersForColony(id).length`. Backfill for colonies that
+  predate this stage is a conservative floor — current living worker count,
+  or `1` for an already-defeated ruin with zero workers — never a fabricated
+  higher number.
+- **Exactly one selection per tier, enforced by the database, not by caller
+  discipline — the same idempotency shape `defeatColony()` already
+  established.** `applyEvolutionSelection()`'s guard,
+  `UPDATE colonies SET evolution_tierN = ? WHERE id = ? AND evolution_tierN
+  IS NULL`, affects zero rows on a second call (a lost race, or a tier
+  that's simply already chosen), so `selectEvolution()`'s cheap pre-checks
+  (tier validity, choice validity, colony active, peak population,
+  not-already-chosen) are just a fast, friendly error path in front of a
+  real guarantee that holds even under a genuine concurrent race — see
+  `spec/evolution.test.ts`'s `Promise.all` double-POST test, which resolves
+  to exactly one `[200, 400]` outcome. There is no prerequisite between
+  tiers and no respec path anywhere in the code — a colony can go straight
+  to Tier II Survival without ever having picked a Tier I trait at all.
+- **One central modifier function, not scattered `if evolution === ...`
+  checks.** `src/server/evolution.ts`'s `getEvolutionModifiers(selections)`
+  is the single place every one of the seven derived values (carry yield,
+  gather duration, carrying move-speed multiplier, chase-speed multiplier,
+  max health, attack damage, reproduce cost) is computed from a colony's
+  three tier strings. Every call site — gather claim, movement, combat,
+  reproduction — calls this once and reads the field it needs, rather than
+  re-deriving branch logic locally. Every selected trait affects *all* of
+  that colony's existing and future workers immediately — there's no
+  per-worker evolution state, only a per-colony one read fresh at the point
+  of use.
+- **Brood's discount is tier-effective, not cumulative.** Picking Brood at
+  multiple tiers doesn't stack — `getEvolutionModifiers` scans
+  `[tier3, tier2, tier1]` in that order and applies only the highest
+  selected Brood tier's multiplier (50%/35%/20% off at Tier III/II/I
+  respectively), defaulting to no discount if Brood was never chosen at
+  any tier. "Foraging I + Brood II" gets exactly Tier II's discount, never
+  Tier I's discount plus Tier II's.
+- **Survival I retroactively converts every living worker's health by
+  percentage, not by a flat heal or a silent mismatch against the new
+  max.** This is genuinely new logic with no prior precedent in this
+  codebase — every other max-health write (worker creation, `reproduce()`)
+  sets `health = maxHealth` at creation time; nothing before this stage had
+  ever rescaled an existing live entity's max health. On selecting Tier 1
+  Survival, every living worker of that colony gets
+  `newHealth = round((health / oldMaxHealth) * newMaxHealth)`, written to
+  both SQLite and the in-memory cache inside the same transaction as the
+  selection itself — an injured worker stays proportionally injured after
+  the upgrade, never fully healed and never left stale relative to a max
+  that just changed under it. Damage/death logic (`applyDamageToWorker`,
+  `killWorker`) needed zero changes — they already operate on whatever
+  `health`/`maxHealth` currently is.
+- **Foraging II required a genuinely new mechanic, not a constant
+  tweak — gathering had no duration to shorten.** Every gather before this
+  stage was instantaneous on arrival: `attemptGatherClaim()` fired the
+  instant a worker reached `GATHER_RANGE`. "Gather 30% faster" has nothing
+  to speed up against an instant action, so this stage introduces the
+  smallest meaningful duration mechanic: a short, universal
+  `GATHER_DURATION` (1 second) channel between arrival and claim, applying
+  to every worker regardless of evolution, that Foraging II shortens via
+  division by its speed multiplier. This is a plain in-memory countdown on
+  the worker's existing gather command object (`channelRemaining`), the
+  same idiom the attack command's `cooldownRemaining` already used — no new
+  column, no new persistence, and it's deliberately small enough not to
+  disrupt the generous timeouts the existing gather-round-trip tests
+  already relied on (though those timeouts were still lengthened — see
+  below).
+- **Foraging III and Survival III are per-tick dynamic multipliers on
+  `WORKER_SPEED`, never a stored per-worker speed stat.** Foraging III's
+  carry-speed bonus applies only while `worker.carrying !== null` during
+  the `return` movement step; Survival III's chase-speed bonus applies only
+  while the worker's command is `attack`. The pre-existing invariant that a
+  carrying worker can never also be mid-attack (Stage 6's
+  `issueAttackCommand` guard) means these two bonuses can never stack —
+  confirmed preserved, not new code.
+- **No PvP, reaffirmed structurally under two new combat-adjacent
+  modifiers.** Survival II's attack-damage bonus and Survival III's
+  chase-speed bonus are both applied as numeric substitutions purely within
+  `handleAttackCommand()`'s existing path, which resolves `creatureId`
+  only against the `creatures` Map — never `workers` — exactly as every
+  prior stage's no-PvP guarantee already relied on. Neither modifier
+  changes what a worker can target, only how hard/fast it fights whatever
+  it was already allowed to fight.
+- **`POST /api/evolve` follows the exact authorization shape every other
+  mutating route already uses.** Body is `{ tier, choice }` only;
+  `colonyId` is resolved exclusively from `req.colonyId` (session
+  middleware), never trusted from the request body, matching
+  `/api/reproduce`, `/api/abandon`, `/api/start-new-colony`, and every
+  `/api/command/*` route. A forged `colonyId` in the body can never select
+  evolution on someone else's colony — confirmed both by code reading and
+  by `spec/evolution.test.ts`'s forged-id test.
+- **Ruins retain their evolution history forever, affecting nothing.**
+  `defeatColony()` was given zero new code for this stage — it already
+  never touches `peak_population`/`evolution_tier*`, so a defeated colony's
+  final peak population and every trait it ever chose simply remain on its
+  row, visible in the public roster (`colonies[].peakPopulation`,
+  `evolutionTier1/2/3`, `defeatCause`) exactly like Stage 8's `status`
+  already was. A replacement colony via Start New Colony gets a genuinely
+  blank lineage — `createColony()` explicitly sets
+  `peak_population = STARTING_WORKER_COUNT` and leaves all three tier
+  columns `NULL` on every fresh INSERT, the same explicit-not-backfill-only
+  discipline every other lifecycle column already follows.
+- **No hover/tooltip/inspection system was built for ruin history — the
+  existing public roster already carries enough to list it.** The client's
+  Evolution panel's "Other colonies" section is a plain list driven by the
+  same `colonies` array Stage 8 already sent, now carrying
+  `population`/`peakPopulation`/`evolutionTier1/2/3`/`defeatCause` — no new
+  canvas hit-testing or rendering machinery, per the brief's explicit
+  warning against building a complex inspection system for this.
+- **Evolution availability is surfaced non-blockingly — never an interrupt,
+  never auto-opened.** A small badge appears on the existing modal-button
+  Evolution control (same overlay idiom as Help: `z-index: 10`,
+  Escape/backdrop-dismissible, never the urgent `z-index: 20` tier
+  Abandon/Defeat use) when at least one tier is unlocked and unchosen,
+  computed client-side from the mirrored threshold constants. The player
+  opens it whenever they choose; nothing about reaching a milestone pauses
+  or redirects play.
+- **Existing timing-sensitive tests needed longer deadlines, not weaker
+  assertions, because of the new gather channel.** `GATHER_DURATION` adds
+  real, fixed latency to every gather round trip on top of travel time —
+  `spec/colony.test.ts`'s idle-worker-wait and busy-worker polling
+  deadlines were lengthened (15s→30s) to accommodate this, with the reason
+  stated inline as a comment; no assertion's actual expected outcome
+  changed.
+- **Performance was re-measured at a larger scale, not assumed safe by
+  extension.** A throwaway script (not committed) grew 30 colonies to 20
+  peak population each via real `reproduce()` calls, gave every one of them
+  a distinct evolution build (pure Foraging/Survival/Brood, a mixed build,
+  and an unevolved control), put all 690 resulting workers into active
+  gather/attack commands, and measured `advanceSimulation()` at
+  ~0.72ms/tick average over 500 ticks — still roughly 139x headroom under
+  the 100ms (10Hz) tick budget. This is higher than Stage 8's measured
+  ~0.19ms/tick (93 workers, 30 colonies), consistent with roughly 7.4x more
+  workers doing real per-tick work (channel countdowns, evolved movement/
+  combat multipliers included), not a regression.
+- **Explicitly out of scope, same as the brief:** no respec/un-evolve, no
+  soldier/scout castes, no genetics/breeding, no evolution-driven PvP, no
+  balancing pass on the provisional percentages, no new creature or
+  building types, no production world reset.
+
