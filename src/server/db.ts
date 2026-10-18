@@ -44,6 +44,7 @@ migrateResourceNodeKind();
 migrateCreatureHealth();
 migrateWorkerHealth();
 migrateColonyLifecycle();
+migrateColonyEvolution();
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS worlds (
@@ -58,6 +59,12 @@ db.exec(`
   -- is cheap; backfillColonyLifecycle() fills them in immediately.
   -- defeat_cause/defeated_at stay NULL for every colony that's never been
   -- defeated. See CLAUDE.md.
+  -- Stage 9: peak_population and the three evolution_tier columns belong to
+  -- the colony LINEAGE, not the session — a ruin keeps them forever, and a
+  -- replacement colony via Start New Colony never inherits them (see
+  -- createColony()). evolution_tierN is one of 'foraging'/'survival'/'brood'
+  -- or NULL ("no selection made for this tier yet"); nullable for the same
+  -- cheap-ALTER reason as every other lifecycle column here.
   CREATE TABLE IF NOT EXISTS colonies (
     id INTEGER PRIMARY KEY,
     world_id INTEGER NOT NULL REFERENCES worlds(id),
@@ -68,6 +75,10 @@ db.exec(`
     queen_max_health REAL,
     defeat_cause TEXT,
     defeated_at TEXT,
+    peak_population INTEGER,
+    evolution_tier1 TEXT,
+    evolution_tier2 TEXT,
+    evolution_tier3 TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -159,6 +170,7 @@ seedSpidersIfMissing();
 backfillCreatureHealth();
 backfillWorkerHealth();
 backfillColonyLifecycle();
+backfillColonyEvolution();
 
 // Pre-Stage-1 deployments have a `colonies` table from the Crit 8/9 schema:
 // integer grid coordinates, a flat `protein` column, no `world_id`. That
@@ -299,6 +311,43 @@ function backfillColonyLifecycle(): void {
   );
 }
 
+// Stage 9: colonies gain peak_population + three evolution tier columns.
+// Nullable so the ALTER is cheap; backfillColonyEvolution() immediately
+// fills peak_population for every pre-existing row. Mirrors
+// migrateColonyLifecycle()'s guard pattern exactly.
+function migrateColonyEvolution(): void {
+  const columns = db.prepare("PRAGMA table_info(colonies)").all() as { name: string }[];
+  if (columns.length === 0) return; // table doesn't exist yet; CREATE TABLE below defines it with the columns
+  if (columns.some((c) => c.name === "peak_population")) return;
+  db.exec(`
+    ALTER TABLE colonies ADD COLUMN peak_population INTEGER;
+    ALTER TABLE colonies ADD COLUMN evolution_tier1 TEXT;
+    ALTER TABLE colonies ADD COLUMN evolution_tier2 TEXT;
+    ALTER TABLE colonies ADD COLUMN evolution_tier3 TEXT;
+  `);
+}
+
+// Idempotent: only rows with peak_population IS NULL match (brand-new rows
+// from seedIfEmpty/createColony already insert peak_population directly).
+// Backfills a safe, conservative floor — a colony's true historical peak may
+// have been higher than its current living-worker count, but nothing
+// recorded that before this migration existed, and the brief (§3/§32)
+// explicitly calls for a conservative floor over fabricated history. An
+// already-defeated colony has zero living workers (defeatColony() deletes
+// them), so its floor is simply 1 — it did, at minimum, once have its queen
+// and starting workers. evolution_tier1/2/3 are deliberately left NULL here
+// (not backfilled to anything): "no selection ever made" is the only honest
+// value for a colony that existed before evolution did.
+function backfillColonyEvolution(): void {
+  const colonyIds = db.prepare("SELECT id FROM colonies WHERE peak_population IS NULL").all() as { id: number }[];
+  const countWorkers = db.prepare("SELECT COUNT(*) AS n FROM workers WHERE colony_id = ?");
+  const setPeak = db.prepare("UPDATE colonies SET peak_population = ? WHERE id = ?");
+  for (const { id } of colonyIds) {
+    const { n } = countWorkers.get(id) as { n: number };
+    setPeak.run(Math.max(n, 1), id);
+  }
+}
+
 // Pre-Crit-10 this was "the" one global colony. It still seeds exactly the
 // same way (same world-centre queen position, same 3 starting workers) — but
 // as of Crit 10 it starts out unowned, and becomes whichever session asks
@@ -320,9 +369,9 @@ function seedIfEmpty(): void {
   const queenY = WORLD.height / 2;
   const { lastInsertRowid: colonyRowId } = db
     .prepare(
-      "INSERT INTO colonies (world_id, queen_x, queen_y, status, queen_health, queen_max_health) VALUES (?, ?, ?, 'active', ?, ?)",
+      "INSERT INTO colonies (world_id, queen_x, queen_y, status, queen_health, queen_max_health, peak_population) VALUES (?, ?, ?, 'active', ?, ?, ?)",
     )
-    .run(worldId, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
+    .run(worldId, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, STARTING_WORKERS);
   const colonyId = Number(colonyRowId);
 
   seedColonyResources(colonyId);
@@ -457,6 +506,7 @@ export function resetForTests(): void {
   backfillCreatureHealth();
   backfillWorkerHealth();
   backfillColonyLifecycle();
+  backfillColonyEvolution();
 }
 
 // Stage 6b: the production-safe, intentionally-invoked counterpart to
@@ -500,6 +550,7 @@ export function resetProductionWorld(): {
     backfillCreatureHealth();
     backfillWorkerHealth();
     backfillColonyLifecycle();
+    backfillColonyEvolution();
   });
   tx();
 
@@ -560,9 +611,9 @@ export function createColony(avoid: { x: number; y: number; radius: number }[] =
   const tx = db.transaction(() => {
     const colonyInfo = db
       .prepare(
-        "INSERT INTO colonies (world_id, queen_x, queen_y, status, queen_health, queen_max_health) VALUES (?, ?, ?, 'active', ?, ?)",
+        "INSERT INTO colonies (world_id, queen_x, queen_y, status, queen_health, queen_max_health, peak_population) VALUES (?, ?, ?, 'active', ?, ?, ?)",
       )
-      .run(world.id, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
+      .run(world.id, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, STARTING_WORKERS);
     colonyId = Number(colonyInfo.lastInsertRowid);
 
     seedColonyResources(colonyId);

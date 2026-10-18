@@ -372,6 +372,48 @@ export const SPIDER_ATTACK_RANGE = 30;
 export const SPIDER_ATTACK_DAMAGE = 10;
 export const SPIDER_ATTACK_COOLDOWN = 1;
 
+// Stage 9: evolution milestones are gated on a colony's PEAK population
+// (highest living-worker count its lineage has ever reached), never current
+// population — see CLAUDE.md's Stage 9 section. Exactly 3 tiers, thresholds
+// are explicit balance placeholders, not the result of any tuning pass.
+export const EVOLUTION_TIER_1_POPULATION = 5;
+export const EVOLUTION_TIER_2_POPULATION = 10;
+export const EVOLUTION_TIER_3_POPULATION = 20;
+
+// Stage 9: nine permanent, freely-mixable traits across three branches
+// (Foraging/Survival/Brood) and three tiers — every multiplier below is
+// provisional per the brief (§4); no balancing pass has been done.
+export const FORAGING_I_CARRY_MULTIPLIER = 1.5; // Strong Mandibles: +50% carried per claim
+export const SURVIVAL_I_HEALTH_MULTIPLIER = 1.5; // Hardened Carapace: +50% max health
+export const BROOD_I_COST_MULTIPLIER = 0.8; // Efficient Brood: 20% cheaper reproduction
+
+export const FORAGING_II_GATHER_SPEED_MULTIPLIER = 1.3; // Efficient Foragers: 30% faster gather
+export const SURVIVAL_II_ATTACK_MULTIPLIER = 1.5; // Powerful Mandibles: +50% attack damage
+export const BROOD_II_COST_MULTIPLIER = 0.65; // Rapid Development: 35% cheaper reproduction
+
+export const FORAGING_III_CARRY_SPEED_MULTIPLIER = 1.25; // Trail Instinct: +25% move speed while carrying
+export const SURVIVAL_III_CHASE_SPEED_MULTIPLIER = 1.25; // Predator Instinct: +25% move speed while attacking/chasing
+export const BROOD_III_COST_MULTIPLIER = 0.5; // Thriving Colony: 50% cheaper reproduction
+
+// Stage 9: gathering is otherwise instantaneous on arrival (see
+// attemptGatherClaim in simulation.ts) — Foraging II ("gather 30% faster")
+// has nothing to speed up as the architecture stood before this. Rather than
+// build a large new harvesting subsystem, this introduces the smallest
+// meaningful channel-duration mechanic: every worker (evolved or not) spends
+// this many seconds "channeling" on arrival before a claim is attempted.
+// Foraging II shortens it; nobody else's gather behavior changes in kind,
+// only in speed. See CLAUDE.md's Stage 9 section for the full rationale.
+export const GATHER_DURATION = 1; // seconds; baseline channel time, applies to every worker
+
+// Stage 9: exact display names from the brief (§4), shared by the world
+// event feed template and the client Evolution panel — one source of truth
+// instead of hand-typing the same strings in two places.
+export const TRAIT_DISPLAY_NAMES: Record<1 | 2 | 3, Record<"foraging" | "survival" | "brood", string>> = {
+  1: { foraging: "Strong Mandibles", survival: "Hardened Carapace", brood: "Efficient Brood" },
+  2: { foraging: "Efficient Foragers", survival: "Powerful Mandibles", brood: "Rapid Development" },
+  3: { foraging: "Trail Instinct", survival: "Predator Instinct", brood: "Thriving Colony" },
+};
+
 // Stage 8: the queen gains her own durable health pool, following the exact
 // precedent WORKER_MAX_HEALTH set. 200 means a lone spider (10 dmg/hit,
 // 1s cooldown) takes 20s of uninterrupted attack to kill an undefended
