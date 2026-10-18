@@ -369,17 +369,19 @@ describe("world event feed (Stage 8, §43)", () => {
     logAction(1, "colony_defeated", { cause: "spider", creatureId: 99 });
     logAction(2, "colony_defeated", { cause: "abandoned" });
     logAction(2, "colony_started", { previousColonyId: 1 });
+    logAction(3, "colony_evolved", { tier: 1, choice: "foraging" });
 
     const events = getWorldEvents();
-    expect(events.length).toBe(5); // the colony_created and non-spider worker_died rows are excluded
+    expect(events.length).toBe(6); // the colony_created and non-spider worker_died rows are excluded
 
-    // Newest-first: the most recently logged action_log row (colony_started)
+    // Newest-first: the most recently logged action_log row (colony_evolved)
     // is first, the oldest feed-eligible row (worker_died/spider) is last.
-    expect(events[0].message).toBe("A new colony has emerged.");
-    expect(events[1].message).toBe("Colony 2 was abandoned.");
-    expect(events[2].message).toBe("Colony 1 has fallen.");
-    expect(events[3].message).toBe("A spider was killed.");
-    expect(events[4].message).toBe("Colony 1 lost a worker to a spider.");
+    expect(events[0].message).toBe("Colony 3 evolved Strong Mandibles.");
+    expect(events[1].message).toBe("A new colony has emerged.");
+    expect(events[2].message).toBe("Colony 2 was abandoned.");
+    expect(events[3].message).toBe("Colony 1 has fallen.");
+    expect(events[4].message).toBe("A spider was killed.");
+    expect(events[5].message).toBe("Colony 1 lost a worker to a spider.");
 
     // No raw detail (worker/creature/carcass ids), no sid/cookie value, ever
     // appears in a feed message — only colony ids, which are already public.
@@ -461,6 +463,16 @@ describe("in-game help (Section 16H)", () => {
     expect(overlayText).toMatch(/start new colony/i);
     expect(overlayText).toMatch(/never.{0,20}reset.{0,40}shared world|shared world.{0,40}(never|not).{0,20}reset/i);
     expect(overlayText).toMatch(/no player-vs-player|cannot attack another player/i);
+
+    // Stage 9: evolution tiers, the three branches, and permanence must all
+    // be documented — exact percentages are deliberately left to the
+    // Evolution panel itself, not duplicated here.
+    expect(overlayText).toMatch(/evolution/i);
+    expect(overlayText).toMatch(/peak population/i);
+    expect(overlayText).toMatch(/foraging/i);
+    expect(overlayText).toMatch(/survival/i);
+    expect(overlayText).toMatch(/brood/i);
+    expect(overlayText).toMatch(/permanent/i);
   });
 
   it("the client bundle wires up opening and closing the help overlay", async () => {

@@ -266,7 +266,6 @@ it("rejects a session's attempt to attack a worker belonging to someone else's c
 // colonies racing, not just two workers from the same one.
 it(
   "two colonies attacking the same spider concurrently produce exactly one death and one carcass, visible identically to both",
-  { timeout: 60000 },
   async () => {
     const alice = createSession();
     const bob = createSession();
@@ -314,6 +313,7 @@ it(
     expect(bobStateAfter.creatures.some((c: any) => c.id === spider.id)).toBe(false);
     expect(bobStateAfter.resourceNodes.find((n: any) => n.id === newItemNodes[0].id)).toEqual(newItemNodes[0]);
   },
+  60000,
 );
 
 it("logs who did what, server-side, in a form queryable over the API and attributable to the acting colony", async () => {

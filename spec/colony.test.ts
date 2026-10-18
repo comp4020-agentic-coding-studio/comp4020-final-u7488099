@@ -212,7 +212,7 @@ async function gatherProteinUntil(targetProtein: number): Promise<void> {
   }
 }
 
-it("reproduce spends protein and adds a worker at the queen's position", { timeout: 60000 }, async () => {
+it("reproduce spends protein and adds a worker at the queen's position", async () => {
   await gatherProteinUntil(50);
   const before = await getState();
 
@@ -229,7 +229,7 @@ it("reproduce spends protein and adds a worker at the queen's position", { timeo
   // as freshly seeded aphids.
   expect(newWorker.health).toBe(newWorker.maxHealth);
   expect(newWorker.health).toBeGreaterThan(0);
-});
+}, 60000);
 
 it("rejects reproduce with insufficient protein, without mutating state", async () => {
   // Runs right after the test above, which gathers to exactly 50 and spends
@@ -245,81 +245,92 @@ it("rejects reproduce with insufficient protein, without mutating state", async 
   expect(after.colony.resources.protein).toBe(before.colony.resources.protein);
 });
 
-it("still has the mutated resource count and worker count on a fresh request", async () => {
-  // SQLite-backed, not in-memory: a gather, then a fresh GET as its own
-  // request should see what the earlier request wrote. This can only prove
-  // cross-request persistence, not cross-restart — that's verified manually
-  // against a running container (see PROCESS.md).
-  const before = await getState();
-  await gatherProteinUntil(before.colony.resources.protein + 10);
+it(
+  "still has the mutated resource count and worker count on a fresh request",
+  async () => {
+    // SQLite-backed, not in-memory: a gather, then a fresh GET as its own
+    // request should see what the earlier request wrote. This can only prove
+    // cross-request persistence, not cross-restart — that's verified manually
+    // against a running container (see PROCESS.md).
+    const before = await getState();
+    await gatherProteinUntil(before.colony.resources.protein + 10);
 
-  const mutated = await getState();
-  expect(mutated.colony.resources.protein).toBeGreaterThan(before.colony.resources.protein);
+    const mutated = await getState();
+    expect(mutated.colony.resources.protein).toBeGreaterThan(before.colony.resources.protein);
 
-  const stillThere = await getState();
-  expect(stillThere.colony.resources.protein).toBe(mutated.colony.resources.protein);
-  expect(stillThere.workers).toHaveLength(mutated.workers.length);
-});
+    const stillThere = await getState();
+    expect(stillThere.colony.resources.protein).toBe(mutated.colony.resources.protein);
+    expect(stillThere.workers).toHaveLength(mutated.workers.length);
+  },
+  60000,
+);
 
-it("a worker that's carrying resources home rejects a new move command, but a free worker in the same batch still moves", async () => {
-  // The previous two tests' gatherProteinUntil calls can leave a worker still
-  // mid-round-trip when they exit (they only wait for the protein total to
-  // rise, not for every in-flight gather to finish) — wait for at least 2
-  // genuinely idle workers before picking this test's two candidates, rather
-  // than assuming before.workers[0]/[1] are both free.
-  let before = await getState();
-  const idleDeadline = Date.now() + 15000;
-  while (before.workers.filter((w: any) => !w.carrying).length < 2 && Date.now() < idleDeadline) {
-    await new Promise((r) => setTimeout(r, 200));
-    before = await getState();
-  }
-  const [busyCandidate, freeWorker] = before.workers.filter((w: any) => !w.carrying);
-  const sugarNode = closestNode(before, busyCandidate, "sugar");
+it(
+  "a worker that's carrying resources home rejects a new move command, but a free worker in the same batch still moves",
+  async () => {
+    // The previous two tests' gatherProteinUntil calls can leave a worker still
+    // mid-round-trip when they exit (they only wait for the protein total to
+    // rise, not for every in-flight gather to finish) — wait for at least 2
+    // genuinely idle workers before picking this test's two candidates, rather
+    // than assuming before.workers[0]/[1] are both free. Stage 9's gather
+    // channel (GATHER_DURATION, see evolution.ts) adds real latency to every
+    // round trip on top of travel time, so this deadline is longer than it
+    // would need to be pre-Stage-9.
+    let before = await getState();
+    const idleDeadline = Date.now() + 30000;
+    while (before.workers.filter((w: any) => !w.carrying).length < 2 && Date.now() < idleDeadline) {
+      await new Promise((r) => setTimeout(r, 200));
+      before = await getState();
+    }
+    const [busyCandidate, freeWorker] = before.workers.filter((w: any) => !w.carrying);
+    const sugarNode = closestNode(before, busyCandidate, "sugar");
 
-  // freeWorker looked idle (not carrying) in the snapshot above, but it may
-  // still have a stale in-flight gather command from an earlier test's
-  // gatherProteinUntil (carrying is null until arrival/claim, so "not
-  // carrying" alone doesn't mean "no command"). Issuing it a move to its own
-  // current position unconditionally overwrites any such command and settles
-  // it before the real assertion below, so it can't suddenly start carrying
-  // mid-test.
-  await request("/api/command/move", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ workerIds: [freeWorker.id], x: freeWorker.x, y: freeWorker.y }),
-  });
+    // freeWorker looked idle (not carrying) in the snapshot above, but it may
+    // still have a stale in-flight gather command from an earlier test's
+    // gatherProteinUntil (carrying is null until arrival/claim, so "not
+    // carrying" alone doesn't mean "no command"). Issuing it a move to its own
+    // current position unconditionally overwrites any such command and settles
+    // it before the real assertion below, so it can't suddenly start carrying
+    // mid-test.
+    await request("/api/command/move", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerIds: [freeWorker.id], x: freeWorker.x, y: freeWorker.y }),
+    });
 
-  await request("/api/command/gather", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ workerIds: [busyCandidate.id], resourceId: sugarNode.id }),
-  });
+    await request("/api/command/gather", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerIds: [busyCandidate.id], resourceId: sugarNode.id }),
+    });
 
-  const deadline = Date.now() + 15000;
-  let state = await getState();
-  let busyWorker = state.workers.find((w: any) => w.id === busyCandidate.id);
-  while (!busyWorker.carrying && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 200));
-    state = await getState();
-    busyWorker = state.workers.find((w: any) => w.id === busyCandidate.id);
-  }
-  expect(busyWorker.carrying).toBeTruthy();
+    const deadline = Date.now() + 30000;
+    let state = await getState();
+    let busyWorker = state.workers.find((w: any) => w.id === busyCandidate.id);
+    while (!busyWorker.carrying && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 200));
+      state = await getState();
+      busyWorker = state.workers.find((w: any) => w.id === busyCandidate.id);
+    }
+    expect(busyWorker.carrying).toBeTruthy();
 
-  const target = { x: Math.min(before.world.width - 10, freeWorker.x + 400), y: freeWorker.y };
-  const res = await request("/api/command/move", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ workerIds: [busyWorker.id, freeWorker.id], x: target.x, y: target.y }),
-  });
-  expect(res.status).toBe(200);
-  const body = await res.json();
-  expect(body.errors).toEqual({ [busyWorker.id]: "worker is busy returning resources" });
+    const target = { x: Math.min(before.world.width - 10, freeWorker.x + 400), y: freeWorker.y };
+    const res = await request("/api/command/move", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerIds: [busyWorker.id, freeWorker.id], x: target.x, y: target.y }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.errors).toEqual({ [busyWorker.id]: "worker is busy returning resources" });
 
-  await new Promise((r) => setTimeout(r, 300));
-  const after = await getState();
-  const movedFreeWorker = after.workers.find((w: any) => w.id === freeWorker.id);
-  expect(movedFreeWorker.x !== freeWorker.x || movedFreeWorker.y !== freeWorker.y).toBe(true);
-});
+    await new Promise((r) => setTimeout(r, 300));
+    const after = await getState();
+    const movedFreeWorker = after.workers.find((w: any) => w.id === freeWorker.id);
+    expect(movedFreeWorker.x !== freeWorker.x || movedFreeWorker.y !== freeWorker.y).toBe(true);
+  },
+  60000,
+);
 
 // Stage 5: H — the authoritative state surface exposes the neutral/hostile
 // creature population (aphids and, since Stage 7, spiders) alongside
@@ -388,7 +399,6 @@ it("dispatches an attack command: valid ids succeed and the worker chases the ap
 // this file's black-box style.
 it(
   "killing an aphid leaves a carcass that can be gathered and deposited like any other resource",
-  { timeout: 60000 },
   async () => {
     const before = await getState();
     const worker = before.workers.find((w: any) => !w.carrying) ?? before.workers[0];
@@ -454,6 +464,7 @@ it(
     expect(killer.carrying).toBeNull();
     expect(after.colony.resources.protein).toBeGreaterThan(baselineProtein);
   },
+  60000,
 );
 
 // Stage 7 §26: mirrors the aphid-combat test above, but a spider hits back —
@@ -463,7 +474,6 @@ it(
 // case the brief specifically calls out.
 it(
   "killing a spider leaves a carcass that can be gathered and deposited, surviving exactly one attacker's worth of combat",
-  { timeout: 60000 },
   async () => {
     const before = await getState();
     const spider = before.creatures.find((c: any) => c.species === "spider");
@@ -526,6 +536,7 @@ it(
     expect(g.carrying).toBeNull();
     expect(after.colony.resources.protein).toBeGreaterThan(baselineProtein);
   },
+  60000,
 );
 
 // Stage 8 §39/§40/§41: abandonment, restart, and the direct regression test
@@ -668,7 +679,6 @@ it(
 // -> Start New Colony recovers it into an immediately playable colony.
 it(
   "soft-lock regression: a colony with zero workers and insufficient protein cannot recover via gameplay, but Abandon -> Start New Colony fully recovers it",
-  { timeout: 60000 },
   async () => {
     const stuckRequest = createSession();
     const seeded = await (await stuckRequest("/api/state")).json();
@@ -737,4 +747,5 @@ it(
     });
     expect(moveRes.status).toBe(200);
   },
+  60000,
 );

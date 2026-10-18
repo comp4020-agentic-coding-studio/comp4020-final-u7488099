@@ -140,53 +140,64 @@ it("a worker move issued by one colony is delivered, as an otherWorkers update, 
   }
 });
 
-it("pushes the updated resources to an open connection when a gather command completes, with no reload", async () => {
-  const before = await getState();
-  const worker = before.workers[0];
-  const node = closestNode(before, worker, "sugar");
-
-  const ws = await connect();
-  try {
-    const res = await request("/api/command/gather", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
-    });
-    expect(res.status).toBe(200);
-
-    const message = await waitForResourceIncreaseOnSocket(ws, "sugar", before.colony.resources.sugar);
-    const after = await getState();
-    expect(message.colony.resources.sugar).toBe(after.colony.resources.sugar);
-  } finally {
-    ws.close();
-  }
-});
-
-it("broadcasts to every open connection, not just the one that caused the change", async () => {
-  const [wsA, wsB] = await Promise.all([connect(), connect()]);
-  try {
+it(
+  "pushes the updated resources to an open connection when a gather command completes, with no reload",
+  async () => {
     const before = await getState();
-    const worker = before.workers[1];
+    const worker = before.workers[0];
     const node = closestNode(before, worker, "sugar");
 
-    const res = await request("/api/command/gather", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
-    });
-    expect(res.status).toBe(200);
+    const ws = await connect();
+    try {
+      const res = await request("/api/command/gather", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
+      });
+      expect(res.status).toBe(200);
 
-    const [msgA, msgB] = await Promise.all([
-      waitForResourceIncreaseOnSocket(wsA, "sugar", before.colony.resources.sugar),
-      waitForResourceIncreaseOnSocket(wsB, "sugar", before.colony.resources.sugar),
-    ]);
+      // Stage 9's gather channel (GATHER_DURATION, see evolution.ts) adds real
+      // latency on top of travel time to a full claim->return->deposit round
+      // trip, so this needs more headroom than the default 15000ms budget.
+      const message = await waitForResourceIncreaseOnSocket(ws, "sugar", before.colony.resources.sugar, 30000);
+      const after = await getState();
+      expect(message.colony.resources.sugar).toBe(after.colony.resources.sugar);
+    } finally {
+      ws.close();
+    }
+  },
+  60000,
+);
 
-    expect(msgA.colony.resources.sugar).toBe(msgB.colony.resources.sugar);
-  } finally {
-    wsA.close();
-    wsB.close();
-  }
-});
+it(
+  "broadcasts to every open connection, not just the one that caused the change",
+  async () => {
+    const [wsA, wsB] = await Promise.all([connect(), connect()]);
+    try {
+      const before = await getState();
+      const worker = before.workers[1];
+      const node = closestNode(before, worker, "sugar");
+
+      const res = await request("/api/command/gather", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workerIds: [worker.id], resourceId: node.id }),
+      });
+      expect(res.status).toBe(200);
+
+      const [msgA, msgB] = await Promise.all([
+        waitForResourceIncreaseOnSocket(wsA, "sugar", before.colony.resources.sugar, 30000),
+        waitForResourceIncreaseOnSocket(wsB, "sugar", before.colony.resources.sugar, 30000),
+      ]);
+
+      expect(msgA.colony.resources.sugar).toBe(msgB.colony.resources.sugar);
+    } finally {
+      wsA.close();
+      wsB.close();
+    }
+  },
+  60000,
+);
 
 it("worker movement is broadcast to open WebSocket clients without a reload", async () => {
   const before = await getState();
@@ -285,7 +296,7 @@ async function gatherProteinUntil(targetProtein: number): Promise<void> {
   }
 }
 
-it("two simultaneous reproduce calls racing for the same protein: exactly one succeeds", { timeout: 60000 }, async () => {
+it("two simultaneous reproduce calls racing for the same protein: exactly one succeeds", async () => {
   await gatherProteinUntil(50);
   const before = await getState();
 
@@ -298,11 +309,10 @@ it("two simultaneous reproduce calls racing for the same protein: exactly one su
 
   const after = await getState();
   expect(after.workers).toHaveLength(before.workers.length + 1);
-});
+}, 60000);
 
 it(
   "the full claim -> carrying -> return -> deposit lifecycle is visible over the wire to two open connections",
-  { timeout: 30000 },
   async () => {
     const before = await getState();
     const worker = before.workers.find((w: any) => !w.carrying) ?? before.workers[0];
@@ -320,11 +330,13 @@ it(
 
       // First: a broadcast frame shows the worker carrying a payload while
       // the colony's sugar bucket is still at baseline — claim precedes
-      // credit, even over the wire.
+      // credit, even over the wire. Stage 9's gather channel (GATHER_DURATION,
+      // see evolution.ts) adds real latency on top of travel time, so each
+      // phase's deadline has more headroom than it needed pre-Stage-9.
       async function waitForCarrying(ws: WebSocket): Promise<any> {
-        const deadline = Date.now() + 15000;
+        const deadline = Date.now() + 25000;
         while (Date.now() < deadline) {
-          const message = await nextMessage(ws, 15000);
+          const message = await nextMessage(ws, 25000);
           const current = message.workers.find((w: any) => w.id === worker.id);
           if (current?.carrying) return message;
         }
@@ -337,9 +349,9 @@ it(
       // Then: a later frame shows the deposit — sugar credited, carrying
       // cleared back to null — on both open connections.
       async function waitForDeposit(ws: WebSocket): Promise<any> {
-        const deadline = Date.now() + 15000;
+        const deadline = Date.now() + 25000;
         while (Date.now() < deadline) {
-          const message = await nextMessage(ws, 15000);
+          const message = await nextMessage(ws, 25000);
           const current = message.workers.find((w: any) => w.id === worker.id);
           if (current && !current.carrying && message.colony.resources.sugar > baselineSugar) return message;
         }
@@ -352,6 +364,7 @@ it(
       wsB.close();
     }
   },
+  60000,
 );
 
 // Stage 5: I — aphid state rides the same broadcast channel as every other
@@ -402,7 +415,6 @@ it("I: aphid wandering is visible over an open WebSocket connection without a re
 // on every open connection, with no separate combat protocol.
 it(
   "N: an attack's health drop, the creature's death, and its carcass are broadcast identically to every open connection",
-  { timeout: 60000 },
   async () => {
     const before = await getState();
     const worker = before.workers.find((w: any) => !w.carrying) ?? before.workers[0];
@@ -459,11 +471,11 @@ it(
       wsB.close();
     }
   },
+  60000,
 );
 
 it(
   "a worker injured or killed by a spider is visible, as an otherWorkers health/presence change, to another colony's own open WebSocket connection",
-  { timeout: 60000 },
   async () => {
     const colonyA = createOtherSession();
     const colonyB = createOtherSession();
@@ -504,6 +516,7 @@ it(
       wsB.close();
     }
   },
+  60000,
 );
 
 // Stage 8: a colony's defeat and its eventual restart must reach every open
@@ -516,7 +529,6 @@ it(
 // a black-box test's time budget.
 it(
   "another colony's defeat, resulting ruin, and eventual restart are all visible live, via the shared colonies roster, to a different open connection",
-  { timeout: 60000 },
   async () => {
     const colonyA = createOtherSession();
     const colonyB = createOtherSession();
@@ -560,6 +572,7 @@ it(
       wsB.close();
     }
   },
+  60000,
 );
 
 // Stage 8: this file's module-scope session/colony is shared by every test
@@ -570,7 +583,6 @@ it(
 // just readable via GET /api/state.
 it(
   "a colony's own defeat and subsequent restart are each broadcast directly to its own open WebSocket connection",
-  { timeout: 60000 },
   async () => {
     const before = await getState();
     expect(before.colony.status).toBe("active");
@@ -615,4 +627,5 @@ it(
       ws.close();
     }
   },
+  60000,
 );

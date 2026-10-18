@@ -38,6 +38,8 @@ const {
   WORKER_ATTACK_DAMAGE,
   WORKER_ATTACK_COOLDOWN,
   WORKER_MAX_HEALTH,
+  WORKER_SPEED,
+  STARTING_WORKERS,
   SPIDER_MAX_HEALTH,
   SPIDER_AGGRO_RANGE,
   SPIDER_DISENGAGE_RANGE,
@@ -50,9 +52,40 @@ const {
   QUEEN_REGEN_RATE,
   QUEEN_AGGRO_RANGE,
   QUEEN_DISENGAGE_RANGE,
+  EVOLUTION_TIER_1_POPULATION,
+  EVOLUTION_TIER_2_POPULATION,
+  EVOLUTION_TIER_3_POPULATION,
+  FORAGING_I_CARRY_MULTIPLIER,
+  FORAGING_II_GATHER_SPEED_MULTIPLIER,
+  FORAGING_III_CARRY_SPEED_MULTIPLIER,
+  SURVIVAL_I_HEALTH_MULTIPLIER,
+  SURVIVAL_II_ATTACK_MULTIPLIER,
+  SURVIVAL_III_CHASE_SPEED_MULTIPLIER,
+  BROOD_I_COST_MULTIPLIER,
+  BROOD_II_COST_MULTIPLIER,
+  BROOD_III_COST_MULTIPLIER,
+  GATHER_DURATION,
 } = await import("../src/server/balance.ts");
+const { getEvolutionModifiers, tierThreshold, traitDisplayName, NO_EVOLUTION } = await import(
+  "../src/server/evolution.ts"
+);
 
 const TICK_DT = 1 / SIMULATION.tickHz;
+
+// Stage 9: Foraging II introduced a GATHER_DURATION channel between arrival
+// and claim (baseline 1s, see balance.ts). A worker already standing exactly
+// on its target needs 12 ticks of TICK_DT=0.1 to go from "gather command
+// issued" to "claim landed" — not the naive 10 (1s / 0.1s) — because (a) the
+// very first tick is consumed entirely by resolveArrival() *starting* the
+// channel, with no decrement on that tick, and (b) floating-point drift in
+// repeated 0.1 subtraction from 1.0 leaves a tiny positive residue after 10
+// decrements, requiring an 11th. Any test that issues a gather command to a
+// worker already on the node and expects the claim to have landed needs
+// exactly this many ticks, not one.
+const GATHER_CLAIM_TICKS = 12;
+function advanceThroughGatherChannel(): void {
+  for (let i = 0; i < GATHER_CLAIM_TICKS; i++) sim.advanceSimulation(TICK_DT);
+}
 
 const colony = db.prepare("SELECT id FROM colonies LIMIT 1").get() as { id: number };
 const world = db.prepare("SELECT id, width, height FROM worlds LIMIT 1").get() as {
@@ -302,7 +335,7 @@ describe("gather: travel + claim", () => {
     const before = resourceAmount("sugar");
 
     expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
 
     expect(resourceAmount("sugar")).toBe(before); // not credited yet — only deposit credits the colony
     expect(workerById(worker.id).carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
@@ -320,7 +353,7 @@ describe("gather: travel + claim", () => {
     const beforeNode = nodeRow(proteinNode.id)!.amount!;
 
     expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
 
     expect(resourceAmount("protein")).toBe(beforeColony); // not credited until deposit
     expect(workerById(worker.id).carrying).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
@@ -335,7 +368,7 @@ describe("gather: travel + claim", () => {
     const beforeColony = resourceAmount("protein");
 
     expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
 
     expect(resourceAmount("protein")).toBe(beforeColony); // still not credited
     expect(workerById(worker.id).carrying).toEqual({ resourceType: "protein", amount: 4 }); // capped, not the full GATHER_YIELD
@@ -354,7 +387,7 @@ describe("gather: travel + claim", () => {
 
     expect(sim.issueGatherCommand(first.id, proteinNode.id, colony.id)).toBeNull();
     expect(sim.issueGatherCommand(second.id, proteinNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
 
     // The node only had GATHER_YIELD left — exactly one claim can have landed.
     expect(resourceAmount("protein")).toBe(beforeColony);
@@ -445,7 +478,7 @@ describe("group commands", () => {
     const before = resourceAmount("sugar");
 
     for (const w of group) expect(sim.issueGatherCommand(w.id, sugarNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
 
     // Claiming doesn't credit the colony — each worker is now carrying its
     // own payload home instead.
@@ -471,7 +504,7 @@ describe("group commands", () => {
     const beforeColony = resourceAmount("protein");
 
     for (const w of group) expect(sim.issueGatherCommand(w.id, proteinNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
 
     // The node only had GATHER_YIELD left — exactly one claim can have
     // landed, and even that claim doesn't credit the colony yet.
@@ -606,7 +639,7 @@ describe("Stage 3: loose swarm movement", () => {
     const beforeColony = resourceAmount("biomass");
 
     for (const w of group) expect(sim.issueGatherCommand(w.id, nodeId, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
 
     // Exactly one claim can have landed — and even that claim doesn't credit
     // the colony yet, it's carried home first.
@@ -659,7 +692,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
     const group = [9102, 9103, 9104].map((id, i) => registerTestWorker(id, proteinNode.x + i * 5, proteinNode.y));
 
     for (const w of group) expect(sim.issueGatherCommand(w.id, proteinNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
 
     for (const w of group) {
       expect(workerById(w.id).carrying).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
@@ -676,7 +709,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
     const beforeColony = resourceAmount("sugar");
 
     expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT); // claim resolves: carrying set, command becomes "return"
+    advanceThroughGatherChannel(); // claim resolves: carrying set, command becomes "return"
 
     expect(workerById(worker.id).carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
     expect(sim.getWorkerCommand(worker.id)).toBe("return");
@@ -701,7 +734,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
       maxHealth: WORKER_MAX_HEALTH,
     });
     expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
 
     const carryingBefore = workerById(worker.id).carrying;
     expect(carryingBefore).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
@@ -727,7 +760,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
     });
 
     expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT); // claim -> carrying, command "return"
+    advanceThroughGatherChannel(); // claim -> carrying, command "return"
     sim.advanceSimulation(TICK_DT); // already in deposit range -> deposits
 
     const creditedAmount = resourceAmount("sugar");
@@ -750,7 +783,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
     const [proteinNode] = findNodesByType("protein");
     const worker = registerTestWorker(9100, proteinNode.x, proteinNode.y);
     expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
     expect(workerById(worker.id).carrying).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
 
     expect(actions.reproduce(colony.id)).toEqual({ ok: false, error: "not enough protein" });
@@ -760,7 +793,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
     const [sugarNode] = findNodesByType("sugar");
     const worker = registerTestWorker(9101, sugarNode.x, sugarNode.y);
     expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
     const carryingState = workerById(worker.id);
     expect(carryingState.carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
 
@@ -861,7 +894,7 @@ describe("Stage 7: worker health", () => {
     const [proteinNode] = findNodesByType("protein");
     const worker = registerTestWorker(9200, proteinNode.x, proteinNode.y);
     expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
     expect(workerById(worker.id).carrying).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
     const beforeProtein = resourceAmount("protein");
 
@@ -890,7 +923,7 @@ describe("Stage 7: worker health", () => {
     const [proteinNode] = findNodesByType("protein");
     const worker = registerTestWorker(9201, proteinNode.x, proteinNode.y);
     expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
     expect(sim.getWorkerCommand(worker.id)).toBe("return");
 
     sim.applyDamageToWorker(worker.id, 5, 999);
@@ -1135,7 +1168,11 @@ describe("Stage 5: renewable resource regeneration", () => {
     const worker = registerTestWorker(9200, sugarNode.x, sugarNode.y);
 
     expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT); // regen (node still below GATHER_YIELD) then claim drains it exactly to 0
+    // Regen (well below GATHER_YIELD the whole time, so the eventual claim
+    // still drains whatever's accumulated exactly to 0) ticks alongside the
+    // Foraging II gather channel every tick; the claim itself only resolves
+    // once the channel completes.
+    advanceThroughGatherChannel();
 
     expect(fullNodeRow(sugarNode.id)?.amount).toBe(0);
 
@@ -1225,7 +1262,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     const [sugarNode] = findNodesByType("sugar");
     const worker = registerTestWorker(13002, sugarNode.x, sugarNode.y);
     expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
     expect(workerById(worker.id).carrying).not.toBeNull();
 
     const [creature] = sim.getCreaturesForWorld(world.id);
@@ -1378,7 +1415,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD, carcass.id);
     const gatherer = registerTestWorker(13012, creature.x, creature.y);
     expect(sim.issueGatherCommand(gatherer.id, carcass.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
 
     expect(nodeRow(carcass.id)).toBeUndefined(); // deleted once fully claimed, same as any finite node
   });
@@ -1397,7 +1434,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     const beforeColony = resourceAmount("protein");
     const carcass = db.prepare("SELECT id FROM resource_nodes WHERE kind = 'item'").get() as { id: number };
     expect(sim.issueGatherCommand(worker.id, carcass.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT); // claim resolves: carrying set, command becomes return
+    advanceThroughGatherChannel(); // claim resolves: carrying set, command becomes return
     expect(resourceAmount("protein")).toBe(beforeColony); // claiming alone never credits
 
     sim.advanceSimulation(TICK_DT); // already in deposit range of the queen -> deposits
@@ -1457,7 +1494,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD, proteinNode.id);
     const worker = registerTestWorker(13018, proteinNode.x, proteinNode.y);
     expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
-    sim.advanceSimulation(TICK_DT);
+    advanceThroughGatherChannel();
     expect(nodeRow(proteinNode.id)).toBeUndefined();
   });
 
@@ -1534,7 +1571,7 @@ describe("Stage 8: queen health", () => {
   it("B: a createColony()-minted colony also starts at full health, active", async () => {
     const { createColony } = await import("../src/server/db.ts");
     const other = createColony();
-    sim.registerColony(other.colonyId, other.queenX, other.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
+    sim.registerColony(other.colonyId, other.queenX, other.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, other.workers.length);
 
     const snapshot = sim.getColonySnapshot(other.colonyId);
     expect(snapshot).toMatchObject({ health: QUEEN_MAX_HEALTH, maxHealth: QUEEN_MAX_HEALTH, status: "active" });
@@ -1655,8 +1692,8 @@ describe("Stage 8: spider queen-targeting", () => {
     const { createColony } = await import("../src/server/db.ts");
     const otherA = createColony();
     const otherB = createColony();
-    sim.registerColony(otherA.colonyId, otherA.queenX, otherA.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
-    sim.registerColony(otherB.colonyId, otherB.queenX, otherB.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
+    sim.registerColony(otherA.colonyId, otherA.queenX, otherA.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, otherA.workers.length);
+    sim.registerColony(otherB.colonyId, otherB.queenX, otherB.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, otherB.workers.length);
 
     const midX = (otherA.queenX + otherB.queenX) / 2;
     const midY = (otherA.queenY + otherB.queenY) / 2;
@@ -1692,7 +1729,7 @@ describe("Stage 8: spider queen-targeting", () => {
     // spider's next step closes distance toward the *new* position.
     const newY = queenPosition().y + QUEEN_DISENGAGE_RANGE - 20;
     const snapshot = sim.getColonySnapshot(colony.id)!;
-    sim.registerColony(colony.id, snapshot.x, newY, snapshot.health, snapshot.maxHealth);
+    sim.registerColony(colony.id, snapshot.x, newY, snapshot.health, snapshot.maxHealth, snapshot.peakPopulation);
     const before = Math.hypot(
       sim.getCreaturesForWorld(world.id).find((c) => c.id === spiderId)!.x - snapshot.x,
       sim.getCreaturesForWorld(world.id).find((c) => c.id === spiderId)!.y - newY,
@@ -1738,7 +1775,7 @@ describe("Stage 8: spider queen-targeting", () => {
     // disengage is ever exercised.
     const spiderY = sim.getCreaturesForWorld(world.id).find((c) => c.id === spiderId)!.y;
     const snapshot = sim.getColonySnapshot(colony.id)!;
-    sim.registerColony(colony.id, snapshot.x, spiderY + QUEEN_DISENGAGE_RANGE + 50, snapshot.health, snapshot.maxHealth);
+    sim.registerColony(colony.id, snapshot.x, spiderY + QUEEN_DISENGAGE_RANGE + 50, snapshot.health, snapshot.maxHealth, snapshot.peakPopulation);
 
     sim.advanceSimulation(TICK_DT);
 
@@ -1772,7 +1809,7 @@ describe("Stage 8: spider queen-targeting", () => {
     }
     const { createColony } = await import("../src/server/db.ts");
     const other = createColony();
-    sim.registerColony(other.colonyId, other.queenX, other.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
+    sim.registerColony(other.colonyId, other.queenX, other.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, other.workers.length);
 
     const spiderId = insertSpider(other.queenX, other.queenY + QUEEN_AGGRO_RANGE - 10);
     sim.loadSimulation();
@@ -1936,7 +1973,7 @@ describe("Stage 8: colony defeat", () => {
   it("M: a colony's defeat has no effect on an unrelated active colony's workers, resources, or status", async () => {
     const { createColony } = await import("../src/server/db.ts");
     const other = createColony();
-    sim.registerColony(other.colonyId, other.queenX, other.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
+    sim.registerColony(other.colonyId, other.queenX, other.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, other.workers.length);
     for (const worker of other.workers) {
       sim.registerWorker({
         id: worker.id,
@@ -1954,5 +1991,320 @@ describe("Stage 8: colony defeat", () => {
     expect(sim.isColonyActive(other.colonyId)).toBe(true);
     expect(sim.getWorkersForColony(other.colonyId)).toHaveLength(otherWorkerCount);
     expect(sim.getColonySnapshot(other.colonyId)?.status).toBe("active");
+  });
+});
+
+describe("Stage 9: peak population", () => {
+  it("A: a freshly seeded colony's peak population starts at its own starting worker count", () => {
+    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS);
+  });
+
+  it("B: reproducing increases peak population by one", () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'protein'").run(
+      REPRODUCE_COST,
+      colony.id,
+    );
+    expect(actions.reproduce(colony.id)).toEqual({ ok: true });
+    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 1);
+  });
+
+  it("C: losing workers never lowers peak population — it only ever moves upward", () => {
+    const [worker] = sim.getWorkersForColony(colony.id);
+    setWorkerHealth(worker.id, 1);
+    sim.applyDamageToWorker(worker.id, 999, 777);
+    expect(sim.getWorkersForColony(colony.id)).toHaveLength(STARTING_WORKERS - 1);
+    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS);
+  });
+
+  it("D: peak population survives a restart (reload from SQLite)", () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'protein'").run(
+      REPRODUCE_COST,
+      colony.id,
+    );
+    expect(actions.reproduce(colony.id)).toEqual({ ok: true });
+    sim.loadSimulation();
+    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 1);
+  });
+
+  it("E: peak population is frozen once a colony is defeated", () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'protein'").run(
+      REPRODUCE_COST,
+      colony.id,
+    );
+    expect(actions.reproduce(colony.id)).toEqual({ ok: true });
+    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 1);
+
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+    expect(sim.getColonySnapshot(colony.id)?.status).toBe("defeated");
+    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 1);
+  });
+
+  it("F: a replacement colony starts with its own fresh peak population, not inherited from anywhere else", async () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'protein'").run(
+      REPRODUCE_COST,
+      colony.id,
+    );
+    expect(actions.reproduce(colony.id)).toEqual({ ok: true }); // old colony's peak is now above STARTING_WORKERS
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+
+    const { createColony } = await import("../src/server/db.ts");
+    const fresh = createColony();
+    sim.registerColony(fresh.colonyId, fresh.queenX, fresh.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, fresh.workers.length);
+
+    expect(sim.getColonySnapshot(fresh.colonyId)?.peakPopulation).toBe(fresh.workers.length);
+    expect(sim.getColonySnapshot(fresh.colonyId)?.peakPopulation).toBeLessThan(
+      sim.getColonySnapshot(colony.id)!.peakPopulation,
+    );
+  });
+});
+
+describe("Stage 9: evolution modifiers", () => {
+  it("every modifier defaults to baseline when no evolution has been chosen", () => {
+    const modifiers = getEvolutionModifiers(NO_EVOLUTION);
+    expect(modifiers).toEqual({
+      carryYield: GATHER_YIELD,
+      gatherDuration: GATHER_DURATION,
+      carryMoveSpeedMultiplier: 1,
+      chaseSpeedMultiplier: 1,
+      maxHealth: WORKER_MAX_HEALTH,
+      attackDamage: WORKER_ATTACK_DAMAGE,
+      reproduceCost: REPRODUCE_COST,
+    });
+  });
+
+  it("Foraging I (Strong Mandibles) increases effective carry yield, and only that field", () => {
+    const base = getEvolutionModifiers(NO_EVOLUTION);
+    const modifiers = getEvolutionModifiers({ tier1: "foraging", tier2: null, tier3: null });
+    expect(modifiers.carryYield).toBe(Math.round(GATHER_YIELD * FORAGING_I_CARRY_MULTIPLIER));
+    expect({ ...modifiers, carryYield: base.carryYield }).toEqual(base);
+  });
+
+  it("Foraging II (Efficient Foragers) shortens gather duration, and only that field", () => {
+    const base = getEvolutionModifiers(NO_EVOLUTION);
+    const modifiers = getEvolutionModifiers({ tier1: null, tier2: "foraging", tier3: null });
+    expect(modifiers.gatherDuration).toBeCloseTo(GATHER_DURATION / FORAGING_II_GATHER_SPEED_MULTIPLIER);
+    expect({ ...modifiers, gatherDuration: base.gatherDuration }).toEqual(base);
+  });
+
+  it("Foraging III (Trail Instinct) raises carry move speed, and only that field", () => {
+    const base = getEvolutionModifiers(NO_EVOLUTION);
+    const modifiers = getEvolutionModifiers({ tier1: null, tier2: null, tier3: "foraging" });
+    expect(modifiers.carryMoveSpeedMultiplier).toBe(FORAGING_III_CARRY_SPEED_MULTIPLIER);
+    expect({ ...modifiers, carryMoveSpeedMultiplier: base.carryMoveSpeedMultiplier }).toEqual(base);
+  });
+
+  it("Survival I (Hardened Carapace) raises worker max health, and only that field", () => {
+    const base = getEvolutionModifiers(NO_EVOLUTION);
+    const modifiers = getEvolutionModifiers({ tier1: "survival", tier2: null, tier3: null });
+    expect(modifiers.maxHealth).toBe(Math.round(WORKER_MAX_HEALTH * SURVIVAL_I_HEALTH_MULTIPLIER));
+    expect({ ...modifiers, maxHealth: base.maxHealth }).toEqual(base);
+  });
+
+  it("Survival II (Powerful Mandibles) raises attack damage, and only that field", () => {
+    const base = getEvolutionModifiers(NO_EVOLUTION);
+    const modifiers = getEvolutionModifiers({ tier1: null, tier2: "survival", tier3: null });
+    expect(modifiers.attackDamage).toBe(Math.round(WORKER_ATTACK_DAMAGE * SURVIVAL_II_ATTACK_MULTIPLIER));
+    expect({ ...modifiers, attackDamage: base.attackDamage }).toEqual(base);
+  });
+
+  it("Survival III (Predator Instinct) raises chase speed, and only that field", () => {
+    const base = getEvolutionModifiers(NO_EVOLUTION);
+    const modifiers = getEvolutionModifiers({ tier1: null, tier2: null, tier3: "survival" });
+    expect(modifiers.chaseSpeedMultiplier).toBe(SURVIVAL_III_CHASE_SPEED_MULTIPLIER);
+    expect({ ...modifiers, chaseSpeedMultiplier: base.chaseSpeedMultiplier }).toEqual(base);
+  });
+
+  it("Brood discount is tier-effective, not cumulative — the highest Brood tier chosen always wins", () => {
+    expect(getEvolutionModifiers({ tier1: "brood", tier2: null, tier3: null }).reproduceCost).toBe(
+      Math.round(REPRODUCE_COST * BROOD_I_COST_MULTIPLIER),
+    );
+    expect(getEvolutionModifiers({ tier1: null, tier2: "brood", tier3: null }).reproduceCost).toBe(
+      Math.round(REPRODUCE_COST * BROOD_II_COST_MULTIPLIER),
+    );
+    expect(getEvolutionModifiers({ tier1: null, tier2: null, tier3: "brood" }).reproduceCost).toBe(
+      Math.round(REPRODUCE_COST * BROOD_III_COST_MULTIPLIER),
+    );
+    // Brood I + Brood II chosen: tier II (higher) wins outright, not stacked/multiplied with tier I.
+    expect(getEvolutionModifiers({ tier1: "brood", tier2: "brood", tier3: null }).reproduceCost).toBe(
+      Math.round(REPRODUCE_COST * BROOD_II_COST_MULTIPLIER),
+    );
+    // Brood I + Brood III chosen: tier III (highest) wins, even skipping tier II entirely.
+    expect(getEvolutionModifiers({ tier1: "brood", tier2: null, tier3: "brood" }).reproduceCost).toBe(
+      Math.round(REPRODUCE_COST * BROOD_III_COST_MULTIPLIER),
+    );
+    // A non-Brood tier 3 choice doesn't block a lower Brood tier from applying.
+    expect(getEvolutionModifiers({ tier1: "brood", tier2: null, tier3: "foraging" }).reproduceCost).toBe(
+      Math.round(REPRODUCE_COST * BROOD_I_COST_MULTIPLIER),
+    );
+  });
+
+  it("traitDisplayName and tierThreshold match the balance constants exactly", () => {
+    expect(traitDisplayName(1, "foraging")).toBe("Strong Mandibles");
+    expect(traitDisplayName(1, "survival")).toBe("Hardened Carapace");
+    expect(traitDisplayName(1, "brood")).toBe("Efficient Brood");
+    expect(traitDisplayName(2, "foraging")).toBe("Efficient Foragers");
+    expect(traitDisplayName(2, "survival")).toBe("Powerful Mandibles");
+    expect(traitDisplayName(2, "brood")).toBe("Rapid Development");
+    expect(traitDisplayName(3, "foraging")).toBe("Trail Instinct");
+    expect(traitDisplayName(3, "survival")).toBe("Predator Instinct");
+    expect(traitDisplayName(3, "brood")).toBe("Thriving Colony");
+
+    expect(tierThreshold(1)).toBe(EVOLUTION_TIER_1_POPULATION);
+    expect(tierThreshold(2)).toBe(EVOLUTION_TIER_2_POPULATION);
+    expect(tierThreshold(3)).toBe(EVOLUTION_TIER_3_POPULATION);
+  });
+
+  it("Survival I's retroactive health conversion preserves each living worker's health percentage", () => {
+    const [full, injured, dead] = sim.getWorkersForColony(colony.id);
+    setWorkerHealth(injured.id, 15); // exactly half of WORKER_MAX_HEALTH=30
+    // registerTestWorker avoids loadSimulation, but setWorkerHealth already
+    // reloads — re-fetch so we're not holding stale pre-reload objects.
+    const beforeFull = workerById(full.id);
+    const beforeInjured = workerById(injured.id);
+    expect(beforeFull.health).toBe(30);
+    expect(beforeInjured.health).toBe(15);
+
+    expect(sim.applyEvolutionSelection(colony.id, 1, "survival")).toBe(true);
+
+    const newMax = Math.round(WORKER_MAX_HEALTH * SURVIVAL_I_HEALTH_MULTIPLIER); // 45
+    expect(newMax).toBe(45);
+    const afterFull = workerById(full.id);
+    const afterInjured = workerById(injured.id);
+    expect(afterFull.maxHealth).toBe(45);
+    expect(afterFull.health).toBe(45); // was 100% of 30 -> 100% of 45
+    expect(afterInjured.maxHealth).toBe(45);
+    expect(afterInjured.health).toBe(Math.round((15 / 30) * 45)); // was 50% -> stays 50%, rescaled
+
+    // Durable: survives a restart.
+    sim.loadSimulation();
+    expect(workerById(full.id).health).toBe(45);
+    expect(workerById(full.id).maxHealth).toBe(45);
+    expect(workerById(injured.id).health).toBe(Math.round((15 / 30) * 45));
+  });
+
+  it("Survival I only rescales living workers of the evolving colony, never an unrelated colony's", async () => {
+    const { createColony } = await import("../src/server/db.ts");
+    const other = createColony();
+    sim.registerColony(other.colonyId, other.queenX, other.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, other.workers.length);
+    for (const worker of other.workers) {
+      sim.registerWorker({
+        id: worker.id,
+        colonyId: other.colonyId,
+        x: worker.x,
+        y: worker.y,
+        health: worker.health,
+        maxHealth: worker.maxHealth,
+      });
+    }
+
+    expect(sim.applyEvolutionSelection(colony.id, 1, "survival")).toBe(true);
+
+    for (const worker of sim.getWorkersForColony(other.colonyId)) {
+      expect(worker.maxHealth).toBe(WORKER_MAX_HEALTH);
+      expect(worker.health).toBe(WORKER_MAX_HEALTH);
+    }
+  });
+});
+
+describe("Stage 9: mixed builds", () => {
+  it("a colony with Foraging I + Survival II + Brood III expresses exactly those three effects and nothing else", () => {
+    expect(sim.applyEvolutionSelection(colony.id, 1, "foraging")).toBe(true);
+    expect(sim.applyEvolutionSelection(colony.id, 2, "survival")).toBe(true);
+    expect(sim.applyEvolutionSelection(colony.id, 3, "brood")).toBe(true);
+
+    const evolution = sim.getColonyEvolution(colony.id)!;
+    const modifiers = getEvolutionModifiers(evolution);
+
+    // Present: Foraging I, Survival II, Brood III.
+    expect(modifiers.carryYield).toBe(Math.round(GATHER_YIELD * FORAGING_I_CARRY_MULTIPLIER));
+    expect(modifiers.attackDamage).toBe(Math.round(WORKER_ATTACK_DAMAGE * SURVIVAL_II_ATTACK_MULTIPLIER));
+    expect(modifiers.reproduceCost).toBe(Math.round(REPRODUCE_COST * BROOD_III_COST_MULTIPLIER));
+
+    // Absent: Foraging II/III, Survival I/III, Brood I/II — every other field
+    // stays at its untouched baseline.
+    expect(modifiers.gatherDuration).toBe(GATHER_DURATION);
+    expect(modifiers.carryMoveSpeedMultiplier).toBe(1);
+    expect(modifiers.maxHealth).toBe(WORKER_MAX_HEALTH);
+    expect(modifiers.chaseSpeedMultiplier).toBe(1);
+  });
+});
+
+describe("Stage 9: evolution selection", () => {
+  function bumpPeakPopulationTo(target: number): void {
+    db.prepare("UPDATE colonies SET peak_population = ? WHERE id = ?").run(target, colony.id);
+    sim.loadSimulation();
+  }
+
+  it("A: a tier locked by peak population is rejected with 'tier locked'", () => {
+    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBeLessThan(EVOLUTION_TIER_1_POPULATION);
+    expect(actions.selectEvolution(colony.id, 1, "foraging")).toEqual({ ok: false, error: "tier locked" });
+  });
+
+  it("B: an unlocked tier accepts a valid selection", () => {
+    bumpPeakPopulationTo(EVOLUTION_TIER_1_POPULATION);
+    expect(actions.selectEvolution(colony.id, 1, "foraging")).toEqual({ ok: true });
+    expect(sim.getColonyEvolution(colony.id)).toEqual({ tier1: "foraging", tier2: null, tier3: null });
+  });
+
+  it("C: a tier that's already been chosen is rejected with 'tier already chosen'", () => {
+    bumpPeakPopulationTo(EVOLUTION_TIER_1_POPULATION);
+    expect(actions.selectEvolution(colony.id, 1, "foraging")).toEqual({ ok: true });
+    expect(actions.selectEvolution(colony.id, 1, "survival")).toEqual({ ok: false, error: "tier already chosen" });
+    expect(sim.getColonyEvolution(colony.id)).toEqual({ tier1: "foraging", tier2: null, tier3: null }); // unchanged
+  });
+
+  it("D: an invalid tier number is rejected with 'invalid tier'", () => {
+    bumpPeakPopulationTo(EVOLUTION_TIER_3_POPULATION);
+    expect(actions.selectEvolution(colony.id, 4, "foraging")).toEqual({ ok: false, error: "invalid tier" });
+    expect(actions.selectEvolution(colony.id, 0, "foraging")).toEqual({ ok: false, error: "invalid tier" });
+  });
+
+  it("E: an invalid choice string is rejected with 'invalid choice'", () => {
+    bumpPeakPopulationTo(EVOLUTION_TIER_1_POPULATION);
+    expect(actions.selectEvolution(colony.id, 1, "soldier")).toEqual({ ok: false, error: "invalid choice" });
+  });
+
+  it("F: a defeated colony rejects selection with 'colony defeated'", () => {
+    bumpPeakPopulationTo(EVOLUTION_TIER_1_POPULATION);
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+    expect(actions.selectEvolution(colony.id, 1, "foraging")).toEqual({ ok: false, error: "colony defeated" });
+  });
+
+  it("G: mixing all three branches freely across tiers is allowed, with no prerequisite ordering", () => {
+    bumpPeakPopulationTo(EVOLUTION_TIER_3_POPULATION);
+    expect(actions.selectEvolution(colony.id, 3, "brood")).toEqual({ ok: true }); // tier 3 chosen before tier 1/2
+    expect(actions.selectEvolution(colony.id, 1, "survival")).toEqual({ ok: true });
+    expect(actions.selectEvolution(colony.id, 2, "foraging")).toEqual({ ok: true });
+    expect(sim.getColonyEvolution(colony.id)).toEqual({ tier1: "survival", tier2: "foraging", tier3: "brood" });
+  });
+
+  it("H: applyEvolutionSelection is exactly-once under a duplicate/concurrent call, logging colony_evolved exactly once", () => {
+    bumpPeakPopulationTo(EVOLUTION_TIER_1_POPULATION);
+    expect(sim.applyEvolutionSelection(colony.id, 1, "foraging")).toBe(true);
+    expect(sim.applyEvolutionSelection(colony.id, 1, "survival")).toBe(false); // simulated duplicate/concurrent trigger
+
+    expect(sim.getColonyEvolution(colony.id)).toEqual({ tier1: "foraging", tier2: null, tier3: null });
+
+    const rows = db
+      .prepare("SELECT detail FROM action_log WHERE colony_id = ? AND action = 'colony_evolved'")
+      .all(colony.id) as { detail: string }[];
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0].detail)).toEqual({ tier: 1, choice: "foraging" });
+  });
+
+  it("I: a replacement colony starts with no evolution selections, even after the old colony fully evolved", async () => {
+    bumpPeakPopulationTo(EVOLUTION_TIER_3_POPULATION);
+    expect(actions.selectEvolution(colony.id, 1, "foraging")).toEqual({ ok: true });
+    expect(actions.selectEvolution(colony.id, 2, "survival")).toEqual({ ok: true });
+    expect(actions.selectEvolution(colony.id, 3, "brood")).toEqual({ ok: true });
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+
+    const { createColony } = await import("../src/server/db.ts");
+    const fresh = createColony();
+    sim.registerColony(fresh.colonyId, fresh.queenX, fresh.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, fresh.workers.length);
+
+    expect(sim.getColonyEvolution(fresh.colonyId)).toEqual(NO_EVOLUTION);
+    // The old, now-defeated colony's selections remain on the ruin, untouched.
+    expect(sim.getColonyEvolution(colony.id)).toEqual({ tier1: "foraging", tier2: "survival", tier3: "brood" });
   });
 });
