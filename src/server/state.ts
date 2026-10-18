@@ -1,5 +1,6 @@
 import { RESOURCE_TYPES } from "./balance.ts";
 import { db } from "./db.ts";
+import { type EvolutionChoice, type EvolutionSelections, getEvolutionModifiers, NO_EVOLUTION } from "./evolution.ts";
 import {
   getAllColonies,
   getColonySnapshot,
@@ -21,6 +22,14 @@ export interface ColonyState {
     queenMaxHealth: number;
     status: "active" | "defeated";
     defeatCause: string | null;
+    // Stage 9: the colony's own peak population, evolution selections, and
+    // the live effective reproduction cost (always the number actually
+    // deducted — see §17).
+    peakPopulation: number;
+    evolutionTier1: EvolutionChoice | null;
+    evolutionTier2: EvolutionChoice | null;
+    evolutionTier3: EvolutionChoice | null;
+    reproduceCost: number;
   };
   workers: { id: number; x: number; y: number; carrying: Carrying; health: number; maxHealth: number }[];
   // Post-Stage-6b fix: every OTHER colony's workers, visible in the shared
@@ -55,7 +64,23 @@ export interface ColonyState {
   // that other players exist and where, without exposing their economy.
   // Stage 8 adds health/maxHealth/status — still no resources — so the
   // client can draw other queens' health bars and distinguish ruins.
-  colonies: { id: number; queenX: number; queenY: number; health: number; maxHealth: number; status: "active" | "defeated" }[];
+  // Stage 9 §24/§25: population/peakPopulation/evolution/defeatCause let a
+  // foreign colony's (or a ruin's) public evolutionary identity be shown —
+  // never an internal modifier/stat, never session data.
+  colonies: {
+    id: number;
+    queenX: number;
+    queenY: number;
+    health: number;
+    maxHealth: number;
+    status: "active" | "defeated";
+    population: number;
+    peakPopulation: number;
+    evolutionTier1: EvolutionChoice | null;
+    evolutionTier2: EvolutionChoice | null;
+    evolutionTier3: EvolutionChoice | null;
+    defeatCause: string | null;
+  }[];
   // Stage 8: a small (<=6), curated, public feed — see log.ts's
   // getWorldEvents. No session/cookie data, never raw action_log detail.
   worldEvents: { message: string }[];
@@ -97,16 +122,36 @@ export function getState(colonyId: number): ColonyState {
 
   const creatures = getCreaturesForWorld(world.id);
 
-  const colonies: ColonyState["colonies"] = getAllColonies().map(({ id, x, y, health, maxHealth, status }) => ({
-    id,
-    queenX: x,
-    queenY: y,
-    health,
-    maxHealth,
-    status,
-  }));
+  // defeat_cause is a durable SQLite column, never part of the in-memory sim
+  // cache (it never changes after defeat) — fetched once here rather than
+  // threading it through getAllColonies()'s per-tick-safe shape.
+  const defeatCauses = new Map(
+    (db.prepare("SELECT id, defeat_cause AS defeatCause FROM colonies").all() as { id: number; defeatCause: string | null }[]).map(
+      (row) => [row.id, row.defeatCause],
+    ),
+  );
+
+  const colonies: ColonyState["colonies"] = getAllColonies().map(
+    ({ id, x, y, health, maxHealth, status, population, peakPopulation, evolution }) => ({
+      id,
+      queenX: x,
+      queenY: y,
+      health,
+      maxHealth,
+      status,
+      population,
+      peakPopulation,
+      evolutionTier1: evolution.tier1,
+      evolutionTier2: evolution.tier2,
+      evolutionTier3: evolution.tier3,
+      defeatCause: defeatCauses.get(id) ?? null,
+    }),
+  );
 
   const worldEvents = getWorldEvents();
+
+  const evolution: EvolutionSelections = snapshot?.evolution ?? NO_EVOLUTION;
+  const reproduceCost = getEvolutionModifiers(evolution).reproduceCost;
 
   return {
     world: { width: world.width, height: world.height },
@@ -119,6 +164,11 @@ export function getState(colonyId: number): ColonyState {
       queenMaxHealth: snapshot?.maxHealth ?? 0,
       status: snapshot?.status ?? "defeated",
       defeatCause: colonyRow.defeatCause,
+      peakPopulation: snapshot?.peakPopulation ?? 0,
+      evolutionTier1: evolution.tier1,
+      evolutionTier2: evolution.tier2,
+      evolutionTier3: evolution.tier3,
+      reproduceCost,
     },
     workers,
     otherWorkers,

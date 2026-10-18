@@ -1,7 +1,7 @@
 import express from "express";
 import { readFileSync } from "node:fs";
 import { WebSocket, WebSocketServer } from "ws";
-import { abandon, reproduce } from "./actions.ts";
+import { abandon, reproduce, selectEvolution } from "./actions.ts";
 import { SIMULATION } from "./balance.ts";
 import { getColonyForSession } from "./db.ts";
 import { getLog, logAction } from "./log.ts";
@@ -127,6 +127,25 @@ app.post("/api/start-new-colony", (req, res) => {
     return;
   }
   const state = getState(result.colonyId);
+  broadcastState();
+  res.json(state);
+});
+
+// Stage 9 §8: body carries only {tier, choice} — colonyId is always
+// resolved from the session middleware, never trusted from the client, same
+// discipline as every other mutating route.
+app.post("/api/evolve", (req, res) => {
+  const { tier, choice } = req.body ?? {};
+  if (typeof tier !== "number" || typeof choice !== "string") {
+    res.status(400).json({ error: "tier and choice are required" });
+    return;
+  }
+  const result = selectEvolution(req.colonyId, tier, choice);
+  if (!result.ok) {
+    res.status(400).json(result);
+    return;
+  }
+  const state = getState(req.colonyId);
   broadcastState();
   res.json(state);
 });
