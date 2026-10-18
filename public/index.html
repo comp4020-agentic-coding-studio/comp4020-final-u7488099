@@ -121,6 +121,120 @@
       #abandon-button:hover {
         background: #7f0000;
       }
+      #evolution-button {
+        position: relative;
+        font-weight: 600;
+        background: #00695c;
+        color: white;
+        border: none;
+        border-radius: 999px;
+        padding: 0.4rem 1rem;
+        cursor: pointer;
+      }
+      #evolution-button:hover {
+        background: #004d40;
+      }
+      #evolution-badge {
+        display: inline-block;
+        margin-left: 0.4rem;
+        background: #ab47bc;
+        color: white;
+        border-radius: 999px;
+        padding: 0.1rem 0.5rem;
+        font-size: 0.75rem;
+        font-weight: 700;
+      }
+      #evolution-badge[hidden] {
+        display: none;
+      }
+      #evolution-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.55);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 2rem;
+        z-index: 10;
+      }
+      #evolution-overlay[hidden] {
+        display: none;
+      }
+      #evolution-panel {
+        background: white;
+        color: #1a1a1a;
+        max-width: 640px;
+        max-height: 85vh;
+        overflow-y: auto;
+        border-radius: 8px;
+        padding: 1.5rem 2rem;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+      }
+      #evolution-close {
+        float: right;
+        background: none;
+        border: none;
+        font-size: 1.5rem;
+        line-height: 1;
+        cursor: pointer;
+        color: #555;
+      }
+      #evolution-peak {
+        color: #555;
+        margin-top: 0;
+      }
+      .evolution-tier {
+        margin-block: 1rem;
+        padding-block: 0.5rem;
+        border-top: 1px solid #ddd;
+      }
+      .evolution-tier h3 {
+        margin: 0 0 0.3rem;
+      }
+      .evolution-locked {
+        color: #777;
+      }
+      .evolution-choices {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+      }
+      .evolution-choices button {
+        text-align: left;
+        padding: 0.5rem 0.75rem;
+        border-radius: 6px;
+        border: 1px solid #00695c;
+        background: #e0f2f1;
+        cursor: pointer;
+      }
+      .evolution-choices button:hover {
+        background: #b2dfdb;
+      }
+      #evolution-others {
+        margin: 0;
+        padding-left: 1.1rem;
+      }
+      #evolution-confirm-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.55);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 2rem;
+        z-index: 20;
+      }
+      #evolution-confirm-overlay[hidden] {
+        display: none;
+      }
+      #evolution-confirm-panel {
+        background: white;
+        color: #1a1a1a;
+        max-width: 480px;
+        border-radius: 8px;
+        padding: 1.5rem 2rem;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+      }
       #abandon-button:disabled,
       #reproduce:disabled {
         opacity: 0.5;
@@ -196,6 +310,13 @@
         background: #2e7d32;
         color: white;
       }
+      #evolution-confirm-cancel {
+        background: #e0e0e0;
+      }
+      #evolution-confirm-confirm {
+        background: #00695c;
+        color: white;
+      }
     </style>
   </head>
   <body>
@@ -208,6 +329,9 @@
         </button>
         <button id="abandon-button" type="button" aria-haspopup="dialog" aria-controls="abandon-overlay">
           Abandon Colony
+        </button>
+        <button id="evolution-button" type="button" aria-haspopup="dialog" aria-controls="evolution-overlay">
+          Evolution <span id="evolution-badge" hidden>AVAILABLE</span>
         </button>
       </div>
       <p id="resources">sugar: 0 · protein: 0 · biomass: 0</p>
@@ -332,6 +456,29 @@
           </li>
         </ul>
 
+        <h2>Evolution</h2>
+        <ul>
+          <li>
+            As your colony reaches 5, 10, and 20 peak population (the highest worker count it's ever reached, not
+            your current count), a new evolution tier unlocks — click the "Evolution" button to choose one of three
+            permanent traits for that tier.
+          </li>
+          <li>
+            Each tier offers a <strong>Foraging</strong>, <strong>Survival</strong>, or <strong>Brood</strong> trait.
+            Choices are freely mixable across tiers (no prerequisites) and permanent once made — there's no respec.
+          </li>
+          <li>
+            Foraging traits boost how much workers carry, how fast they gather, and how fast they move while
+            carrying resources home. Survival traits boost worker health, attack damage, and combat speed. Brood
+            traits make reproducing a new worker cheaper.
+          </li>
+          <li>
+            Evolution belongs to your colony, not your browser session — if your colony falls, its evolutionary
+            history remains on the ruin forever, but a replacement colony via "Start New Colony" always begins
+            completely fresh.
+          </li>
+        </ul>
+
         <h2>Quick start</h2>
         <ol>
           <li>Left-drag a box around your starting workers to select all of them.</li>
@@ -390,6 +537,28 @@
         <div class="legend-item">
           <span class="legend-swatch circle" style="background: #9e9e9e; border: 2px solid #616161"></span> A fallen
           colony's ruin — not interactive, not selectable
+        </div>
+      </div>
+    </div>
+
+    <div id="evolution-overlay" role="dialog" aria-modal="true" aria-labelledby="evolution-title" hidden>
+      <div id="evolution-panel">
+        <button id="evolution-close" type="button" aria-label="Close evolution">×</button>
+        <h1 id="evolution-title">Evolution</h1>
+        <p id="evolution-peak"></p>
+        <div id="evolution-tiers"></div>
+        <h2>Other colonies</h2>
+        <ul id="evolution-others"></ul>
+      </div>
+    </div>
+
+    <div id="evolution-confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="evolution-confirm-title" hidden>
+      <div id="evolution-confirm-panel">
+        <h2 id="evolution-confirm-title">Confirm evolution</h2>
+        <p id="evolution-confirm-text"></p>
+        <div class="modal-actions">
+          <button id="evolution-confirm-cancel" type="button">CANCEL</button>
+          <button id="evolution-confirm-confirm" type="button">CONFIRM</button>
         </div>
       </div>
     </div>

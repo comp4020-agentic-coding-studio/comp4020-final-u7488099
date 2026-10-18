@@ -1,4 +1,42 @@
-import { APHID_RADIUS, SPIDER_RADIUS, WORKER_RADIUS } from "../server/balance.ts";
+import {
+  APHID_RADIUS,
+  EVOLUTION_TIER_1_POPULATION,
+  EVOLUTION_TIER_2_POPULATION,
+  EVOLUTION_TIER_3_POPULATION,
+  SPIDER_RADIUS,
+  TRAIT_DISPLAY_NAMES,
+  WORKER_RADIUS,
+} from "../server/balance.ts";
+
+type EvolutionChoice = "foraging" | "survival" | "brood";
+
+// Stage 9: one-line effect text per trait, shown in the Evolution panel and
+// in each trait's confirm step — kept client-side next to the display-name
+// lookup it's paired with, same duplication discipline as every other
+// mirrored constant (ColonyState itself, NODE_RADIUS vs. the server's radii).
+const TRAIT_EFFECT_TEXT: Record<1 | 2 | 3, Record<EvolutionChoice, string>> = {
+  1: {
+    foraging: "Workers carry +50% more resources per claim.",
+    survival: "Workers gain +50% maximum health.",
+    brood: "Reproducing a new worker costs 20% less protein.",
+  },
+  2: {
+    foraging: "Workers gather 30% faster.",
+    survival: "Workers deal +50% attack damage.",
+    brood: "Reproducing a new worker costs 35% less protein.",
+  },
+  3: {
+    foraging: "Workers move 25% faster while carrying resources home.",
+    survival: "Workers move 25% faster while attacking or chasing.",
+    brood: "Reproducing a new worker costs 50% less protein.",
+  },
+};
+
+const EVOLUTION_TIER_POPULATION: Record<1 | 2 | 3, number> = {
+  1: EVOLUTION_TIER_1_POPULATION,
+  2: EVOLUTION_TIER_2_POPULATION,
+  3: EVOLUTION_TIER_3_POPULATION,
+};
 
 interface ColonyState {
   world: { width: number; height: number };
@@ -11,6 +49,11 @@ interface ColonyState {
     queenMaxHealth: number;
     status: "active" | "defeated";
     defeatCause: string | null;
+    peakPopulation: number;
+    evolutionTier1: EvolutionChoice | null;
+    evolutionTier2: EvolutionChoice | null;
+    evolutionTier3: EvolutionChoice | null;
+    reproduceCost: number;
   };
   workers: {
     id: number;
@@ -49,6 +92,12 @@ interface ColonyState {
     health: number;
     maxHealth: number;
     status: "active" | "defeated";
+    population: number;
+    peakPopulation: number;
+    evolutionTier1: EvolutionChoice | null;
+    evolutionTier2: EvolutionChoice | null;
+    evolutionTier3: EvolutionChoice | null;
+    defeatCause: string | null;
   }[];
   worldEvents: { message: string }[];
 }
@@ -70,6 +119,17 @@ const abandonConfirm = document.querySelector<HTMLButtonElement>("#abandon-confi
 const defeatOverlay = document.querySelector<HTMLElement>("#defeat-overlay")!;
 const defeatMessageEl = document.querySelector<HTMLElement>("#defeat-message")!;
 const startNewColonyButton = document.querySelector<HTMLButtonElement>("#start-new-colony")!;
+const evolutionButton = document.querySelector<HTMLButtonElement>("#evolution-button")!;
+const evolutionBadge = document.querySelector<HTMLElement>("#evolution-badge")!;
+const evolutionOverlay = document.querySelector<HTMLElement>("#evolution-overlay")!;
+const evolutionClose = document.querySelector<HTMLButtonElement>("#evolution-close")!;
+const evolutionPeakEl = document.querySelector<HTMLElement>("#evolution-peak")!;
+const evolutionTiersEl = document.querySelector<HTMLElement>("#evolution-tiers")!;
+const evolutionOthersEl = document.querySelector<HTMLElement>("#evolution-others")!;
+const evolutionConfirmOverlay = document.querySelector<HTMLElement>("#evolution-confirm-overlay")!;
+const evolutionConfirmText = document.querySelector<HTMLElement>("#evolution-confirm-text")!;
+const evolutionConfirmCancel = document.querySelector<HTMLButtonElement>("#evolution-confirm-cancel")!;
+const evolutionConfirmButton = document.querySelector<HTMLButtonElement>("#evolution-confirm-confirm")!;
 
 const QUEEN_RADIUS = 20;
 const NODE_RADIUS: Record<string, number> = { sugar: 8, protein: 14, biomass: 20 };
@@ -336,6 +396,14 @@ function renderResourceCounts(): void {
     .join(" · ");
 }
 
+// Stage 9: the reproduce button always shows the colony's current live
+// effective cost (Brood discounts included) — what's displayed is exactly
+// what's deducted, never a stale static "(50 protein)" label.
+function renderReproduceCost(): void {
+  if (!state) return;
+  reproduceBtn.textContent = `Reproduce worker (${state.colony.reproduceCost} protein)`;
+}
+
 function renderQueenHealth(): void {
   if (!state) return;
   queenHealthEl.textContent =
@@ -354,6 +422,131 @@ function renderWorldEvents(): void {
     }),
   );
 }
+
+// Stage 9: the tier/choice a confirm sub-step is currently open for, so the
+// confirm button's click handler knows what to POST without re-deriving it
+// from the DOM. Cleared on cancel/confirm/close, same lifecycle as any other
+// transient UI selection in this file (selectedWorkerIds, dragStart, etc.).
+let pendingEvolutionChoice: { tier: 1 | 2 | 3; choice: EvolutionChoice } | null = null;
+
+function renderEvolutionPanel(): void {
+  if (!state) return;
+  const peak = state.colony.peakPopulation;
+  const tiers: [1 | 2 | 3, EvolutionChoice | null][] = [
+    [1, state.colony.evolutionTier1],
+    [2, state.colony.evolutionTier2],
+    [3, state.colony.evolutionTier3],
+  ];
+
+  const anyUnlockedUnchosen = tiers.some(([tier, chosen]) => chosen === null && peak >= EVOLUTION_TIER_POPULATION[tier]);
+  evolutionBadge.hidden = !anyUnlockedUnchosen;
+
+  evolutionPeakEl.textContent = `Peak population: ${peak}`;
+
+  evolutionTiersEl.replaceChildren(
+    ...tiers.map(([tier, chosen]) => {
+      const threshold = EVOLUTION_TIER_POPULATION[tier];
+      const section = document.createElement("div");
+      section.className = "evolution-tier";
+      const heading = document.createElement("h3");
+      heading.textContent = `Tier ${tier}`;
+      section.append(heading);
+
+      if (chosen !== null) {
+        const p = document.createElement("p");
+        p.textContent = `${TRAIT_DISPLAY_NAMES[tier][chosen]} — ${TRAIT_EFFECT_TEXT[tier][chosen]}`;
+        section.append(p);
+      } else if (peak < threshold) {
+        const p = document.createElement("p");
+        p.className = "evolution-locked";
+        p.textContent = `Locked — reach ${threshold} peak population.`;
+        section.append(p);
+      } else {
+        const choices = document.createElement("div");
+        choices.className = "evolution-choices";
+        for (const choice of ["foraging", "survival", "brood"] as const) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = `${TRAIT_DISPLAY_NAMES[tier][choice]} — ${TRAIT_EFFECT_TEXT[tier][choice]}`;
+          button.addEventListener("click", () => openEvolutionConfirm(tier, choice));
+          choices.append(button);
+        }
+        section.append(choices);
+      }
+      return section;
+    }),
+  );
+
+  evolutionOthersEl.replaceChildren(
+    ...state.colonies
+      .filter((c) => c.id !== state!.colony.id)
+      .map((c) => {
+        const li = document.createElement("li");
+        const traitNames = [c.evolutionTier1, c.evolutionTier2, c.evolutionTier3]
+          .map((choice, i) => (choice ? TRAIT_DISPLAY_NAMES[(i + 1) as 1 | 2 | 3][choice] : "—"))
+          .join(", ");
+        li.textContent =
+          c.status === "defeated"
+            ? `Fallen Colony ${c.id} — Peak population: ${c.peakPopulation} — Evolution: ${traitNames} — Fell to: ${c.defeatCause === "abandoned" ? "Abandoned" : "Spider"}`
+            : `Colony ${c.id} — Workers: ${c.population} — Evolution: ${traitNames}`;
+        return li;
+      }),
+  );
+}
+
+function openEvolutionConfirm(tier: 1 | 2 | 3, choice: EvolutionChoice): void {
+  pendingEvolutionChoice = { tier, choice };
+  evolutionConfirmText.textContent = `Choose ${TRAIT_DISPLAY_NAMES[tier][choice]}? ${TRAIT_EFFECT_TEXT[tier][choice]} This evolution is permanent for this colony.`;
+  evolutionConfirmOverlay.hidden = false;
+}
+
+function closeEvolutionConfirm(): void {
+  pendingEvolutionChoice = null;
+  evolutionConfirmOverlay.hidden = true;
+}
+
+evolutionConfirmCancel.addEventListener("click", closeEvolutionConfirm);
+evolutionConfirmOverlay.addEventListener("click", (e) => {
+  if (e.target === evolutionConfirmOverlay) closeEvolutionConfirm();
+});
+
+evolutionConfirmButton.addEventListener("click", async () => {
+  if (!pendingEvolutionChoice) return;
+  const { tier, choice } = pendingEvolutionChoice;
+  const res = await fetch("/api/evolve", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tier, choice }),
+  });
+  const body = await res.json();
+  closeEvolutionConfirm();
+  if (!res.ok) {
+    statusEl.textContent = body.error ?? "evolution failed";
+    return;
+  }
+  statusEl.textContent = `Evolved: ${TRAIT_DISPLAY_NAMES[tier][choice]}.`;
+  setState(body);
+});
+
+// Stage 9: same discoverable, non-blocking modal convention as Help — opening
+// it never touches `state` or issues a command.
+function openEvolution(): void {
+  evolutionOverlay.hidden = false;
+}
+function closeEvolution(): void {
+  evolutionOverlay.hidden = true;
+  closeEvolutionConfirm();
+}
+evolutionButton.addEventListener("click", openEvolution);
+evolutionClose.addEventListener("click", closeEvolution);
+evolutionOverlay.addEventListener("click", (e) => {
+  if (e.target === evolutionOverlay) closeEvolution();
+});
+window.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (!evolutionConfirmOverlay.hidden) closeEvolutionConfirm();
+  else if (!evolutionOverlay.hidden) closeEvolution();
+});
 
 // Stage 8: tracks the colony id the defeat overlay was last shown/hidden
 // for, so a Start New Colony response (a *different* colony id, also
@@ -394,7 +587,9 @@ function setState(next: ColonyState): void {
   }
   renderResourceCounts();
   renderQueenHealth();
+  renderReproduceCost();
   renderWorldEvents();
+  renderEvolutionPanel();
 }
 
 // --- WASD / arrow-key panning ------------------------------------------
