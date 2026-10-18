@@ -1,5 +1,96 @@
 # Process overview
 
+## Stage 9: evolution & colony specialisation
+
+Stage 8 made colony growth survivable but still purely numerical: gather →
+reproduce → more workers → do the same things with more workers, with
+nothing to tell two colonies apart beyond raw size. This stage's brief
+asked for a permanent, player-chosen identity attached to a colony's
+*lineage*, not its session — three population milestones, three mixable
+branches (Foraging/Survival/Brood), no prerequisites, no respec, and no way
+for one colony's choices to leak into another's state or reopen PvP. I
+started with three parallel read-only passes (schema/simulation/balance,
+client/docs, the full spec suite) before writing anything, specifically to
+find what Stage 8 already gave me rather than invent new idioms — and it
+gave me more than expected: `defeatColony()`'s idempotent `UPDATE ... WHERE
+status='active'` guard is the exact shape an exactly-once evolution
+selection needs, and the inline-lifecycle-column pattern on `colonies` is
+the exact shape three nullable tier columns need. The one genuine gap was
+gathering itself: it was already real travel, but claim-on-arrival was
+instantaneous, so "gather 30% faster" (Foraging II) had nothing to shorten
+without inventing a small duration mechanic first.
+
+Six commits, each green before the next.
+The first
+([`6b3c13f`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/6b3c13f))
+is schema and constants: `peak_population` and three nullable
+`evolution_tierN` columns on `colonies`, a guarded migration mirroring
+`migrateColonyLifecycle()` exactly, and a new `evolution.ts` module whose
+single `getEvolutionModifiers()` function is the only place all seven
+derived numbers (carry yield, gather duration, two movement multipliers,
+max health, attack damage, reproduce cost) get computed — every call site
+elsewhere reads one field from it instead of branching on
+`evolution.tier1 === "foraging"` locally. The second
+([`525cc7f`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/525cc7f))
+wires all three branches into the simulation: peak population is tracked
+monotonically from `reproduce()` and never relocked by worker loss;
+Foraging II's gather duration is a per-worker in-memory channel timer, the
+same idiom the attack command's existing `cooldownRemaining` field already
+uses, not a new persistence concept; Survival I is the one piece with no
+prior art anywhere in the codebase — every existing max-health write sets
+health to a fixed constant at creation, nothing had ever rescaled a live
+worker's max health, so converting existing workers when the trait is
+chosen needed its own percentage-preserving formula
+(`newHealth = round((health / oldMax) * newMax)`), applied once inside the
+same guarded transaction as the selection itself. Foraging III's
+carry-speed bonus and Survival III's chase-speed bonus can never stack,
+because the pre-existing `!worker.carrying` guard on `issueAttackCommand`
+already makes carrying and attacking mutually exclusive — I confirmed this
+is an inherited invariant, not something I had to add. The third
+([`87d9e42`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/87d9e42))
+adds the `POST /api/evolve` route and the realtime/public state fields
+(`peakPopulation`, three `evolutionTierN` fields, `reproduceCost` on the
+player's own colony; `population`/`peakPopulation`/`evolution`/
+`defeatCause` on every roster entry), resolving `colonyId` from session
+middleware only, same as every other mutating route. The fourth
+([`96a9a53`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/96a9a53))
+is the client: a non-blocking Evolution panel at the same modal tier as
+Help, an availability badge, a confirm step before any permanent choice,
+and an "Other colonies" list that satisfies the brief's ruin-history
+requirement with a plain list driven by the existing roster rather than a
+new canvas hover/tooltip system. The fifth
+([`0bc1e13`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/0bc1e13))
+is the test suite, including a new black-box `evolution.test.ts` for
+cross-session authorization and the concurrent-selection race. The sixth
+([`3c56a93`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/3c56a93))
+documents all of it in `CLAUDE.md` and moves evolution from README's "not
+here yet" into "what's here," tied to Juul's *emergence* — the same small,
+fixed set of rules now producing colonies that diverge from each other by
+player choice.
+
+The full suite stands at 207/208, with `pnpm typecheck`/`pnpm
+check:evidence` both green. One test (the same `otherWorkers`
+spider-damage-visibility realtime assertion, pre-existing from an earlier
+stage, untouched this stage beyond a cosmetic timeout-argument-position
+change) failed under both a full-suite run and an isolated rerun; I
+confirmed it is pre-existing flakiness, not a Stage 9 regression, by
+reproducing the identical failure against a clean checkout of the
+pre-Stage-9 commit (`72b2b8c`) with all Stage 9 work stashed out, then
+restored the stash and re-ran the full suite clean (207/208, same single
+failure) before committing documentation. A throwaway script measured
+`advanceSimulation()` at full population (30 evolved colonies spanning
+every branch and mixed builds, 690 workers, 62 creatures, under real
+gather/attack commands exercising every Stage 9 per-tick branch) at
+~0.72ms/tick average, still roughly 139x headroom under the 100ms budget —
+higher than Stage 8's ~0.19ms/tick baseline, consistent with the 7.4x
+increase in worker count (93 → 690) and sub-linear, not a design concern.
+
+Production migration and manual Tier I acceptance (reaching 5 peak
+population through ordinary gameplay on a real colony, via the live
+browser UI rather than a scripted call) are deployment-stage work, reported
+separately once CI is green and the deploy completes, per the same framing
+Stage 8 used for its own post-deploy verification.
+
 ## Stage 8: queen survival, colony defeat & restart
 
 Stage 7 made individual workers mortal but left the colony itself immortal:
