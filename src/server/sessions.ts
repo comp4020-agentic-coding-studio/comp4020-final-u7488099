@@ -38,7 +38,7 @@ function buildSpawnAvoidance(): { x: number; y: number; radius: number }[] {
 
 function mintColony(): number {
   const { colonyId, queenX, queenY, workers } = createColony(buildSpawnAvoidance());
-  registerColony(colonyId, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH);
+  registerColony(colonyId, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, workers.length);
   for (const worker of workers)
     registerWorker({
       id: worker.id,

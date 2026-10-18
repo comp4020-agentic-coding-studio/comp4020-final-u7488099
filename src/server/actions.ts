@@ -1,6 +1,13 @@
-import { REPRODUCE_COST, WORKER_MAX_HEALTH } from "./balance.ts";
 import { db } from "./db.ts";
-import { defeatColony, isColonyActive, registerWorker } from "./simulation.ts";
+import { type EvolutionChoice, getEvolutionModifiers, tierThreshold } from "./evolution.ts";
+import {
+  applyEvolutionSelection,
+  defeatColony,
+  getColonyEvolution,
+  isColonyActive,
+  maybeUpdatePeakPopulation,
+  registerWorker,
+} from "./simulation.ts";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
 
@@ -16,19 +23,31 @@ export function reproduce(colonyId: number): ActionResult {
     .get(colonyId) as { queenX: number; queenY: number } | undefined;
   if (!colony) return { ok: false, error: "no such colony" };
 
+  // Stage 9: Brood I/II/III discount the actual cost used for both the
+  // affordability check and the deduction — the displayed cost and the
+  // spent cost are always the same number, per §17.
+  const evolution = getColonyEvolution(colonyId);
+  const modifiers = getEvolutionModifiers(evolution ?? { tier1: null, tier2: null, tier3: null });
+  const cost = modifiers.reproduceCost;
+
   const protein = db
     .prepare("SELECT amount FROM colony_resources WHERE colony_id = ? AND resource_type = 'protein'")
     .get(colonyId) as { amount: number } | undefined;
-  if (!protein || protein.amount < REPRODUCE_COST) return { ok: false, error: "not enough protein" };
+  if (!protein || protein.amount < cost) return { ok: false, error: "not enough protein" };
+
+  // Stage 9 Survival I: a newly hatched worker starts at the colony's
+  // current evolved max health (full health), not the flat baseline — see
+  // CLAUDE.md's Stage 9 section.
+  const maxHealth = modifiers.maxHealth;
 
   let newWorkerId = 0;
   const tx = db.transaction(() => {
     db.prepare(
       "UPDATE colony_resources SET amount = amount - ? WHERE colony_id = ? AND resource_type = 'protein'",
-    ).run(REPRODUCE_COST, colonyId);
+    ).run(cost, colonyId);
     const info = db
       .prepare("INSERT INTO workers (colony_id, x, y, health, max_health) VALUES (?, ?, ?, ?, ?)")
-      .run(colonyId, colony.queenX, colony.queenY, WORKER_MAX_HEALTH, WORKER_MAX_HEALTH);
+      .run(colonyId, colony.queenX, colony.queenY, maxHealth, maxHealth);
     newWorkerId = Number(info.lastInsertRowid);
   });
   tx();
@@ -40,9 +59,43 @@ export function reproduce(colonyId: number): ActionResult {
     colonyId,
     x: colony.queenX,
     y: colony.queenY,
-    health: WORKER_MAX_HEALTH,
-    maxHealth: WORKER_MAX_HEALTH,
+    health: maxHealth,
+    maxHealth,
   });
+  // Stage 9: reproduction is the only path that increases a colony's living
+  // worker count, so this is the one place peak population needs checking.
+  maybeUpdatePeakPopulation(colonyId);
+  return { ok: true };
+}
+
+const VALID_TIERS = [1, 2, 3] as const;
+const VALID_CHOICES: EvolutionChoice[] = ["foraging", "survival", "brood"];
+
+// Stage 9 §8: the single authoritative evolution-selection mutation. Cheap,
+// friendly pre-checks live here; the real exactly-once guarantee lives in
+// applyEvolutionSelection's guarded SQL UPDATE in simulation.ts — mirrors the
+// abandon()/defeatColony() relationship exactly.
+export function selectEvolution(colonyId: number, tier: number, choice: string): ActionResult {
+  if (!isColonyActive(colonyId)) return { ok: false, error: "colony defeated" };
+  if (!VALID_TIERS.includes(tier as 1 | 2 | 3)) return { ok: false, error: "invalid tier" };
+  if (!VALID_CHOICES.includes(choice as EvolutionChoice)) return { ok: false, error: "invalid choice" };
+
+  const evolution = getColonyEvolution(colonyId);
+  if (!evolution) return { ok: false, error: "no such colony" };
+
+  const t = tier as 1 | 2 | 3;
+  const key = `tier${t}` as const;
+  if (evolution[key] !== null) return { ok: false, error: "tier already chosen" };
+
+  const peakPopulation = db.prepare("SELECT peak_population AS peakPopulation FROM colonies WHERE id = ?").get(colonyId) as
+    | { peakPopulation: number | null }
+    | undefined;
+  if (!peakPopulation || (peakPopulation.peakPopulation ?? 0) < tierThreshold(t)) {
+    return { ok: false, error: "tier locked" };
+  }
+
+  const applied = applyEvolutionSelection(colonyId, t, choice as EvolutionChoice);
+  if (!applied) return { ok: false, error: "tier already chosen" };
   return { ok: true };
 }
 

@@ -5,6 +5,7 @@ import {
   APHID_WANDER_RADIUS,
   CREATURE_PROTEIN_VALUE,
   DEPOSIT_RANGE,
+  GATHER_DURATION,
   GATHER_RANGE,
   GATHER_YIELD,
   GOLDEN_ANGLE,
@@ -32,6 +33,7 @@ import {
   WORKER_SPEED,
 } from "./balance.ts";
 import { db } from "./db.ts";
+import { type EvolutionChoice, type EvolutionSelections, getEvolutionModifiers, NO_EVOLUTION } from "./evolution.ts";
 import { logAction } from "./log.ts";
 
 // The authoritative simulation lives here, in memory — not in SQLite and not
@@ -45,7 +47,12 @@ export type Carrying = { resourceType: string; amount: number } | null;
 type WorkerCommand =
   | { type: "idle" }
   | { type: "move"; targetX: number; targetY: number }
-  | { type: "gather"; resourceId: number; lastKnownX: number; lastKnownY: number }
+  // Stage 9: channelRemaining is absent while still traveling to the node,
+  // and set the instant arrival happens (resolveArrival) — a short in-memory
+  // timer, same idiom as attack's cooldownRemaining, never persisted. Once
+  // it ticks to zero the existing attemptGatherClaim runs exactly as before.
+  // See CLAUDE.md's Stage 9 section for why this exists at all.
+  | { type: "gather"; resourceId: number; lastKnownX: number; lastKnownY: number; channelRemaining?: number }
   | { type: "return" } // target is always the worker's own colony's nest — see nestPositions
   // Stage 6: ephemeral, same category as the rest — never written to the
   // workers table, always reset to idle on loadSimulation(). No
@@ -130,6 +137,13 @@ let worldBounds = { width: 0, height: 0 };
 // never an immediate burst. Position (x, y) is still treated as immutable
 // for the life of the process — nothing ever updates queen_x/y after
 // seeding, defeat included (a ruin keeps its original spot).
+// Stage 9: peakPopulation and evolution are both durable (see db.ts's
+// colonies columns) — loaded fresh in loadSimulation() like health/status
+// above, never reset on a restart. peakPopulation only ever increases (see
+// maybeUpdatePeakPopulation); evolution's three tier fields only ever move
+// from null to a permanent choice (see applyEvolutionSelection). Neither is
+// ever copied onto a different colony row — that's what keeps Start New
+// Colony's replacement genuinely fresh. See CLAUDE.md's Stage 9 section.
 interface SimColony {
   id: number;
   x: number;
@@ -138,6 +152,8 @@ interface SimColony {
   maxHealth: number;
   status: "active" | "defeated";
   timeSinceLastDamage: number;
+  peakPopulation: number;
+  evolution: EvolutionSelections;
 }
 
 const colonies = new Map<number, SimColony>();
@@ -157,7 +173,8 @@ export function loadSimulation(): void {
   colonies.clear();
   const colonyRows = db
     .prepare(
-      "SELECT id, queen_x AS x, queen_y AS y, status, queen_health AS health, queen_max_health AS maxHealth FROM colonies",
+      "SELECT id, queen_x AS x, queen_y AS y, status, queen_health AS health, queen_max_health AS maxHealth, " +
+        "peak_population AS peakPopulation, evolution_tier1 AS tier1, evolution_tier2 AS tier2, evolution_tier3 AS tier3 FROM colonies",
     )
     .all() as {
     id: number;
@@ -166,6 +183,10 @@ export function loadSimulation(): void {
     status: string;
     health: number;
     maxHealth: number;
+    peakPopulation: number | null;
+    tier1: EvolutionChoice | null;
+    tier2: EvolutionChoice | null;
+    tier3: EvolutionChoice | null;
   }[];
   for (const row of colonyRows) {
     colonies.set(row.id, {
@@ -176,6 +197,8 @@ export function loadSimulation(): void {
       maxHealth: row.maxHealth,
       status: row.status === "defeated" ? "defeated" : "active",
       timeSinceLastDamage: 0,
+      peakPopulation: row.peakPopulation ?? 0,
+      evolution: { tier1: row.tier1, tier2: row.tier2, tier3: row.tier3 },
     });
   }
 
@@ -630,7 +653,20 @@ export function registerWorker(worker: {
 // registerWorker above for the same reason. Stage 8: every freshly minted
 // colony starts active at full health — see db.ts's createColony(), which
 // always inserts the same values this is called with.
-export function registerColony(colonyId: number, queenX: number, queenY: number, health: number, maxHealth: number): void {
+// Stage 9: startingPopulation seeds peakPopulation (a fresh colony's peak is
+// always its own starting worker count — never 0, never inherited from
+// anywhere else), and evolution always starts at NO_EVOLUTION — there is no
+// code path that copies a tier selection from one colony row to another, so
+// every freshly minted colony (including Start New Colony's replacement and
+// spare colonies) genuinely starts evolutionarily blank. See CLAUDE.md.
+export function registerColony(
+  colonyId: number,
+  queenX: number,
+  queenY: number,
+  health: number,
+  maxHealth: number,
+  startingPopulation: number,
+): void {
   colonies.set(colonyId, {
     id: colonyId,
     x: queenX,
@@ -639,6 +675,8 @@ export function registerColony(colonyId: number, queenX: number, queenY: number,
     maxHealth,
     status: "active",
     timeSinceLastDamage: 0,
+    peakPopulation: startingPopulation,
+    evolution: NO_EVOLUTION,
   });
 }
 
@@ -757,6 +795,16 @@ export function issueGatherCommand(
   const worker = workers.get(workerId);
   if (!worker || worker.colonyId !== ownerColonyId) return "no such worker";
   if (worker.carrying) return "worker is busy returning resources";
+  // Stage 9: a worker already gathering this exact node — whether still
+  // travelling or mid-channel — is a no-op, not a redirect. Without this, a
+  // redundant re-send (a client poll loop, or a player clicking the same
+  // node twice) would stomp an in-progress gather command and, worse, wipe
+  // out a live `channelRemaining` countdown (resolveArrival), restarting
+  // Foraging II's channel from full duration every time and potentially
+  // never letting it reach zero. A redirect to a *different* resourceId
+  // still works exactly as before — only an identical resourceId is treated
+  // as "already doing this."
+  if (worker.command.type === "gather" && worker.command.resourceId === resourceId) return null;
   const node = db.prepare("SELECT x, y FROM resource_nodes WHERE id = ?").get(resourceId) as
     | { x: number; y: number }
     | undefined;
@@ -874,7 +922,14 @@ function attemptGatherClaim(worker: SimWorker, resourceId: number): boolean {
     return false;
   }
 
-  const claimedAmount = node.amount === null ? GATHER_YIELD : Math.min(GATHER_YIELD, node.amount);
+  // Stage 9 Foraging I: a colony's effective carry yield substitutes for the
+  // flat GATHER_YIELD constant here — the node-depletion math and the
+  // "claim is always capped at what's actually left" invariant below are
+  // completely untouched, since the claim is still read fresh inside this
+  // same transaction. See CLAUDE.md's Stage 9 section.
+  const colony = colonies.get(worker.colonyId);
+  const carryYield = colony ? getEvolutionModifiers(colony.evolution).carryYield : GATHER_YIELD;
+  const claimedAmount = node.amount === null ? carryYield : Math.min(carryYield, node.amount);
   const tx = db.transaction(() => {
     if (node.amount !== null) {
       const remaining = node.amount - claimedAmount;
@@ -1018,13 +1073,30 @@ export function isColonyActive(colonyId: number): boolean {
 // as authoritative, so the client's queen health bar/ruin styling can never
 // show a value that's behind what issueMoveCommand etc. are enforcing
 // against.
-export function getColonySnapshot(
-  colonyId: number,
-): { id: number; x: number; y: number; health: number; maxHealth: number; status: "active" | "defeated" } | undefined {
+export function getColonySnapshot(colonyId: number):
+  | {
+      id: number;
+      x: number;
+      y: number;
+      health: number;
+      maxHealth: number;
+      status: "active" | "defeated";
+      peakPopulation: number;
+      evolution: EvolutionSelections;
+    }
+  | undefined {
   const colony = colonies.get(colonyId);
   if (!colony) return undefined;
-  const { id, x, y, health, maxHealth, status } = colony;
-  return { id, x, y, health, maxHealth, status };
+  const { id, x, y, health, maxHealth, status, peakPopulation, evolution } = colony;
+  return { id, x, y, health, maxHealth, status, peakPopulation, evolution };
+}
+
+// Stage 9: actions.ts's reproduce()/selectEvolution() need just the three
+// tier selections (not the whole position/health snapshot above) to compute
+// modifiers and check eligibility — a small, purpose-built accessor rather
+// than making every caller destructure getColonySnapshot's larger shape.
+export function getColonyEvolution(colonyId: number): EvolutionSelections | undefined {
+  return colonies.get(colonyId)?.evolution;
 }
 
 export function getAllColonies(): {
@@ -1034,10 +1106,87 @@ export function getAllColonies(): {
   health: number;
   maxHealth: number;
   status: "active" | "defeated";
+  population: number;
+  peakPopulation: number;
+  evolution: EvolutionSelections;
 }[] {
   return [...colonies.values()]
     .sort((a, b) => a.id - b.id)
-    .map(({ id, x, y, health, maxHealth, status }) => ({ id, x, y, health, maxHealth, status }));
+    .map(({ id, x, y, health, maxHealth, status, peakPopulation, evolution }) => ({
+      id,
+      x,
+      y,
+      health,
+      maxHealth,
+      status,
+      population: getWorkersForColony(id).length,
+      peakPopulation,
+      evolution,
+    }));
+}
+
+// Stage 9: the only path that currently increases a colony's worker count
+// (reproduce()) calls this immediately after registering the new worker.
+// peakPopulation only ever moves upward — losing workers (death, defeat)
+// never lowers it, which is exactly what makes tier eligibility permanent
+// once reached (§3). A rare, discrete event, not a per-tick scan, so a
+// synchronous write here is cheap and matches checkpointSimulation's own
+// "synchronous for correctness-critical discrete events" discipline.
+export function maybeUpdatePeakPopulation(colonyId: number): void {
+  const colony = colonies.get(colonyId);
+  if (!colony) return;
+  const current = getWorkersForColony(colonyId).length;
+  if (current <= colony.peakPopulation) return;
+  colony.peakPopulation = current;
+  db.prepare("UPDATE colonies SET peak_population = ? WHERE id = ?").run(current, colonyId);
+}
+
+// Stage 9: the single authoritative, idempotent mutator for a permanent
+// evolution choice — mirrors defeatColony's `WHERE status = 'active'` guard
+// exactly, just against a tier column instead: `result.changes === 0` means
+// either the tier was already chosen or lost a race to a concurrent request,
+// and either way nothing further happens. Exactly-once is enforced by
+// SQLite itself, not by caller discipline (actions.ts's selectEvolution does
+// its own cheap pre-checks for fast, friendly error messages, but the real
+// guarantee lives here). See CLAUDE.md's Stage 9 section.
+export function applyEvolutionSelection(colonyId: number, tier: 1 | 2 | 3, choice: EvolutionChoice): boolean {
+  const column = `evolution_tier${tier}`;
+  const result = db
+    .prepare(`UPDATE colonies SET ${column} = ? WHERE id = ? AND ${column} IS NULL`)
+    .run(choice, colonyId);
+  if (result.changes === 0) return false;
+
+  const colony = colonies.get(colonyId);
+  if (!colony) return true; // DB updated; in-memory cache will catch up on next loadSimulation
+  if (tier === 1) colony.evolution = { ...colony.evolution, tier1: choice };
+  else if (tier === 2) colony.evolution = { ...colony.evolution, tier2: choice };
+  else colony.evolution = { ...colony.evolution, tier3: choice };
+
+  // Survival I's retroactive conversion (§14): every existing living worker
+  // of this colony has its health/maxHealth rescaled in the same transaction
+  // as the selection itself, preserving each worker's current HEALTH
+  // PERCENTAGE rather than leaving it stale or magically full-healing. This
+  // is genuinely new logic with no prior art in this codebase — every other
+  // max-health write in the project sets health = maxHealth to a fixed
+  // constant at creation time; nothing before this has ever rescaled a live
+  // entity's max health. Deterministic rounding: Math.round, stated once.
+  if (tier === 1 && choice === "survival") {
+    const newMax = getEvolutionModifiers(colony.evolution).maxHealth;
+    const affected = [...workers.values()].filter((w) => w.colonyId === colonyId);
+    const tx = db.transaction(() => {
+      for (const worker of affected) {
+        const newHealth = Math.round((worker.health / worker.maxHealth) * newMax);
+        db.prepare("UPDATE workers SET health = ?, max_health = ? WHERE id = ?").run(newHealth, newMax, worker.id);
+        worker.health = newHealth;
+        worker.maxHealth = newMax;
+      }
+    });
+    tx();
+    dirty = true;
+  }
+
+  logAction(colonyId, "colony_evolved", { tier, choice });
+  return true;
 }
 
 // Stage 8: the single authoritative, idempotent entry point for ending a
@@ -1140,12 +1289,21 @@ function handleAttackCommand(
     return;
   }
 
+  // Stage 9 Survival III: the existing issueAttackCommand guard
+  // (!worker.carrying) already prevents a worker from being both carrying
+  // and attacking at once, so this chase-speed bonus and Foraging III's
+  // carry-speed bonus (in advanceSimulation's movement step below) can never
+  // stack — an existing invariant, not new code. See CLAUDE.md.
+  const colony = colonies.get(worker.colonyId);
+  const modifiers = colony ? getEvolutionModifiers(colony.evolution) : undefined;
+  const attackSpeed = WORKER_SPEED * (modifiers?.chaseSpeedMultiplier ?? 1);
+
   const dx = creature.x - worker.x;
   const dy = creature.y - worker.y;
   const dist = Math.hypot(dx, dy);
 
   if (dist > WORKER_ATTACK_RANGE) {
-    const step = Math.min(WORKER_SPEED * dt, dist - WORKER_ATTACK_RANGE + ARRIVAL_EPSILON);
+    const step = Math.min(attackSpeed * dt, dist - WORKER_ATTACK_RANGE + ARRIVAL_EPSILON);
     worker.x = clamp(worker.x + (dx / dist) * step + separation.dx, 0, worldBounds.width);
     worker.y = clamp(worker.y + (dy / dist) * step + separation.dy, 0, worldBounds.height);
   } else {
@@ -1160,7 +1318,11 @@ function handleAttackCommand(
   if (dist <= WORKER_ATTACK_RANGE && cooldownRemaining <= 0) {
     const creatureId = creature.id;
     const species = creature.species;
-    const carcassId = applyDamage(creature, WORKER_ATTACK_DAMAGE);
+    // Stage 9 Survival II: applies only along this existing creature-attack
+    // path (aphids, spiders) — attack target resolution never touches
+    // workers/colonies, so this cannot introduce PvP by construction.
+    const attackDamage = modifiers?.attackDamage ?? WORKER_ATTACK_DAMAGE;
+    const carcassId = applyDamage(creature, attackDamage);
     // Stage 7: aphid kills deliberately get no new log line (existing
     // aphid-combat tests/assertions are unaffected) — only a lethal hit on a
     // spider logs, gated on species.
@@ -1292,9 +1454,20 @@ function resolveTarget(
 // the queen is never deposited in the same tick — this only converts
 // gather -> return, mirroring how gather -> move demotion above also never
 // re-checks arrival same-tick. See CLAUDE.md.
+// Stage 9 Foraging II: arrival no longer claims instantly — it starts a
+// short in-memory channel timer instead (advanceSimulation's gather branch
+// below ticks it down and performs the actual claim once it reaches zero).
+// Gathering had no duration of any kind to speed up before this; rather than
+// invent a large harvesting subsystem, every worker (evolved or not) now
+// spends GATHER_DURATION seconds channeling on arrival, shortened by
+// Foraging II's modifier — the smallest meaningful interpretation consistent
+// with the brief's explicit permission (§12). See CLAUDE.md's Stage 9
+// section for the full rationale.
 function resolveArrival(worker: SimWorker, command: WorkerCommand): void {
   if (command.type === "gather") {
-    worker.command = attemptGatherClaim(worker, command.resourceId) ? { type: "return" } : { type: "idle" };
+    const colony = colonies.get(worker.colonyId);
+    const duration = colony ? getEvolutionModifiers(colony.evolution).gatherDuration : GATHER_DURATION;
+    worker.command = { ...command, channelRemaining: duration };
     return;
   }
   if (command.type === "return") {
@@ -1355,6 +1528,28 @@ export function advanceSimulation(dt: number): void {
       continue;
     }
 
+    // Stage 9 Foraging II: a worker that's already arrived and is channeling
+    // (channelRemaining set by resolveArrival) doesn't move and doesn't
+    // re-check the node's existence — it's standing still, counting down.
+    // Still takes the separation nudge so a channeling worker doesn't block
+    // others from settling nearby, same as idle above.
+    if (worker.command.type === "gather" && worker.command.channelRemaining !== undefined) {
+      const newX = clamp(worker.x + separation.dx, 0, worldBounds.width);
+      const newY = clamp(worker.y + separation.dy, 0, worldBounds.height);
+      if (newX !== worker.x || newY !== worker.y) {
+        worker.x = newX;
+        worker.y = newY;
+        dirty = true;
+      }
+      const remaining = worker.command.channelRemaining - dt;
+      if (remaining > 0) {
+        worker.command = { ...worker.command, channelRemaining: remaining };
+      } else {
+        worker.command = attemptGatherClaim(worker, worker.command.resourceId) ? { type: "return" } : { type: "idle" };
+      }
+      continue;
+    }
+
     // A resource that's disappeared since this command was issued (claimed
     // by another worker) converts the command into a plain move toward its
     // last-known position — same target, no further claim attempt. This
@@ -1384,7 +1579,16 @@ export function advanceSimulation(dt: number): void {
     // vacated), so separation's pull is frequently pointed dead against
     // attraction there; letting it onto an arriving tick could cancel the
     // final step and stall the claim indefinitely. See CLAUDE.md.
-    const step = Math.min(WORKER_SPEED * dt, dist - arrivalRange);
+    // Stage 9 Foraging III: a carrying worker's `return` travel gets a speed
+    // multiplier, applied dynamically here — never a stored per-worker speed
+    // stat, and never applied to outbound gather/move travel (worker.carrying
+    // is only ever set while the command is "return" — see
+    // issueMoveCommand/issueGatherCommand's own carrying guards).
+    const moveColony = colonies.get(worker.colonyId);
+    const carrySpeedMultiplier =
+      worker.carrying && moveColony ? getEvolutionModifiers(moveColony.evolution).carryMoveSpeedMultiplier : 1;
+    const effectiveSpeed = WORKER_SPEED * carrySpeedMultiplier;
+    const step = Math.min(effectiveSpeed * dt, dist - arrivalRange);
     const attractedX = worker.x + (dx / dist) * step;
     const attractedY = worker.y + (dy / dist) * step;
     const attractedDist = Math.hypot(targetX - attractedX, targetY - attractedY);

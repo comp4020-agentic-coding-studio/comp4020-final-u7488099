@@ -1,4 +1,5 @@
 import { db } from "./db.ts";
+import { type EvolutionChoice, traitDisplayName } from "./evolution.ts";
 
 // Crit 10: durable "who did what" record, backing GET /api/log. Also prints
 // a concise one-line stdout record of the same event — the thing an operator
@@ -44,7 +45,7 @@ export function getLog(): LogEntry[] {
 // ids that are fine for GET /api/log but needless noise for a glanceable
 // feed. Bounded + ordered newest-first, same shape every other bounded
 // query in this codebase uses.
-const WORLD_EVENT_ACTIONS = ["worker_died", "spider_died", "colony_defeated", "colony_started"];
+const WORLD_EVENT_ACTIONS = ["worker_died", "spider_died", "colony_defeated", "colony_started", "colony_evolved"];
 
 export function getWorldEvents(limit = 6): { message: string }[] {
   const placeholders = WORLD_EVENT_ACTIONS.map(() => "?").join(", ");
@@ -75,6 +76,12 @@ export function getWorldEvents(limit = 6): { message: string }[] {
       case "colony_started":
         messages.push({ message: "A new colony has emerged." });
         break;
+      case "colony_evolved": {
+        const tier = detail.tier as 1 | 2 | 3;
+        const choice = detail.choice as EvolutionChoice;
+        messages.push({ message: `Colony ${row.colonyId} evolved ${traitDisplayName(tier, choice)}.` });
+        break;
+      }
     }
   }
   return messages;
