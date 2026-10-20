@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
   APHID_SEED_POSITIONS,
+  type Caste,
   colonySpiralPosition,
   QUEEN_MAX_HEALTH,
   RESOURCE_NODES,
@@ -45,6 +46,7 @@ migrateCreatureHealth();
 migrateWorkerHealth();
 migrateColonyLifecycle();
 migrateColonyEvolution();
+migrateWorkerCaste();
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS worlds (
@@ -96,6 +98,12 @@ db.exec(`
   -- health/max_health are nullable so a fresh ALTER on an already-deployed
   -- DB is cheap; backfillWorkerHealth() fills them in immediately. See
   -- CLAUDE.md.
+  -- Stage 10: caste is a durable, persistent property of the unit (worker/
+  -- soldier/scout). 'worker' is the only honest default for every row that
+  -- predates castes — unlike status/peak_population above, a constant
+  -- string default needs no separate nullable+backfill step; SQLite's
+  -- ALTER TABLE ADD COLUMN supports NOT NULL DEFAULT '<constant>' directly
+  -- (see migrateWorkerCaste()). See CLAUDE.md.
   CREATE TABLE IF NOT EXISTS workers (
     id INTEGER PRIMARY KEY,
     colony_id INTEGER NOT NULL REFERENCES colonies(id),
@@ -105,6 +113,7 @@ db.exec(`
     carrying_amount REAL,
     health REAL,
     max_health REAL,
+    caste TEXT NOT NULL DEFAULT 'worker',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -348,6 +357,20 @@ function backfillColonyEvolution(): void {
   }
 }
 
+// Stage 10: workers gain a durable caste column. Unlike migrateWorkerHealth
+// (health has no single honest default), 'worker' is the only honest value
+// for every row that predates castes — Soldier/Scout never existed before
+// this stage — so this ALTER adds NOT NULL DEFAULT 'worker' directly and
+// needs no separate backfillWorkerCaste() pass: SQLite applies the default
+// to every existing row as part of the ALTER itself. Mirrors
+// migrateWorkerHealth()'s guard pattern.
+function migrateWorkerCaste(): void {
+  const columns = db.prepare("PRAGMA table_info(workers)").all() as { name: string }[];
+  if (columns.length === 0) return; // table doesn't exist yet; CREATE TABLE below defines it with the column
+  if (columns.some((c) => c.name === "caste")) return;
+  db.exec("ALTER TABLE workers ADD COLUMN caste TEXT NOT NULL DEFAULT 'worker'");
+}
+
 // Pre-Crit-10 this was "the" one global colony. It still seeds exactly the
 // same way (same world-centre queen position, same 3 starting workers) — but
 // as of Crit 10 it starts out unowned, and becomes whichever session asks
@@ -396,20 +419,33 @@ function seedColonyResources(colonyId: number): void {
   for (const type of RESOURCE_TYPES) insertResourceBucket.run(colonyId, type, type === "protein" ? STARTING_PROTEIN : 0);
 }
 
+// Stage 10 (§37/§38): every starting/replacement-colony worker is explicitly
+// pinned to caste='worker' here — not left to rely on the column default —
+// so a pre-minted spare colony or a fresh "Start New Colony" can never
+// accidentally spawn a Soldier/Scout, matching this codebase's standing
+// discipline of explicit-at-insert over backfill-reliant for anything a
+// spawn path controls.
 function spawnStartingWorkers(
   colonyId: number,
   queenX: number,
   queenY: number,
-): { id: number; x: number; y: number; health: number; maxHealth: number }[] {
+): { id: number; x: number; y: number; health: number; maxHealth: number; caste: Caste }[] {
   const insertWorker = db.prepare(
-    "INSERT INTO workers (colony_id, x, y, health, max_health) VALUES (?, ?, ?, ?, ?)",
+    "INSERT INTO workers (colony_id, x, y, health, max_health, caste) VALUES (?, ?, ?, ?, ?, 'worker')",
   );
-  const workers: { id: number; x: number; y: number; health: number; maxHealth: number }[] = [];
+  const workers: { id: number; x: number; y: number; health: number; maxHealth: number; caste: Caste }[] = [];
   for (let i = 0; i < STARTING_WORKERS; i++) {
     const x = queenX + (i - 1) * 50;
     const y = queenY + 50;
     const { lastInsertRowid } = insertWorker.run(colonyId, x, y, WORKER_MAX_HEALTH, WORKER_MAX_HEALTH);
-    workers.push({ id: Number(lastInsertRowid), x, y, health: WORKER_MAX_HEALTH, maxHealth: WORKER_MAX_HEALTH });
+    workers.push({
+      id: Number(lastInsertRowid),
+      x,
+      y,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
+    });
   }
   return workers;
 }
@@ -598,7 +634,7 @@ export function createColony(avoid: { x: number; y: number; radius: number }[] =
   colonyId: number;
   queenX: number;
   queenY: number;
-  workers: { id: number; x: number; y: number; health: number; maxHealth: number }[];
+  workers: { id: number; x: number; y: number; health: number; maxHealth: number; caste: Caste }[];
 } {
   const world = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number } | undefined;
   if (!world) throw new Error("no world seeded");
@@ -607,7 +643,7 @@ export function createColony(avoid: { x: number; y: number; radius: number }[] =
   const { x: queenX, y: queenY } = pickSpawnPosition(index, avoid);
 
   let colonyId = 0;
-  let workers: { id: number; x: number; y: number; health: number; maxHealth: number }[] = [];
+  let workers: { id: number; x: number; y: number; health: number; maxHealth: number; caste: Caste }[] = [];
   const tx = db.transaction(() => {
     const colonyInfo = db
       .prepare(

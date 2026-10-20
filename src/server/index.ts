@@ -90,12 +90,19 @@ app.get("/api/log", (_req, res) => {
 });
 
 app.post("/api/reproduce", (req, res) => {
-  const result = reproduce(req.colonyId);
+  // Stage 10: the client requests a caste, never colony authority —
+  // req.colonyId still resolves exclusively from session middleware above.
+  const { caste } = (req.body ?? {}) as { caste?: unknown };
+  if (caste !== "worker" && caste !== "soldier" && caste !== "scout") {
+    res.status(400).json({ ok: false, error: "invalid caste" });
+    return;
+  }
+  const result = reproduce(req.colonyId, caste);
   if (!result.ok) {
     res.status(400).json(result);
     return;
   }
-  logAction(req.colonyId, "reproduce");
+  logAction(req.colonyId, "reproduce", { caste });
   const state = getState(req.colonyId);
   broadcastState();
   res.json(state);

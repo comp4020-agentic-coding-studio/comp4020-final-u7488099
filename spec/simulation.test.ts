@@ -107,7 +107,7 @@ function workerById(id: number) {
 // row, which is fine: nothing but checkpointSimulation() reads that table,
 // and these tests never call it.
 function registerTestWorker(id: number, x: number, y: number, health: number = WORKER_MAX_HEALTH) {
-  sim.registerWorker({ id, colonyId: colony.id, x, y, health, maxHealth: WORKER_MAX_HEALTH });
+  sim.registerWorker({ id, colonyId: colony.id, x, y, health, maxHealth: WORKER_MAX_HEALTH, caste: "worker" });
   return workerById(id);
 }
 
@@ -245,6 +245,7 @@ describe("gradual movement", () => {
       carrying: null,
       health: WORKER_MAX_HEALTH,
       maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
     });
     expect(sim.getWorkerCommand(worker.id)).toBe("idle");
   });
@@ -732,6 +733,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
       y: proteinNode.y,
       health: WORKER_MAX_HEALTH,
       maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
     });
     expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
     advanceThroughGatherChannel();
@@ -757,6 +759,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
       y: queen.y,
       health: WORKER_MAX_HEALTH,
       maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
     });
 
     expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
@@ -786,7 +789,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
     advanceThroughGatherChannel();
     expect(workerById(worker.id).carrying).toEqual({ resourceType: "protein", amount: GATHER_YIELD });
 
-    expect(actions.reproduce(colony.id)).toEqual({ ok: false, error: "not enough protein" });
+    expect(actions.reproduce(colony.id, "worker")).toEqual({ ok: false, error: "not enough protein" });
   });
 
   it("a carrying worker rejects move and gather commands, leaving its state unchanged", () => {
@@ -816,7 +819,7 @@ describe("Stage 7: worker health", () => {
       REPRODUCE_COST,
       colony.id,
     );
-    expect(actions.reproduce(colony.id)).toEqual({ ok: true });
+    expect(actions.reproduce(colony.id, "worker")).toEqual({ ok: true });
 
     const newWorker = sim.getWorkersForColony(colony.id).at(-1)!;
     expect(newWorker.health).toBe(WORKER_MAX_HEALTH);
@@ -994,7 +997,7 @@ describe("Stage 7: spider AI", () => {
 
     // Move the target away (still within disengage range) and confirm the
     // spider's next step closes distance toward the *new* position.
-    sim.registerWorker({ id: worker.id, colonyId: colony.id, x: 1000, y: 1000 + SPIDER_DISENGAGE_RANGE - 20, health: WORKER_MAX_HEALTH, maxHealth: WORKER_MAX_HEALTH });
+    sim.registerWorker({ id: worker.id, colonyId: colony.id, x: 1000, y: 1000 + SPIDER_DISENGAGE_RANGE - 20, health: WORKER_MAX_HEALTH, maxHealth: WORKER_MAX_HEALTH, caste: "worker" });
     const before = Math.hypot(creatureById(spiderId).x - worker.x, creatureById(spiderId).y - (1000 + SPIDER_DISENGAGE_RANGE - 20));
 
     sim.advanceSimulation(TICK_DT);
@@ -1019,6 +1022,7 @@ describe("Stage 7: spider AI", () => {
       y: 1000 + SPIDER_DISENGAGE_RANGE + 50,
       health: WORKER_MAX_HEALTH,
       maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
     });
 
     sim.advanceSimulation(TICK_DT);
@@ -1084,6 +1088,7 @@ describe("Stage 7: spider AI", () => {
       y: 1000 + SPIDER_AGGRO_RANGE - 10,
       health: WORKER_MAX_HEALTH,
       maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
     });
 
     sim.advanceSimulation(TICK_DT);
@@ -1499,7 +1504,13 @@ describe("Stage 6: hunting, combat, carcasses", () => {
   });
 
   it("command override: a second attack retargets the worker, and a move command replaces an attack outright", () => {
-    const farCreatureId = insertCreature(100, 100);
+    // Stage 10: fog of war means a creature must be within some vision
+    // source's radius to be a legal attack target at all. The "far"
+    // creature only needs to be far enough from the worker's start that one
+    // tick's movement toward it doesn't close to attack range yet — it
+    // still has to sit inside the worker's own VISION_RADIUS.worker (180)
+    // to be targetable in the first place.
+    const farCreatureId = insertCreature(2000, 1850);
     const nearCreatureId = insertCreature(2000, 2000);
     sim.loadSimulation();
     const worker = registerTestWorker(13019, 2000, 2000); // starts on top of the "near" creature
@@ -1529,6 +1540,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
       y: creature.y,
       health: WORKER_MAX_HEALTH,
       maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
     });
     expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBeNull();
     sim.advanceSimulation(TICK_DT);
@@ -1967,7 +1979,7 @@ describe("Stage 8: colony defeat", () => {
     expect(sim.issueMoveCommand(workerId, 10, 10, colony.id)).toBe("colony defeated");
     expect(sim.issueGatherCommand(workerId, 1, colony.id)).toBe("colony defeated");
     expect(sim.issueAttackCommand(workerId, 1, colony.id)).toBe("colony defeated");
-    expect(actions.reproduce(colony.id)).toEqual({ ok: false, error: "colony defeated" });
+    expect(actions.reproduce(colony.id, "worker")).toEqual({ ok: false, error: "colony defeated" });
   });
 
   it("M: a colony's defeat has no effect on an unrelated active colony's workers, resources, or status", async () => {
@@ -1982,6 +1994,7 @@ describe("Stage 8: colony defeat", () => {
         y: worker.y,
         health: worker.health,
         maxHealth: worker.maxHealth,
+        caste: worker.caste,
       });
     }
     const otherWorkerCount = sim.getWorkersForColony(other.colonyId).length;
@@ -2004,7 +2017,7 @@ describe("Stage 9: peak population", () => {
       REPRODUCE_COST,
       colony.id,
     );
-    expect(actions.reproduce(colony.id)).toEqual({ ok: true });
+    expect(actions.reproduce(colony.id, "worker")).toEqual({ ok: true });
     expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 1);
   });
 
@@ -2021,7 +2034,7 @@ describe("Stage 9: peak population", () => {
       REPRODUCE_COST,
       colony.id,
     );
-    expect(actions.reproduce(colony.id)).toEqual({ ok: true });
+    expect(actions.reproduce(colony.id, "worker")).toEqual({ ok: true });
     sim.loadSimulation();
     expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 1);
   });
@@ -2031,7 +2044,7 @@ describe("Stage 9: peak population", () => {
       REPRODUCE_COST,
       colony.id,
     );
-    expect(actions.reproduce(colony.id)).toEqual({ ok: true });
+    expect(actions.reproduce(colony.id, "worker")).toEqual({ ok: true });
     expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 1);
 
     sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
@@ -2044,7 +2057,7 @@ describe("Stage 9: peak population", () => {
       REPRODUCE_COST,
       colony.id,
     );
-    expect(actions.reproduce(colony.id)).toEqual({ ok: true }); // old colony's peak is now above STARTING_WORKERS
+    expect(actions.reproduce(colony.id, "worker")).toEqual({ ok: true }); // old colony's peak is now above STARTING_WORKERS
     sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
 
     const { createColony } = await import("../src/server/db.ts");
@@ -2060,7 +2073,7 @@ describe("Stage 9: peak population", () => {
 
 describe("Stage 9: evolution modifiers", () => {
   it("every modifier defaults to baseline when no evolution has been chosen", () => {
-    const modifiers = getEvolutionModifiers(NO_EVOLUTION);
+    const modifiers = getEvolutionModifiers(NO_EVOLUTION, "worker");
     expect(modifiers).toEqual({
       carryYield: GATHER_YIELD,
       gatherDuration: GATHER_DURATION,
@@ -2073,67 +2086,67 @@ describe("Stage 9: evolution modifiers", () => {
   });
 
   it("Foraging I (Strong Mandibles) increases effective carry yield, and only that field", () => {
-    const base = getEvolutionModifiers(NO_EVOLUTION);
-    const modifiers = getEvolutionModifiers({ tier1: "foraging", tier2: null, tier3: null });
+    const base = getEvolutionModifiers(NO_EVOLUTION, "worker");
+    const modifiers = getEvolutionModifiers({ tier1: "foraging", tier2: null, tier3: null }, "worker");
     expect(modifiers.carryYield).toBe(Math.round(GATHER_YIELD * FORAGING_I_CARRY_MULTIPLIER));
     expect({ ...modifiers, carryYield: base.carryYield }).toEqual(base);
   });
 
   it("Foraging II (Efficient Foragers) shortens gather duration, and only that field", () => {
-    const base = getEvolutionModifiers(NO_EVOLUTION);
-    const modifiers = getEvolutionModifiers({ tier1: null, tier2: "foraging", tier3: null });
+    const base = getEvolutionModifiers(NO_EVOLUTION, "worker");
+    const modifiers = getEvolutionModifiers({ tier1: null, tier2: "foraging", tier3: null }, "worker");
     expect(modifiers.gatherDuration).toBeCloseTo(GATHER_DURATION / FORAGING_II_GATHER_SPEED_MULTIPLIER);
     expect({ ...modifiers, gatherDuration: base.gatherDuration }).toEqual(base);
   });
 
   it("Foraging III (Trail Instinct) raises carry move speed, and only that field", () => {
-    const base = getEvolutionModifiers(NO_EVOLUTION);
-    const modifiers = getEvolutionModifiers({ tier1: null, tier2: null, tier3: "foraging" });
+    const base = getEvolutionModifiers(NO_EVOLUTION, "worker");
+    const modifiers = getEvolutionModifiers({ tier1: null, tier2: null, tier3: "foraging" }, "worker");
     expect(modifiers.carryMoveSpeedMultiplier).toBe(FORAGING_III_CARRY_SPEED_MULTIPLIER);
     expect({ ...modifiers, carryMoveSpeedMultiplier: base.carryMoveSpeedMultiplier }).toEqual(base);
   });
 
   it("Survival I (Hardened Carapace) raises worker max health, and only that field", () => {
-    const base = getEvolutionModifiers(NO_EVOLUTION);
-    const modifiers = getEvolutionModifiers({ tier1: "survival", tier2: null, tier3: null });
+    const base = getEvolutionModifiers(NO_EVOLUTION, "worker");
+    const modifiers = getEvolutionModifiers({ tier1: "survival", tier2: null, tier3: null }, "worker");
     expect(modifiers.maxHealth).toBe(Math.round(WORKER_MAX_HEALTH * SURVIVAL_I_HEALTH_MULTIPLIER));
     expect({ ...modifiers, maxHealth: base.maxHealth }).toEqual(base);
   });
 
   it("Survival II (Powerful Mandibles) raises attack damage, and only that field", () => {
-    const base = getEvolutionModifiers(NO_EVOLUTION);
-    const modifiers = getEvolutionModifiers({ tier1: null, tier2: "survival", tier3: null });
+    const base = getEvolutionModifiers(NO_EVOLUTION, "worker");
+    const modifiers = getEvolutionModifiers({ tier1: null, tier2: "survival", tier3: null }, "worker");
     expect(modifiers.attackDamage).toBe(Math.round(WORKER_ATTACK_DAMAGE * SURVIVAL_II_ATTACK_MULTIPLIER));
     expect({ ...modifiers, attackDamage: base.attackDamage }).toEqual(base);
   });
 
   it("Survival III (Predator Instinct) raises chase speed, and only that field", () => {
-    const base = getEvolutionModifiers(NO_EVOLUTION);
-    const modifiers = getEvolutionModifiers({ tier1: null, tier2: null, tier3: "survival" });
+    const base = getEvolutionModifiers(NO_EVOLUTION, "worker");
+    const modifiers = getEvolutionModifiers({ tier1: null, tier2: null, tier3: "survival" }, "worker");
     expect(modifiers.chaseSpeedMultiplier).toBe(SURVIVAL_III_CHASE_SPEED_MULTIPLIER);
     expect({ ...modifiers, chaseSpeedMultiplier: base.chaseSpeedMultiplier }).toEqual(base);
   });
 
   it("Brood discount is tier-effective, not cumulative — the highest Brood tier chosen always wins", () => {
-    expect(getEvolutionModifiers({ tier1: "brood", tier2: null, tier3: null }).reproduceCost).toBe(
+    expect(getEvolutionModifiers({ tier1: "brood", tier2: null, tier3: null }, "worker").reproduceCost).toBe(
       Math.round(REPRODUCE_COST * BROOD_I_COST_MULTIPLIER),
     );
-    expect(getEvolutionModifiers({ tier1: null, tier2: "brood", tier3: null }).reproduceCost).toBe(
+    expect(getEvolutionModifiers({ tier1: null, tier2: "brood", tier3: null }, "worker").reproduceCost).toBe(
       Math.round(REPRODUCE_COST * BROOD_II_COST_MULTIPLIER),
     );
-    expect(getEvolutionModifiers({ tier1: null, tier2: null, tier3: "brood" }).reproduceCost).toBe(
+    expect(getEvolutionModifiers({ tier1: null, tier2: null, tier3: "brood" }, "worker").reproduceCost).toBe(
       Math.round(REPRODUCE_COST * BROOD_III_COST_MULTIPLIER),
     );
     // Brood I + Brood II chosen: tier II (higher) wins outright, not stacked/multiplied with tier I.
-    expect(getEvolutionModifiers({ tier1: "brood", tier2: "brood", tier3: null }).reproduceCost).toBe(
+    expect(getEvolutionModifiers({ tier1: "brood", tier2: "brood", tier3: null }, "worker").reproduceCost).toBe(
       Math.round(REPRODUCE_COST * BROOD_II_COST_MULTIPLIER),
     );
     // Brood I + Brood III chosen: tier III (highest) wins, even skipping tier II entirely.
-    expect(getEvolutionModifiers({ tier1: "brood", tier2: null, tier3: "brood" }).reproduceCost).toBe(
+    expect(getEvolutionModifiers({ tier1: "brood", tier2: null, tier3: "brood" }, "worker").reproduceCost).toBe(
       Math.round(REPRODUCE_COST * BROOD_III_COST_MULTIPLIER),
     );
     // A non-Brood tier 3 choice doesn't block a lower Brood tier from applying.
-    expect(getEvolutionModifiers({ tier1: "brood", tier2: null, tier3: "foraging" }).reproduceCost).toBe(
+    expect(getEvolutionModifiers({ tier1: "brood", tier2: null, tier3: "foraging" }, "worker").reproduceCost).toBe(
       Math.round(REPRODUCE_COST * BROOD_I_COST_MULTIPLIER),
     );
   });
@@ -2194,6 +2207,7 @@ describe("Stage 9: evolution modifiers", () => {
         y: worker.y,
         health: worker.health,
         maxHealth: worker.maxHealth,
+        caste: worker.caste,
       });
     }
 
@@ -2213,7 +2227,7 @@ describe("Stage 9: mixed builds", () => {
     expect(sim.applyEvolutionSelection(colony.id, 3, "brood")).toBe(true);
 
     const evolution = sim.getColonyEvolution(colony.id)!;
-    const modifiers = getEvolutionModifiers(evolution);
+    const modifiers = getEvolutionModifiers(evolution, "worker");
 
     // Present: Foraging I, Survival II, Brood III.
     expect(modifiers.carryYield).toBe(Math.round(GATHER_YIELD * FORAGING_I_CARRY_MULTIPLIER));

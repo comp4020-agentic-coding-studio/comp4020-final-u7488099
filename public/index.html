@@ -236,7 +236,9 @@
         box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
       }
       #abandon-button:disabled,
-      #reproduce:disabled {
+      #reproduce-worker:disabled,
+      #reproduce-soldier:disabled,
+      #reproduce-scout:disabled {
         opacity: 0.5;
         cursor: default;
       }
@@ -340,7 +342,11 @@
         Drag a box around workers to select them, then click a resource node, an aphid, or empty ground to command
         them. Right/middle-drag or WASD/arrows to look around. Click "How to play" above for the full guide.
       </p>
-      <button id="reproduce">Reproduce worker (50 protein)</button>
+      <div id="reproduce-buttons">
+        <button id="reproduce-worker">Worker (50 protein)</button>
+        <button id="reproduce-soldier">Soldier (100 protein)</button>
+        <button id="reproduce-scout">Scout (60 protein)</button>
+      </div>
       <p id="status"></p>
       <div id="world-events">
         <h3>World events</h3>
@@ -380,7 +386,10 @@
             A worker already carrying resources home ignores new move/gather/attack orders until it deposits —
             reissue the command once it's free again.
           </li>
-          <li><strong>Reproduce worker button</strong> — spends 50 protein from your colony to hatch a new worker.</li>
+          <li>
+            <strong>Reproduce buttons</strong> — spend protein to hatch a new Worker, Soldier, or Scout; each button
+            shows its current live cost.
+          </li>
           <li>
             <strong>Multiplayer</strong> — every browser session controls its own colony in one shared world. Other
             colonies' queens and workers are visible, moving in real time, but you can never select or command them,
@@ -479,12 +488,55 @@
           </li>
         </ul>
 
+        <h2>Castes</h2>
+        <ul>
+          <li>
+            <strong>Worker</strong> — the general-purpose caste: balanced health and speed, able to gather and carry
+            resources, and the only caste that could reproduce before this release.
+          </li>
+          <li>
+            <strong>Soldier</strong> — a costly combat specialist with more health and attack damage but slower
+            movement. A Soldier cannot gather or carry resources at all.
+          </li>
+          <li>
+            <strong>Scout</strong> — fast and fragile, with low health and a small carry capacity, but it sees much
+            farther than any other unit, making it the best way to find distant resources and threats.
+          </li>
+          <li>
+            Evolution traits apply to all three castes — a Survival pick still boosts a Soldier's health and attack,
+            a Foraging pick still boosts a Scout's gather/carry (where applicable), and every caste counts toward
+            your colony's population and peak population.
+          </li>
+        </ul>
+
+        <h2>Fog of War</h2>
+        <ul>
+          <li>
+            You can only see what's within vision range of your own queen and your own units — everything else is
+            hidden, not just undiscovered. There's no persistent "explored" memory: moving a unit away hides
+            whatever it revealed again.
+          </li>
+          <li>
+            Scouts see much farther than Workers or Soldiers, so sending one ahead is the best way to reveal distant
+            parts of the map before committing other units there.
+          </li>
+          <li>
+            Hidden entities — other colonies' queens and workers, ruins, resource nodes, carcasses, aphids, and
+            spiders — keep existing and moving while out of sight; they simply aren't sent to you until something of
+            yours can see them again.
+          </li>
+          <li>
+            If your colony falls, you keep a small consolation view around your own ruin instead of a black screen.
+          </li>
+          <li>Major world events (a nearby colony falling, a spider kill) can still appear in the event feed regardless of fog.</li>
+        </ul>
+
         <h2>Quick start</h2>
         <ol>
           <li>Left-drag a box around your starting workers to select all of them.</li>
           <li>Click a nearby sugar, biomass, or protein node to send them gathering.</li>
           <li>Watch the totals at the top update as they carry resources home on their own.</li>
-          <li>Once protein reaches 50, click "Reproduce worker" to hatch a new one.</li>
+          <li>Once protein reaches 50, click "Worker" in the reproduce buttons to hatch a new one.</li>
           <li>Select some workers and click an aphid to hunt it, then gather the carcass it leaves behind.</li>
           <li>Pan around with WASD or a right-drag to explore — the world is shared with other colonies.</li>
         </ol>
@@ -503,6 +555,14 @@
         <div class="legend-item">
           <span class="legend-swatch circle" style="background: #ce93d8; border: 2px solid #6a1b9a"></span> Another
           colony's worker (visible, not selectable)
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch circle" style="background: #90caf9; border: 3px solid #1565c0; width: 28px; height: 28px"></span>
+          Your Soldier (larger, thicker-bordered — cannot gather or carry)
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch circle" style="background: #90caf9; border: 1px solid #1565c0; width: 14px; height: 14px"></span>
+          Your Scout (smaller, thin-bordered — widest vision range)
         </div>
         <div class="legend-item"><span class="legend-swatch ring"></span> Selected worker (dashed ring)</div>
         <div class="legend-item">

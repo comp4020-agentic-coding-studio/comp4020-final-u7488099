@@ -62,14 +62,126 @@ function closestNode(state: any, worker: any, resourceType: string) {
   );
 }
 
+// Stage 10: fog of war means a protein node isn't guaranteed to already be
+// visible near a fresh colony's spawn — only every other spawn anchor gets
+// one, and a colony claimed later in a shared world (as happens once an
+// earlier spec file has already taken anchor 0) can land somewhere with no
+// protein nearby at all. Sends every one of the colony's own workers on a
+// grid search across the world until at least one protein node comes into
+// view — same discovery pattern as spec/colony.test.ts's discoverCreatures,
+// just for a resource type instead of a creature species.
+async function discoverResourceType(
+  request: ReturnType<typeof createSession>,
+  state: any,
+  resourceType: string,
+  timeoutMs = 60000,
+): Promise<any> {
+  const { width, height } = state.world;
+  const GRID = 4;
+  const waypoints: { x: number; y: number }[] = [];
+  for (let gy = 0; gy < GRID; gy++) {
+    for (let gx = 0; gx < GRID; gx++) {
+      waypoints.push({
+        x: Math.round(((gx + 0.5) / GRID) * width),
+        y: Math.round(((gy + 0.5) / GRID) * height),
+      });
+    }
+  }
+
+  const hasType = (s: any) => s.resourceNodes.some((n: any) => n.resourceType === resourceType);
+
+  const dispatch = async (s: any, wave: number) => {
+    if (s.workers.length === 0) return;
+    await Promise.all(
+      s.workers.map((w: any, i: number) => {
+        const point = waypoints[(wave * s.workers.length + i) % waypoints.length];
+        return request("/api/command/move", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ workerIds: [w.id], ...point }),
+        });
+      }),
+    );
+  };
+
+  const REDISPATCH_MS = 7000;
+  let wave = 0;
+  let current = state;
+  await dispatch(current, wave);
+  let lastDispatch = Date.now();
+
+  const deadline = Date.now() + timeoutMs;
+  while (!hasType(current) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 500));
+    current = await getState(request);
+    if (!hasType(current) && Date.now() - lastDispatch > REDISPATCH_MS) {
+      wave += 1;
+      await dispatch(current, wave);
+      lastDispatch = Date.now();
+    }
+  }
+  return current;
+}
+
+// Stage 10: fog of war means Bob's own roster only lists a foreign colony
+// (Alice's) once Bob's own vision actually covers that colony's queen
+// position — no longer unconditional. Sends every one of Bob's own workers
+// toward a known point (Alice's queen, told to us directly by Alice's own
+// state response) and polls until that colony id shows up in Bob's roster.
+async function scoutToward(
+  request: ReturnType<typeof createSession>,
+  state: any,
+  x: number,
+  y: number,
+  targetColonyId: number,
+  timeoutMs = 60000,
+): Promise<any> {
+  const seen = (s: any) => s.colonies.some((c: any) => c.id === targetColonyId);
+  const REDISPATCH_MS = 7000;
+  const dispatch = (s: any) =>
+    s.workers.length > 0
+      ? Promise.all(
+          s.workers.map((w: any) =>
+            request("/api/command/move", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ workerIds: [w.id], x, y }),
+            }),
+          ),
+        )
+      : Promise.resolve();
+  let current = state;
+  if (seen(current)) return current;
+  await dispatch(current);
+  let lastDispatch = Date.now();
+  const deadline = Date.now() + timeoutMs;
+  while (!seen(current) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 500));
+    current = await getState(request);
+    if (!seen(current) && Date.now() - lastDispatch > REDISPATCH_MS) {
+      await dispatch(current);
+      lastDispatch = Date.now();
+    }
+  }
+  return current;
+}
+
 // Same shape as colony.test.ts's gatherProteinUntil, parameterised by
 // session since this file runs several independent sessions side by side.
+// Stage 10: re-checks protein visibility on every cycle (not just once up
+// front) and scouts for it whenever it's dropped out of view, since fog
+// means a protein node already seen can later fall outside every worker's
+// vision again before a later idle-worker round tries to re-target it.
 async function gatherProteinUntil(request: ReturnType<typeof createSession>, targetProtein: number): Promise<any> {
   let state = await getState(request);
-  const deadline = Date.now() + 45000;
+  const deadline = Date.now() + 90000;
   while (state.colony.resources.protein < targetProtein && Date.now() < deadline) {
+    if (!state.resourceNodes.some((n: any) => n.resourceType === "protein")) {
+      state = await discoverResourceType(request, state, "protein");
+    }
     const idleWorkers = state.workers.filter((w: any) => !w.carrying);
     for (const worker of idleWorkers) {
+      if (!state.resourceNodes.some((n: any) => n.resourceType === "protein")) break;
       const node = closestNode(state, worker, "protein");
       await request("/api/command/gather", {
         method: "POST",
@@ -94,8 +206,12 @@ async function gatherProteinUntil(request: ReturnType<typeof createSession>, tar
 async function growToPeakPopulation(request: ReturnType<typeof createSession>, target: number): Promise<any> {
   let state = await getState(request);
   while (state.colony.peakPopulation < target) {
-    await gatherProteinUntil(request, state.colony.reproduceCost);
-    const res = await request("/api/reproduce", { method: "POST" });
+    await gatherProteinUntil(request, state.colony.reproduceCosts.worker);
+    const res = await request("/api/reproduce", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ caste: "worker" }),
+    });
     expect(res.status).toBe(200);
     state = await res.json();
   }
@@ -214,8 +330,11 @@ it(
 
     // Bob sees Alice's new evolution as a plain shared-world fact in his own
     // roster — no special refresh step, just the same `/api/state` any
-    // client already polls.
-    const aliceFromBobRoster = bobAfter.colonies.find((c: any) => c.id === aliceColonyId);
+    // client already polls, once Bob's own vision actually covers Alice's
+    // queen (Stage 10 fog of war: a foreign colony is no longer a free,
+    // unconditional roster entry).
+    const bobScouted = await scoutToward(bob, bobAfter, aliceGrown.colony.queenX, aliceGrown.colony.queenY, aliceColonyId);
+    const aliceFromBobRoster = bobScouted.colonies.find((c: any) => c.id === aliceColonyId);
     expect(aliceFromBobRoster).toMatchObject({
       status: "active",
       population: EVOLUTION_TIER_1_POPULATION,
@@ -257,13 +376,34 @@ it(
     expect(aliceFresh.colony.evolutionTier2).toBeNull();
     expect(aliceFresh.colony.evolutionTier3).toBeNull();
 
-    const bobFinal = await getState(bob);
-    const freshAliceFromBob = bobFinal.colonies.find((c: any) => c.id === aliceFresh.colony.id);
-    expect(freshAliceFromBob).toMatchObject({ status: "active", evolutionTier1: null });
-    const oldRuinStillThere = bobFinal.colonies.find((c: any) => c.id === aliceColonyId);
+    // The ruin's position never moves — it's the same point Bob was already
+    // scouted toward above, so it's still covered by Bob's vision right now,
+    // before redirecting his workers anywhere else.
+    const bobStillAtRuin = await getState(bob);
+    const oldRuinStillThere = bobStillAtRuin.colonies.find((c: any) => c.id === aliceColonyId);
     expect(oldRuinStillThere).toMatchObject({ status: "defeated", evolutionTier1: winningChoice });
+
+    // Stage 10: fog of war — the replacement colony spawns at a different
+    // point (deliberately steered away from the old ruin), so Bob's own
+    // vision has no particular reason to already cover it; scout there
+    // explicitly rather than assuming it's a free roster entry. This moves
+    // Bob's workers away from the ruin, which is expected and fine — the
+    // ruin's continued existence (never deleted) was already confirmed
+    // above; a single viewer's vision can't cover two distant points at once
+    // under fog, and nothing in this stage claims it should.
+    const bobScoutedFresh = await scoutToward(
+      bob,
+      bobStillAtRuin,
+      aliceFresh.colony.queenX,
+      aliceFresh.colony.queenY,
+      aliceFresh.colony.id,
+    );
+    const freshAliceFromBob = bobScoutedFresh.colonies.find((c: any) => c.id === aliceFresh.colony.id);
+    expect(freshAliceFromBob).toMatchObject({ status: "active", evolutionTier1: null });
   },
-  90000,
+  // Stage 10: fog of war adds up to two scouting phases (each up to 60s) on
+  // top of growToPeakPopulation's own now-longer protein-discovery budget.
+  240000,
 );
 
 it(
@@ -273,7 +413,7 @@ it(
     const bob = createSession();
 
     const aliceGrown = await growToPeakPopulation(alice, EVOLUTION_TIER_1_POPULATION);
-    expect(aliceGrown.colony.reproduceCost).toBe(REPRODUCE_COST);
+    expect(aliceGrown.colony.reproduceCosts.worker).toBe(REPRODUCE_COST);
 
     const res = await alice("/api/evolve", {
       method: "POST",
@@ -283,15 +423,18 @@ it(
     expect(res.status).toBe(200);
     const aliceAfter = await res.json();
     expect(aliceAfter.colony.evolutionTier1).toBe("brood");
-    expect(aliceAfter.colony.reproduceCost).toBe(Math.round(REPRODUCE_COST * BROOD_I_COST_MULTIPLIER));
+    expect(aliceAfter.colony.reproduceCosts.worker).toBe(Math.round(REPRODUCE_COST * BROOD_I_COST_MULTIPLIER));
 
     // No further gameplay needed to observe it — the very next /api/state
     // already reflects it, and an unrelated colony's own cost is untouched.
     const aliceConfirm = await getState(alice);
-    expect(aliceConfirm.colony.reproduceCost).toBe(Math.round(REPRODUCE_COST * BROOD_I_COST_MULTIPLIER));
+    expect(aliceConfirm.colony.reproduceCosts.worker).toBe(Math.round(REPRODUCE_COST * BROOD_I_COST_MULTIPLIER));
 
     const bobState = await getState(bob);
-    expect(bobState.colony.reproduceCost).toBe(REPRODUCE_COST);
+    expect(bobState.colony.reproduceCosts.worker).toBe(REPRODUCE_COST);
   },
-  60000,
+  // Stage 10: fog of war can require a protein-discovery detour inside
+  // growToPeakPopulation's gatherProteinUntil (now up to 90s of its own
+  // budget) before any reproduce cycle can proceed.
+  120000,
 );

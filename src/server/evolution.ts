@@ -2,6 +2,8 @@ import {
   BROOD_I_COST_MULTIPLIER,
   BROOD_II_COST_MULTIPLIER,
   BROOD_III_COST_MULTIPLIER,
+  type Caste,
+  CASTE_BASE_STATS,
   EVOLUTION_TIER_1_POPULATION,
   EVOLUTION_TIER_2_POPULATION,
   EVOLUTION_TIER_3_POPULATION,
@@ -9,14 +11,10 @@ import {
   FORAGING_III_CARRY_SPEED_MULTIPLIER,
   FORAGING_II_GATHER_SPEED_MULTIPLIER,
   GATHER_DURATION,
-  GATHER_YIELD,
-  REPRODUCE_COST,
   SURVIVAL_I_HEALTH_MULTIPLIER,
   SURVIVAL_II_ATTACK_MULTIPLIER,
   SURVIVAL_III_CHASE_SPEED_MULTIPLIER,
   TRAIT_DISPLAY_NAMES,
-  WORKER_ATTACK_DAMAGE,
-  WORKER_MAX_HEALTH,
 } from "./balance.ts";
 
 // Stage 9: the single shared source of truth for turning a colony's three
@@ -71,7 +69,23 @@ function broodCostMultiplier(s: EvolutionSelections): number {
   return 1.0;
 }
 
-export function getEvolutionModifiers(s: EvolutionSelections): EvolutionModifiers {
+// Stage 10: `caste` is a REQUIRED second parameter, deliberately with no
+// default/overload — a defaulting signature would silently misreport a
+// Soldier's or Scout's effective stats the first time a new call site forgot
+// to pass caste, which this codebase's standing discipline (required
+// params, guarded SQL) exists to prevent. Caste determines the absolute
+// BASE for maxHealth/attackDamage/reproduceCost/carryYield (via
+// CASTE_BASE_STATS); evolution only ever scales that base, it never
+// introduces a second, caste-independent system. gatherDuration/
+// carryMoveSpeedMultiplier/chaseSpeedMultiplier stay pure scalars — nothing
+// caste-differentiates them; Strong Mandibles/Efficient Foragers/Trail
+// Instinct simply have no observable effect on a Soldier because Soldier is
+// structurally barred from gathering/carrying (enforced in simulation.ts),
+// exactly matching the brief's "carry bonus applies only to castes that can
+// carry" framing (§5) with no extra branching here.
+export function getEvolutionModifiers(s: EvolutionSelections, caste: Caste): EvolutionModifiers {
+  const base = CASTE_BASE_STATS[caste];
+
   const carryMultiplier = s.tier1 === "foraging" ? FORAGING_I_CARRY_MULTIPLIER : 1;
   const gatherSpeedMultiplier = s.tier2 === "foraging" ? FORAGING_II_GATHER_SPEED_MULTIPLIER : 1;
   const carryMoveSpeedMultiplier = s.tier3 === "foraging" ? FORAGING_III_CARRY_SPEED_MULTIPLIER : 1;
@@ -81,12 +95,12 @@ export function getEvolutionModifiers(s: EvolutionSelections): EvolutionModifier
   const chaseSpeedMultiplier = s.tier3 === "survival" ? SURVIVAL_III_CHASE_SPEED_MULTIPLIER : 1;
 
   return {
-    carryYield: Math.round(GATHER_YIELD * carryMultiplier),
+    carryYield: Math.round(base.carryCapacity * carryMultiplier),
     gatherDuration: GATHER_DURATION / gatherSpeedMultiplier,
     carryMoveSpeedMultiplier,
     chaseSpeedMultiplier,
-    maxHealth: Math.round(WORKER_MAX_HEALTH * healthMultiplier),
-    attackDamage: Math.round(WORKER_ATTACK_DAMAGE * attackMultiplier),
-    reproduceCost: Math.round(REPRODUCE_COST * broodCostMultiplier(s)),
+    maxHealth: Math.round(base.maxHealth * healthMultiplier),
+    attackDamage: Math.round(base.attackDamage * attackMultiplier),
+    reproduceCost: Math.round(base.reproduceCost * broodCostMultiplier(s)),
   };
 }

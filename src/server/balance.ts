@@ -135,9 +135,14 @@ export const SPIDER_CLEAR_RADIUS = 400;
 // A cluster item lands at a random angle and this radius from its anchor —
 // far enough out that nothing sits on top of the queen or the starting
 // workers, close enough that a fresh colony doesn't have to travel far to
-// start gathering/hunting.
+// start gathering/hunting. Stage 10: the max radius must stay under
+// VISION_RADIUS.queen (300) — one of the first SPAWN_ANCHOR_COUNT colonies
+// spawns exactly on its own anchor (colonySpiralPosition(index) is the same
+// sequence createColony() uses), so under fog of war its queen must be able
+// to see its own anchor's cluster without anyone moving first. 280 leaves a
+// 20-unit margin under that radius.
 const ANCHOR_CLUSTER_MIN_RADIUS = 150;
-const ANCHOR_CLUSTER_MAX_RADIUS = 450;
+const ANCHOR_CLUSTER_MAX_RADIUS = 280;
 // Scattered (non-cluster) content keeps this far from every anchor, so
 // "background" placement never accidentally drops something on a queen.
 const ANCHOR_CLEAR_RADIUS = 120;
@@ -435,3 +440,51 @@ export const QUEEN_REGEN_RATE = 2;
 // initially equal in value.
 export const QUEEN_AGGRO_RANGE = 200;
 export const QUEEN_DISENGAGE_RANGE = 300;
+
+// Stage 10: exactly three unit-level castes. Every existing/pre-Stage-10
+// worker becomes 'worker' via migration (see db.ts's migrateWorkerCaste/
+// backfillWorkerCaste) — this is a durable, persistent property of the unit,
+// not a transient UI label. See CLAUDE.md's Stage 10 section.
+export type Caste = "worker" | "soldier" | "scout";
+
+// Stage 10 (§4): caste determines a unit's BASE stats; Stage 9 evolution
+// then scales whichever of these are "applicable" per trait (see
+// evolution.ts's getEvolutionModifiers). Worker is exactly the pre-Stage-10
+// baseline (reuses the existing flat constants, not duplicated numbers) so
+// every pre-Stage-10 behavior/test is preserved byte-for-byte. Soldier/Scout
+// values are the brief's own suggested placeholders (§4) — no balancing
+// pass. Soldier's carryCapacity of 0 is what backs its structural inability
+// to gather/carry (enforced in simulation.ts, not just a UI hint).
+export const CASTE_BASE_STATS: Record<
+  Caste,
+  { maxHealth: number; attackDamage: number; speed: number; reproduceCost: number; carryCapacity: number }
+> = {
+  worker: {
+    maxHealth: WORKER_MAX_HEALTH,
+    attackDamage: WORKER_ATTACK_DAMAGE,
+    speed: WORKER_SPEED,
+    reproduceCost: REPRODUCE_COST,
+    carryCapacity: GATHER_YIELD,
+  },
+  soldier: { maxHealth: 60, attackDamage: 20, speed: 120, reproduceCost: 100, carryCapacity: 0 },
+  scout: { maxHealth: 18, attackDamage: 5, speed: 240, reproduceCost: 60, carryCapacity: 5 },
+};
+
+// Stage 10 (§14): current-visibility fog of war vision radii. Fixed
+// placeholders, deliberately NOT modified by Stage 9 evolution (§14 is
+// explicit that vision stays constant regardless of evolution tier). Queen
+// isn't a caste but is its own vision source with its own radius, hence the
+// separate "queen" key alongside the three castes.
+export const VISION_RADIUS: Record<"queen" | Caste, number> = {
+  queen: 300,
+  worker: 180,
+  soldier: 180,
+  scout: 400,
+};
+
+// Stage 10 (§18): a defeated colony (no active queen, no living units) keeps
+// a small consolation view of its own ruin rather than a black screen or
+// global omniscience. Deliberately smaller than every living-unit radius
+// above (150 < 180 <= 300 <= 400) — a defeated player sees meaningfully less
+// than an active one, not more.
+export const DEFEATED_COLONY_VISION_RADIUS = 150;

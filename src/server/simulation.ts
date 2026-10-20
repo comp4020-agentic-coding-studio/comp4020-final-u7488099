@@ -3,11 +3,13 @@ import {
   APHID_IDLE_MIN,
   APHID_SPEED,
   APHID_WANDER_RADIUS,
+  type Caste,
+  CASTE_BASE_STATS,
   CREATURE_PROTEIN_VALUE,
+  DEFEATED_COLONY_VISION_RADIUS,
   DEPOSIT_RANGE,
   GATHER_DURATION,
   GATHER_RANGE,
-  GATHER_YIELD,
   GOLDEN_ANGLE,
   GROUP_DESTINATION_SPACING,
   MIN_SEPARATION,
@@ -27,10 +29,9 @@ import {
   SPIDER_IDLE_MIN,
   SPIDER_SPEED,
   SPIDER_WANDER_RADIUS,
+  VISION_RADIUS,
   WORKER_ATTACK_COOLDOWN,
-  WORKER_ATTACK_DAMAGE,
   WORKER_ATTACK_RANGE,
-  WORKER_SPEED,
 } from "./balance.ts";
 import { db } from "./db.ts";
 import { type EvolutionChoice, type EvolutionSelections, getEvolutionModifiers, NO_EVOLUTION } from "./evolution.ts";
@@ -73,6 +74,10 @@ interface SimWorker {
   // health/maxHealth — a restart never silently heals an injured worker.
   health: number;
   maxHealth: number;
+  // Stage 10: durable, set once at insert (spawnStartingWorkers/reproduce)
+  // and never changed thereafter — there's no caste-respec mechanic. See
+  // CLAUDE.md's Stage 10 section.
+  caste: Caste;
 }
 
 export type MoveCommandError =
@@ -85,11 +90,14 @@ export type GatherCommandError =
   | "no such worker"
   | "no such resource node"
   | "worker is busy returning resources"
+  | "wrong caste"
+  | "target not visible"
   | "colony defeated";
 export type AttackCommandError =
   | "no such worker"
   | "no such creature"
   | "worker is busy returning resources"
+  | "target not visible"
   | "colony defeated";
 
 // Stage 5: a neutral creature (first species: aphid). Stage 6 makes it
@@ -208,7 +216,7 @@ export function loadSimulation(): void {
   // claims, where the worker processed first wins. See CLAUDE.md.
   const rows = db
     .prepare(
-      "SELECT id, colony_id AS colonyId, x, y, carrying_type AS carryingType, carrying_amount AS carryingAmount, health, max_health AS maxHealth FROM workers ORDER BY id",
+      "SELECT id, colony_id AS colonyId, x, y, carrying_type AS carryingType, carrying_amount AS carryingAmount, health, max_health AS maxHealth, caste FROM workers ORDER BY id",
     )
     .all() as {
     id: number;
@@ -219,6 +227,7 @@ export function loadSimulation(): void {
     carryingAmount: number | null;
     health: number;
     maxHealth: number;
+    caste: Caste;
   }[];
   for (const row of rows) {
     const carrying: Carrying =
@@ -234,6 +243,7 @@ export function loadSimulation(): void {
       command: carrying ? { type: "return" } : { type: "idle" },
       health: row.health,
       maxHealth: row.maxHealth,
+      caste: row.caste,
     });
   }
 
@@ -641,6 +651,7 @@ export function registerWorker(worker: {
   y: number;
   health: number;
   maxHealth: number;
+  caste: Caste;
 }): void {
   workers.set(worker.id, { ...worker, carrying: null, command: { type: "idle" } });
 }
@@ -682,11 +693,11 @@ export function registerColony(
 
 export function getWorkersForColony(
   colonyId: number,
-): { id: number; x: number; y: number; carrying: Carrying; health: number; maxHealth: number }[] {
+): { id: number; x: number; y: number; carrying: Carrying; health: number; maxHealth: number; caste: Caste }[] {
   return [...workers.values()]
     .filter((w) => w.colonyId === colonyId)
     .sort((a, b) => a.id - b.id)
-    .map(({ id, x, y, carrying, health, maxHealth }) => ({ id, x, y, carrying, health, maxHealth }));
+    .map(({ id, x, y, carrying, health, maxHealth, caste }) => ({ id, x, y, carrying, health, maxHealth, caste }));
 }
 
 // Stage 8: live spider positions, for sessions.ts to fold into createColony()'s
@@ -695,6 +706,39 @@ export function getWorkersForColony(
 // since this is purely a collision-avoidance input, not a public API.
 export function getSpiderPositions(): { x: number; y: number }[] {
   return [...creatures.values()].filter((c) => c.species === "spider").map(({ x, y }) => ({ x, y }));
+}
+
+// Stage 10: fog of war. A colony's vision is the union of circles centred on
+// its queen and every one of its own living units, each sized by
+// VISION_RADIUS — never anything persisted or exploration-memory based (see
+// CLAUDE.md's Stage 10 section). Lives here, not a separate module, because
+// it reads directly from the live workers/colonies Maps the same way
+// buildSpatialGrid/separationDelta already do, rather than through a
+// snapshot-returning accessor.
+export interface VisionSource {
+  x: number;
+  y: number;
+  radius: number;
+}
+
+export function getVisionSources(colonyId: number): VisionSource[] {
+  const colony = colonies.get(colonyId);
+  if (!colony) return [];
+  if (colony.status !== "active") {
+    // §18: a defeated colony keeps a small consolation view of its own ruin
+    // rather than a black screen or omniscience.
+    return [{ x: colony.x, y: colony.y, radius: DEFEATED_COLONY_VISION_RADIUS }];
+  }
+  const sources: VisionSource[] = [{ x: colony.x, y: colony.y, radius: VISION_RADIUS.queen }];
+  for (const worker of workers.values()) {
+    if (worker.colonyId !== colonyId) continue;
+    sources.push({ x: worker.x, y: worker.y, radius: VISION_RADIUS[worker.caste] });
+  }
+  return sources;
+}
+
+export function isVisible(x: number, y: number, sources: VisionSource[]): boolean {
+  return sources.some((s) => Math.hypot(s.x - x, s.y - y) <= s.radius);
 }
 
 // Multiplayer visibility fix: the shared world has exactly one population of
@@ -708,11 +752,29 @@ export function getSpiderPositions(): { x: number; y: number }[] {
 // relies on it, selection/hit-testing included — stays exactly as it was.
 export function getWorkersExcludingColony(
   colonyId: number,
-): { id: number; colonyId: number; x: number; y: number; carrying: Carrying; health: number; maxHealth: number }[] {
+): {
+  id: number;
+  colonyId: number;
+  x: number;
+  y: number;
+  carrying: Carrying;
+  health: number;
+  maxHealth: number;
+  caste: Caste;
+}[] {
   return [...workers.values()]
     .filter((w) => w.colonyId !== colonyId)
     .sort((a, b) => a.id - b.id)
-    .map(({ id, colonyId, x, y, carrying, health, maxHealth }) => ({ id, colonyId, x, y, carrying, health, maxHealth }));
+    .map(({ id, colonyId, x, y, carrying, health, maxHealth, caste }) => ({
+      id,
+      colonyId,
+      x,
+      y,
+      carrying,
+      health,
+      maxHealth,
+      caste,
+    }));
 }
 
 export function getWorkerCommand(workerId: number): "idle" | "move" | "gather" | "return" | "attack" {
@@ -795,6 +857,10 @@ export function issueGatherCommand(
   const worker = workers.get(workerId);
   if (!worker || worker.colonyId !== ownerColonyId) return "no such worker";
   if (worker.carrying) return "worker is busy returning resources";
+  // Stage 10: Soldier is structurally barred from gathering/carrying — a
+  // combat specialist, not a laborer. Checked before the DB hit, cheapest
+  // rejection first.
+  if (worker.caste === "soldier") return "wrong caste";
   // Stage 9: a worker already gathering this exact node — whether still
   // travelling or mid-channel — is a no-op, not a redirect. Without this, a
   // redundant re-send (a client poll loop, or a player clicking the same
@@ -809,6 +875,11 @@ export function issueGatherCommand(
     | { x: number; y: number }
     | undefined;
   if (!node) return "no such resource node";
+  // Stage 10: a hidden target id is rejected at command-issue time, even if
+  // guessed — see CLAUDE.md's Stage 10 section. Once issued, the traveling
+  // worker's own position is itself a vision source, so the command is never
+  // re-checked after this (§21).
+  if (!isVisible(node.x, node.y, getVisionSources(ownerColonyId))) return "target not visible";
   worker.command = { type: "gather", resourceId, lastKnownX: node.x, lastKnownY: node.y };
   return null;
 }
@@ -828,7 +899,11 @@ export function issueAttackCommand(
   const worker = workers.get(workerId);
   if (!worker || worker.colonyId !== ownerColonyId) return "no such worker";
   if (worker.carrying) return "worker is busy returning resources";
-  if (!creatures.has(creatureId)) return "no such creature";
+  const creature = creatures.get(creatureId);
+  if (!creature) return "no such creature";
+  // Stage 10: same hidden-target authorization as gather (§20/§21) — checked
+  // once at issue time; an in-progress chase is never re-validated.
+  if (!isVisible(creature.x, creature.y, getVisionSources(ownerColonyId))) return "target not visible";
   worker.command = { type: "attack", creatureId, cooldownRemaining: 0 };
   return null;
 }
@@ -923,12 +998,15 @@ function attemptGatherClaim(worker: SimWorker, resourceId: number): boolean {
   }
 
   // Stage 9 Foraging I: a colony's effective carry yield substitutes for the
-  // flat GATHER_YIELD constant here — the node-depletion math and the
-  // "claim is always capped at what's actually left" invariant below are
-  // completely untouched, since the claim is still read fresh inside this
-  // same transaction. See CLAUDE.md's Stage 9 section.
+  // flat per-caste base here — the node-depletion math and the "claim is
+  // always capped at what's actually left" invariant below are completely
+  // untouched, since the claim is still read fresh inside this same
+  // transaction. Stage 10: carryYield is also caste-dependent (see
+  // CASTE_BASE_STATS). See CLAUDE.md's Stage 9/10 sections.
   const colony = colonies.get(worker.colonyId);
-  const carryYield = colony ? getEvolutionModifiers(colony.evolution).carryYield : GATHER_YIELD;
+  const carryYield = colony
+    ? getEvolutionModifiers(colony.evolution, worker.caste).carryYield
+    : CASTE_BASE_STATS[worker.caste].carryCapacity;
   const claimedAmount = node.amount === null ? carryYield : Math.min(carryYield, node.amount);
   const tx = db.transaction(() => {
     if (node.amount !== null) {
@@ -1171,10 +1249,13 @@ export function applyEvolutionSelection(colonyId: number, tier: 1 | 2 | 3, choic
   // constant at creation time; nothing before this has ever rescaled a live
   // entity's max health. Deterministic rounding: Math.round, stated once.
   if (tier === 1 && choice === "survival") {
-    const newMax = getEvolutionModifiers(colony.evolution).maxHealth;
     const affected = [...workers.values()].filter((w) => w.colonyId === colonyId);
     const tx = db.transaction(() => {
       for (const worker of affected) {
+        // Stage 10: newMax is per-worker — a mixed-caste colony rescales each
+        // worker against its OWN caste's base maxHealth, not a single
+        // colony-wide figure.
+        const newMax = getEvolutionModifiers(colony.evolution, worker.caste).maxHealth;
         const newHealth = Math.round((worker.health / worker.maxHealth) * newMax);
         db.prepare("UPDATE workers SET health = ?, max_health = ? WHERE id = ?").run(newHealth, newMax, worker.id);
         worker.health = newHealth;
@@ -1295,8 +1376,8 @@ function handleAttackCommand(
   // carry-speed bonus (in advanceSimulation's movement step below) can never
   // stack — an existing invariant, not new code. See CLAUDE.md.
   const colony = colonies.get(worker.colonyId);
-  const modifiers = colony ? getEvolutionModifiers(colony.evolution) : undefined;
-  const attackSpeed = WORKER_SPEED * (modifiers?.chaseSpeedMultiplier ?? 1);
+  const modifiers = colony ? getEvolutionModifiers(colony.evolution, worker.caste) : undefined;
+  const attackSpeed = CASTE_BASE_STATS[worker.caste].speed * (modifiers?.chaseSpeedMultiplier ?? 1);
 
   const dx = creature.x - worker.x;
   const dy = creature.y - worker.y;
@@ -1321,7 +1402,7 @@ function handleAttackCommand(
     // Stage 9 Survival II: applies only along this existing creature-attack
     // path (aphids, spiders) — attack target resolution never touches
     // workers/colonies, so this cannot introduce PvP by construction.
-    const attackDamage = modifiers?.attackDamage ?? WORKER_ATTACK_DAMAGE;
+    const attackDamage = modifiers?.attackDamage ?? CASTE_BASE_STATS[worker.caste].attackDamage;
     const carcassId = applyDamage(creature, attackDamage);
     // Stage 7: aphid kills deliberately get no new log line (existing
     // aphid-combat tests/assertions are unaffected) — only a lethal hit on a
@@ -1419,7 +1500,7 @@ function separationDelta(worker: SimWorker, grid: Map<string, GridEntry[]>, dt: 
   }
   let dx = pushX * dt;
   let dy = pushY * dt;
-  const maxStep = WORKER_SPEED * dt;
+  const maxStep = CASTE_BASE_STATS[worker.caste].speed * dt;
   const mag = Math.hypot(dx, dy);
   if (mag > maxStep) {
     const scale = maxStep / mag;
@@ -1466,7 +1547,7 @@ function resolveTarget(
 function resolveArrival(worker: SimWorker, command: WorkerCommand): void {
   if (command.type === "gather") {
     const colony = colonies.get(worker.colonyId);
-    const duration = colony ? getEvolutionModifiers(colony.evolution).gatherDuration : GATHER_DURATION;
+    const duration = colony ? getEvolutionModifiers(colony.evolution, worker.caste).gatherDuration : GATHER_DURATION;
     worker.command = { ...command, channelRemaining: duration };
     return;
   }
@@ -1586,8 +1667,13 @@ export function advanceSimulation(dt: number): void {
     // issueMoveCommand/issueGatherCommand's own carrying guards).
     const moveColony = colonies.get(worker.colonyId);
     const carrySpeedMultiplier =
-      worker.carrying && moveColony ? getEvolutionModifiers(moveColony.evolution).carryMoveSpeedMultiplier : 1;
-    const effectiveSpeed = WORKER_SPEED * carrySpeedMultiplier;
+      worker.carrying && moveColony
+        ? getEvolutionModifiers(moveColony.evolution, worker.caste).carryMoveSpeedMultiplier
+        : 1;
+    // Stage 10: base speed is per-caste (Soldier slower, Scout much faster)
+    // — applies to every worker's movement (plain move/gather travel and
+    // carrying/return alike), not just the carry-speed-multiplier portion.
+    const effectiveSpeed = CASTE_BASE_STATS[worker.caste].speed * carrySpeedMultiplier;
     const step = Math.min(effectiveSpeed * dt, dist - arrivalRange);
     const attractedX = worker.x + (dx / dist) * step;
     const attractedY = worker.y + (dy / dist) * step;

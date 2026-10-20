@@ -1,15 +1,19 @@
-import { RESOURCE_TYPES } from "./balance.ts";
+import { type Caste, RESOURCE_TYPES } from "./balance.ts";
 import { db } from "./db.ts";
 import { type EvolutionChoice, type EvolutionSelections, getEvolutionModifiers, NO_EVOLUTION } from "./evolution.ts";
 import {
   getAllColonies,
   getColonySnapshot,
   getCreaturesForWorld,
+  getVisionSources,
   getWorkersExcludingColony,
   getWorkersForColony,
+  isVisible,
   type Carrying,
 } from "./simulation.ts";
 import { getWorldEvents } from "./log.ts";
+
+const ALL_CASTES: Caste[] = ["worker", "soldier", "scout"];
 
 export interface ColonyState {
   world: { width: number; height: number };
@@ -29,9 +33,12 @@ export interface ColonyState {
     evolutionTier1: EvolutionChoice | null;
     evolutionTier2: EvolutionChoice | null;
     evolutionTier3: EvolutionChoice | null;
-    reproduceCost: number;
+    // Stage 10: one effective cost per caste, each already Brood-discounted —
+    // the displayed cost and the spent cost are always the same number per
+    // caste, per §17/§34.
+    reproduceCosts: Record<Caste, number>;
   };
-  workers: { id: number; x: number; y: number; carrying: Carrying; health: number; maxHealth: number }[];
+  workers: { id: number; x: number; y: number; carrying: Carrying; health: number; maxHealth: number; caste: Caste }[];
   // Post-Stage-6b fix: every OTHER colony's workers, visible in the shared
   // world but never controllable by this session — kept as its own field
   // (not merged into `workers`) so "workers = my own colony, fully
@@ -48,6 +55,7 @@ export interface ColonyState {
     carrying: Carrying;
     health: number;
     maxHealth: number;
+    caste: Caste;
   }[];
   resourceNodes: {
     id: number;
@@ -111,16 +119,22 @@ export function getState(colonyId: number): ColonyState {
 
   // Live positions come from in-memory simulation state, not straight from
   // SQLite — the table only ever holds the last checkpoint. See simulation.ts.
+  // Stage 10: own data (workers/colony) is never fog-filtered — only ever
+  // the OTHER colonies'/world's spatial entities below, per §16.
   const workers = getWorkersForColony(colonyRow.id);
-  const otherWorkers = getWorkersExcludingColony(colonyRow.id);
 
-  const resourceNodes = db
-    .prepare(
-      "SELECT id, x, y, resource_type AS resourceType, amount, max_amount AS maxAmount, kind FROM resource_nodes WHERE world_id = ? ORDER BY id",
-    )
-    .all(world.id) as ColonyState["resourceNodes"];
+  const visionSources = getVisionSources(colonyRow.id);
+  const otherWorkers = getWorkersExcludingColony(colonyRow.id).filter((w) => isVisible(w.x, w.y, visionSources));
 
-  const creatures = getCreaturesForWorld(world.id);
+  const resourceNodes = (
+    db
+      .prepare(
+        "SELECT id, x, y, resource_type AS resourceType, amount, max_amount AS maxAmount, kind FROM resource_nodes WHERE world_id = ? ORDER BY id",
+      )
+      .all(world.id) as ColonyState["resourceNodes"]
+  ).filter((n) => isVisible(n.x, n.y, visionSources));
+
+  const creatures = getCreaturesForWorld(world.id).filter((c) => isVisible(c.x, c.y, visionSources));
 
   // defeat_cause is a durable SQLite column, never part of the in-memory sim
   // cache (it never changes after defeat) — fetched once here rather than
@@ -131,8 +145,14 @@ export function getState(colonyId: number): ColonyState {
     ),
   );
 
-  const colonies: ColonyState["colonies"] = getAllColonies().map(
-    ({ id, x, y, health, maxHealth, status, population, peakPopulation, evolution }) => ({
+  // Stage 10 §17/§23: a foreign colony (active queen or ruin) is only
+  // included when it falls inside this colony's own vision — except this
+  // colony's own entry, always included regardless of geometry (own-ness,
+  // not position, gates it — keeps a defeated viewer's own ruin visible to
+  // themselves).
+  const colonies: ColonyState["colonies"] = getAllColonies()
+    .filter((c) => c.id === colonyRow.id || isVisible(c.x, c.y, visionSources))
+    .map(({ id, x, y, health, maxHealth, status, population, peakPopulation, evolution }) => ({
       id,
       queenX: x,
       queenY: y,
@@ -145,13 +165,14 @@ export function getState(colonyId: number): ColonyState {
       evolutionTier2: evolution.tier2,
       evolutionTier3: evolution.tier3,
       defeatCause: defeatCauses.get(id) ?? null,
-    }),
-  );
+    }));
 
   const worldEvents = getWorldEvents();
 
   const evolution: EvolutionSelections = snapshot?.evolution ?? NO_EVOLUTION;
-  const reproduceCost = getEvolutionModifiers(evolution).reproduceCost;
+  const reproduceCosts = Object.fromEntries(
+    ALL_CASTES.map((caste) => [caste, getEvolutionModifiers(evolution, caste).reproduceCost]),
+  ) as Record<Caste, number>;
 
   return {
     world: { width: world.width, height: world.height },
@@ -168,7 +189,7 @@ export function getState(colonyId: number): ColonyState {
       evolutionTier1: evolution.tier1,
       evolutionTier2: evolution.tier2,
       evolutionTier3: evolution.tier3,
-      reproduceCost,
+      reproduceCosts,
     },
     workers,
     otherWorkers,

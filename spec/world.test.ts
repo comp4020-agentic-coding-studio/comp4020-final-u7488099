@@ -77,8 +77,8 @@ describe("world population (Section 16A: deterministic seed counts)", () => {
   });
 
   it("is pinned to a fixed literal seed, not Math.random()/Date.now() — exact coordinates reproduce every run", () => {
-    expect(RESOURCE_NODES[0]).toMatchObject({ resourceType: "sugar", x: 1582.9098245013563, y: 1689.667145349901 });
-    expect(APHID_SEED_POSITIONS[0]).toMatchObject({ x: 1242.0614485647156, y: 1574.7119399523094 });
+    expect(RESOURCE_NODES[0]).toMatchObject({ resourceType: "sugar", x: 1569.9732179907203, y: 1660.0729538033117 });
+    expect(APHID_SEED_POSITIONS[0]).toMatchObject({ x: 1306.5825144134217, y: 1556.0234035915205 });
   });
 
   it("colonySpiralPosition is a pure function of its index", () => {
@@ -107,7 +107,7 @@ describe("colony spawn placement (Section 16B: multi-colony spawn support)", () 
   });
 
   it("gives every spawn anchor its own nearby sugar, biomass, and aphids (never just one lucky colony)", () => {
-    const NEARBY_RADIUS = 500; // comfortably covers the generator's own 450-unit cluster radius
+    const NEARBY_RADIUS = 500; // comfortably covers the generator's own 280-unit cluster radius
     for (const anchor of anchors) {
       const near = (x: number, y: number) => Math.hypot(x - anchor.x, y - anchor.y) <= NEARBY_RADIUS;
       expect(RESOURCE_NODES.filter((n) => n.resourceType === "sugar" && near(n.x, n.y)).length).toBeGreaterThan(0);
@@ -473,6 +473,15 @@ describe("in-game help (Section 16H)", () => {
     expect(overlayText).toMatch(/survival/i);
     expect(overlayText).toMatch(/brood/i);
     expect(overlayText).toMatch(/permanent/i);
+
+    // Stage 10: castes and fog of war must both be documented.
+    expect(overlayText).toMatch(/worker/i);
+    expect(overlayText).toMatch(/soldier/i);
+    expect(overlayText).toMatch(/scout/i);
+    expect(overlayText).toMatch(/cannot gather or carry/i);
+    expect(overlayText).toMatch(/fog of war/i);
+    expect(overlayText).toMatch(/vision/i);
+    expect(overlayText).toMatch(/hidden/i);
   });
 
   it("the client bundle wires up opening and closing the help overlay", async () => {

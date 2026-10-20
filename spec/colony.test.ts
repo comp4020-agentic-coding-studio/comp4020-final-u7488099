@@ -58,6 +58,68 @@ function closestNode(state: any, worker: any, resourceType: string) {
   );
 }
 
+// Stage 10: fog of war means GET /api/state only returns resource nodes
+// within the caller's own vision radius — a freshly-seeded, unscouted colony
+// sees none of them. Duplicated (not imported) from the identical idiom in
+// spec/realtime.test.ts/multiplayer.test.ts/evolution.test.ts, per this
+// file's own header comment on why these specs stay self-contained.
+async function dispatchGridSearch(state: any, wave: number): Promise<void> {
+  if (state.workers.length === 0) return;
+  const { width, height } = state.world;
+  const GRID = 4;
+  const waypoints: { x: number; y: number }[] = [];
+  for (let gy = 0; gy < GRID; gy++) {
+    for (let gx = 0; gx < GRID; gx++) {
+      waypoints.push({
+        x: Math.round(((gx + 0.5) / GRID) * width),
+        y: Math.round(((gy + 0.5) / GRID) * height),
+      });
+    }
+  }
+  await Promise.all(
+    state.workers.map((w: any, i: number) => {
+      const point = waypoints[(wave * state.workers.length + i) % waypoints.length];
+      return request("/api/command/move", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workerIds: [w.id], ...point }),
+      });
+    }),
+  );
+}
+
+// Keeps re-dispatching a widening grid search until `isFound` is true — used
+// when we need vision of some resource type the seed may have placed
+// anywhere in the (large) world relative to this colony's queen.
+async function discoverUntil(
+  state: any,
+  isFound: (s: any) => boolean,
+  timeoutMs = 60000,
+): Promise<any> {
+  if (isFound(state)) return state;
+  const REDISPATCH_MS = 7000;
+  let wave = 0;
+  let current = state;
+  await dispatchGridSearch(current, wave);
+  let lastDispatch = Date.now();
+
+  const deadline = Date.now() + timeoutMs;
+  while (!isFound(current) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 500));
+    current = await getState();
+    if (!isFound(current) && Date.now() - lastDispatch > REDISPATCH_MS) {
+      wave += 1;
+      await dispatchGridSearch(current, wave);
+      lastDispatch = Date.now();
+    }
+  }
+  return current;
+}
+
+async function discoverResourceType(state: any, resourceType: string, timeoutMs = 60000): Promise<any> {
+  return discoverUntil(state, (s: any) => s.resourceNodes.some((n: any) => n.resourceType === resourceType), timeoutMs);
+}
+
 async function waitForResourceIncrease(resourceType: string, baseline: number, timeoutMs = 15000): Promise<any> {
   const deadline = Date.now() + timeoutMs;
   let state = await getState();
@@ -68,8 +130,90 @@ async function waitForResourceIncrease(resourceType: string, baseline: number, t
   return state;
 }
 
-it("seeds a large continuous world with one colony, 3 workers near the queen, and several resource types", async () => {
-  const state = await getState();
+// Stage 10: fog of war means a fresh colony's own vision only covers the
+// small area around its queen/starting workers — the seeded world-wide
+// creature population (and specifically a spider) is no longer guaranteed
+// to already be visible. Sends every one of the colony's own workers on a
+// patrol around a grid of waypoints spread across the world, re-dispatching
+// them to a fresh wave of points periodically, and polls /api/state until
+// enough creatures (optionally of a specific species) come into view —
+// rather than assuming the full seed is visible from a static starting
+// position, or that a single fixed destination is guaranteed to cross paths
+// with a wandering creature.
+async function discoverCreatures(
+  req: ReturnType<typeof createSession>,
+  state: any,
+  opts: { minCount?: number; needSpecies?: string; timeoutMs?: number } = {},
+): Promise<any> {
+  const { minCount = 1, needSpecies, timeoutMs = 60000 } = opts;
+  const { width, height } = state.world;
+  const GRID = 4;
+  const waypoints: { x: number; y: number }[] = [];
+  for (let gy = 0; gy < GRID; gy++) {
+    for (let gx = 0; gx < GRID; gx++) {
+      waypoints.push({
+        x: Math.round(((gx + 0.5) / GRID) * width),
+        y: Math.round(((gy + 0.5) / GRID) * height),
+      });
+    }
+  }
+
+  const satisfied = (s: any) =>
+    s.creatures.length >= minCount && (!needSpecies || s.creatures.some((c: any) => c.species === needSpecies));
+
+  const dispatch = async (s: any, wave: number) => {
+    if (s.workers.length === 0) return;
+    await Promise.all(
+      s.workers.map((w: any, i: number) => {
+        const point = waypoints[(wave * s.workers.length + i) % waypoints.length];
+        return req("/api/command/move", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ workerIds: [w.id], ...point }),
+        });
+      }),
+    );
+  };
+
+  const REDISPATCH_MS = 7000;
+  let wave = 0;
+  let current = state;
+  await dispatch(current, wave);
+  let lastDispatch = Date.now();
+
+  const deadline = Date.now() + timeoutMs;
+  while (!satisfied(current) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 500));
+    current = await (await req("/api/state")).json();
+    if (!satisfied(current) && Date.now() - lastDispatch > REDISPATCH_MS) {
+      wave += 1;
+      await dispatch(current, wave);
+      lastDispatch = Date.now();
+    }
+  }
+  return current;
+}
+
+// Stage 10: halts every one of a colony's own workers exactly where they
+// stand, by commanding each to "move" to its own current position — used
+// right before a stability check that must see a genuinely unmoving fog
+// view across two back-to-back /api/state calls.
+async function freezeWorkers(req: ReturnType<typeof createSession>, state: any): Promise<void> {
+  await Promise.all(
+    state.workers.map((w: any) =>
+      req("/api/command/move", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workerIds: [w.id], x: w.x, y: w.y }),
+      }),
+    ),
+  );
+}
+
+it(
+  "seeds a large continuous world with one colony, 3 workers near the queen, and several resource types",
+  async () => {
+  let state = await getState();
 
   expect(state.world.width).toBeGreaterThanOrEqual(1000);
   expect(state.world.height).toBeGreaterThanOrEqual(1000);
@@ -90,6 +234,12 @@ it("seeds a large continuous world with one colony, 3 workers near the queen, an
     expect(Math.hypot(worker.x - state.colony.queenX, worker.y - state.colony.queenY)).toBeLessThanOrEqual(100);
   }
 
+  // Stage 10: fog means the initial, unscouted response only shows resource
+  // nodes near the queen — scout toward each type still missing before
+  // checking the seed actually contains all three.
+  for (const type of RESOURCE_TYPES) {
+    state = await discoverResourceType(state, type);
+  }
   expect(state.resourceNodes.length).toBeGreaterThan(0);
   const seenTypes = new Set(state.resourceNodes.map((n: any) => n.resourceType));
   for (const type of RESOURCE_TYPES) {
@@ -101,10 +251,15 @@ it("seeds a large continuous world with one colony, 3 workers near the queen, an
     expect(node.y).toBeGreaterThanOrEqual(0);
     expect(node.y).toBeLessThanOrEqual(state.world.height);
   }
-});
+  },
+  60000,
+);
 
-it("gathering requires travel: no instant credit on issue, then the clicked node's resource type is credited on arrival", async () => {
-  const before = await getState();
+it(
+  "gathering requires travel: no instant credit on issue, then the clicked node's resource type is credited on arrival",
+  async () => {
+  let before = await getState();
+  before = await discoverResourceType(before, "sugar");
   const worker = before.workers[0];
   const node = closestNode(before, worker, "sugar");
 
@@ -125,7 +280,9 @@ it("gathering requires travel: no instant credit on issue, then the clicked node
 
   const refetched = await getState();
   expect(refetched.colony.resources.sugar).toBe(after.colony.resources.sugar);
-});
+  },
+  60000,
+);
 
 it("a move command with several valid worker ids moves all of them", async () => {
   const before = await getState();
@@ -193,6 +350,9 @@ it("rejects a gather command for a worker or resource that doesn't exist, with n
 // that might now be busy returning a previous claim.
 async function gatherProteinUntil(targetProtein: number): Promise<void> {
   let state = await getState();
+  // Stage 10: fog means a fresh colony may not yet have a protein node in
+  // view — scout for one before entering the claim loop below.
+  state = await discoverResourceType(state, "protein");
   const deadline = Date.now() + 45000;
   while (state.colony.resources.protein < targetProtein && Date.now() < deadline) {
     const idleWorkers = state.workers.filter((w: any) => !w.carrying);
@@ -216,7 +376,11 @@ it("reproduce spends protein and adds a worker at the queen's position", async (
   await gatherProteinUntil(50);
   const before = await getState();
 
-  const res = await request("/api/reproduce", { method: "POST" });
+  const res = await request("/api/reproduce", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ caste: "worker" }),
+  });
   expect(res.status).toBe(200);
   const after = await res.json();
 
@@ -237,7 +401,11 @@ it("rejects reproduce with insufficient protein, without mutating state", async 
   const before = await getState();
   expect(before.colony.resources.protein).toBeLessThan(50);
 
-  const res = await request("/api/reproduce", { method: "POST" });
+  const res = await request("/api/reproduce", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ caste: "worker" }),
+  });
   expect(res.status).toBe(400);
 
   const after = await getState();
@@ -282,6 +450,7 @@ it(
       await new Promise((r) => setTimeout(r, 200));
       before = await getState();
     }
+    before = await discoverResourceType(before, "sugar");
     const [busyCandidate, freeWorker] = before.workers.filter((w: any) => !w.carrying);
     const sugarNode = closestNode(before, busyCandidate, "sugar");
 
@@ -335,24 +504,35 @@ it(
 // Stage 5: H — the authoritative state surface exposes the neutral/hostile
 // creature population (aphids and, since Stage 7, spiders) alongside
 // workers/resourceNodes, with no separate endpoint or protocol.
-it("H: state includes the seeded creature population, each shaped {id, species, x, y} within world bounds", async () => {
-  const state = await getState();
+it(
+  "H: state includes the seeded creature population, each shaped {id, species, x, y} within world bounds",
+  async () => {
+    // Stage 10: fog of war means this colony's vision starts out small — send
+    // its workers out to scout before expecting the full seeded population to
+    // be visible.
+    let state = await discoverCreatures(request, await getState(), { minCount: 10 });
 
-  expect(Array.isArray(state.creatures)).toBe(true);
-  expect(state.creatures.length).toBeGreaterThanOrEqual(10);
-  for (const creature of state.creatures) {
-    expect(typeof creature.id).toBe("number");
-    expect(["aphid", "spider"]).toContain(creature.species);
-    expect(creature.x).toBeGreaterThanOrEqual(0);
-    expect(creature.x).toBeLessThanOrEqual(state.world.width);
-    expect(creature.y).toBeGreaterThanOrEqual(0);
-    expect(creature.y).toBeLessThanOrEqual(state.world.height);
-  }
+    expect(Array.isArray(state.creatures)).toBe(true);
+    expect(state.creatures.length).toBeGreaterThanOrEqual(10);
+    for (const creature of state.creatures) {
+      expect(typeof creature.id).toBe("number");
+      expect(["aphid", "spider"]).toContain(creature.species);
+      expect(creature.x).toBeGreaterThanOrEqual(0);
+      expect(creature.x).toBeLessThanOrEqual(state.world.width);
+      expect(creature.y).toBeGreaterThanOrEqual(0);
+      expect(creature.y).toBeLessThanOrEqual(state.world.height);
+    }
 
-  // Stable identity across requests — same population, not re-seeded per call.
-  const again = await getState();
-  expect(again.creatures.map((c: any) => c.id).sort()).toEqual(state.creatures.map((c: any) => c.id).sort());
-});
+    // Stable identity across requests — same population, not re-seeded per
+    // call. Freeze workers first so fog visibility itself doesn't shift
+    // between these two back-to-back reads.
+    await freezeWorkers(request, state);
+    state = await getState();
+    const again = await getState();
+    expect(again.creatures.map((c: any) => c.id).sort()).toEqual(state.creatures.map((c: any) => c.id).sort());
+  },
+  90000,
+);
 
 // Stage 6: a valid attack dispatches like any other batch command (200,
 // per-id error shape for bad ids); the worker then visibly chases the
@@ -401,8 +581,21 @@ it(
   "killing an aphid leaves a carcass that can be gathered and deposited like any other resource",
   async () => {
     const before = await getState();
-    const worker = before.workers.find((w: any) => !w.carrying) ?? before.workers[0];
     const creature = before.creatures[0];
+    // Stage 10 bugfix: fog of war means this colony's own view of `creature`
+    // only exists because *some* own worker is currently within vision range
+    // of it. Picking an arbitrary non-carrying worker (instead of the one
+    // nearest to the creature) could pick one stationed far away — the long
+    // travel time to close to attack range left the creature with no vision
+    // source covering it for many frames in between, which the "disappeared
+    // from state" poll below misread as death, producing no carcass at all.
+    // Picking the nearest own worker keeps the creature continuously visible
+    // to this same session throughout the fight.
+    const eligibleWorkers = before.workers.filter((w: any) => !w.carrying);
+    const workerPool = eligibleWorkers.length > 0 ? eligibleWorkers : before.workers;
+    const worker = workerPool.reduce((best: any, w: any) =>
+      Math.hypot(w.x - creature.x, w.y - creature.y) < Math.hypot(best.x - creature.x, best.y - creature.y) ? w : best,
+    );
     const baselineProtein = before.colony.resources.protein;
     // The creature wanders (and is chased) before it dies, so its death
     // position won't match where it started — identify the new carcass by
@@ -418,17 +611,27 @@ it(
     });
     expect(attackRes.status).toBe(200);
 
+    // Stage 10 bugfix: fog of war means this colony's view of `creature` can
+    // drop out transiently while it's still alive (e.g. it wanders beyond
+    // every current vision source while the attacking worker is still
+    // travelling toward its last-known position) — "missing from
+    // state.creatures" is therefore no longer proof of death. Death and its
+    // carcass are created atomically in one transaction (Stage 6), and the
+    // carcass spawns right at the kill site, within the attacking worker's
+    // own vision radius — so wait for the new carcass to appear instead,
+    // which is unambiguous proof of death regardless of fog.
     const deadline = Date.now() + 45000;
     let state = await getState();
-    while (state.creatures.some((c: any) => c.id === creature.id) && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 300));
-      state = await getState();
-    }
-    expect(state.creatures.some((c: any) => c.id === creature.id)).toBe(false);
-
-    const carcass = state.resourceNodes.find(
+    let carcass = state.resourceNodes.find(
       (n: any) => n.kind === "item" && n.resourceType === "protein" && !existingItemIds.has(n.id),
     );
+    while (!carcass && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 300));
+      state = await getState();
+      carcass = state.resourceNodes.find(
+        (n: any) => n.kind === "item" && n.resourceType === "protein" && !existingItemIds.has(n.id),
+      );
+    }
     expect(carcass).toBeDefined();
 
     // The attacking worker went idle right at the kill site (Stage 6 §10) —
@@ -475,7 +678,9 @@ it(
 it(
   "killing a spider leaves a carcass that can be gathered and deposited, surviving exactly one attacker's worth of combat",
   async () => {
-    const before = await getState();
+    // Stage 10: fog of war — scout until a spider is actually visible before
+    // trying to fight one.
+    const before = await discoverCreatures(request, await getState(), { needSpecies: "spider" });
     const spider = before.creatures.find((c: any) => c.species === "spider");
     expect(spider, "seed should always include at least one spider").toBeDefined();
     const baselineProtein = before.colony.resources.protein;
@@ -536,7 +741,7 @@ it(
     expect(g.carrying).toBeNull();
     expect(after.colony.resources.protein).toBeGreaterThan(baselineProtein);
   },
-  60000,
+  120000,
 );
 
 // Stage 8 §39/§40/§41: abandonment, restart, and the direct regression test
@@ -602,7 +807,11 @@ it("every mutating command is rejected on a defeated colony, by lifecycle status
   });
   expect(attackRes.status).toBe(400);
 
-  const reproduceRes = await request("/api/reproduce", { method: "POST" });
+  const reproduceRes = await request("/api/reproduce", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ caste: "worker" }),
+  });
   expect(reproduceRes.status).toBe(400);
 });
 
@@ -619,7 +828,7 @@ it("Start New Colony is rejected while the current colony is still active", asyn
 });
 
 it(
-  "Start New Colony on a defeated session produces a fresh, full-health, standard-resource colony in the same session, while the old colony remains a visible ruin",
+  "Start New Colony on a defeated session produces a fresh, full-health, standard-resource colony in the same session",
   async () => {
     const defeatedBefore = await getState();
     expect(defeatedBefore.colony.status).toBe("defeated");
@@ -647,10 +856,14 @@ it(
     expect(after.colony.queenY).toBeGreaterThanOrEqual(0);
     expect(after.colony.queenY).toBeLessThanOrEqual(after.world.height);
 
-    // The old colony is still present in the shared roster, as a ruin —
-    // never deleted, never claimable again.
-    const oldRoster = after.colonies.find((c: any) => c.id === oldColonyId);
-    expect(oldRoster).toMatchObject({ status: "defeated" });
+    // The new colony's own roster entry is always present (own-ness, not
+    // geometry, gates visibility of your own colony — Stage 10 fog of war).
+    // The old ruin is never deleted (it remains in the database and in any
+    // viewer whose vision actually covers it — see spec/fog.test.ts), but
+    // Stage 8's spawn-avoidance deliberately steers a fresh colony away from
+    // existing ruins, so the new colony's own vision has no particular
+    // reason to currently cover the old ruin's position; this test no longer
+    // assumes it's part of *this* viewer's fogged roster.
     const newRoster = after.colonies.find((c: any) => c.id === after.colony.id);
     expect(newRoster).toMatchObject({ status: "active" });
 
@@ -686,7 +899,11 @@ it(
     // spend it on one extra worker first so the colony ends up genuinely
     // below REPRODUCE_COST, not merely at it, once every worker is dead.
     expect(seeded.colony.resources.protein).toBe(REPRODUCE_COST);
-    const reproduceSeedRes = await stuckRequest("/api/reproduce", { method: "POST" });
+    const reproduceSeedRes = await stuckRequest("/api/reproduce", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ caste: "worker" }),
+    });
     expect(reproduceSeedRes.status).toBe(200);
 
     // Kill every starting worker by walking it directly onto a nearby
@@ -697,14 +914,33 @@ it(
     // which otherwise makes this test's travel time (and its 30s-per-worker
     // deadline) depend on spider-population layout rather than the thing
     // it's meant to test.
-    let state = await (await stuckRequest("/api/state")).json();
+    // Stage 10: fog of war — a spider isn't guaranteed to already be in
+    // view, and shrinking vision (fewer living workers each iteration) only
+    // makes that worse. Scout once up front to learn a spider's position,
+    // then keep reusing that last-known position to aim subsequent workers
+    // even once it's no longer actually in view — walking a worker toward
+    // where a spider recently was is enough to re-enter its aggro range and
+    // trigger a fresh chase, without needing a full re-scout every time.
+    let state = await discoverCreatures(stuckRequest, await (await stuckRequest("/api/state")).json(), {
+      needSpecies: "spider",
+    });
+    let lastKnownSpider = state.creatures.find((c: any) => c.species === "spider");
     while (state.workers.length > 0) {
+      const visibleSpider = state.creatures.find((c: any) => c.species === "spider");
+      if (visibleSpider) lastKnownSpider = visibleSpider;
+      if (!lastKnownSpider) {
+        state = await discoverCreatures(stuckRequest, state, { needSpecies: "spider" });
+        lastKnownSpider = state.creatures.find((c: any) => c.species === "spider");
+      }
+      expect(lastKnownSpider, "seed should always include at least one spider").toBeDefined();
       const worker = state.workers[0];
       const spiders = state.creatures.filter((c: any) => c.species === "spider");
-      expect(spiders.length, "seed should always include at least one spider").toBeGreaterThan(0);
-      const spider = spiders.reduce((best: any, c: any) =>
-        Math.hypot(c.x - worker.x, c.y - worker.y) < Math.hypot(best.x - worker.x, best.y - worker.y) ? c : best,
-      );
+      const spider =
+        spiders.length > 0
+          ? spiders.reduce((best: any, c: any) =>
+              Math.hypot(c.x - worker.x, c.y - worker.y) < Math.hypot(best.x - worker.x, best.y - worker.y) ? c : best,
+            )
+          : lastKnownSpider;
       await stuckRequest("/api/command/move", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -715,6 +951,16 @@ it(
         await new Promise((r) => setTimeout(r, 300));
         state = await (await stuckRequest("/api/state")).json();
       }
+      // Stage 10: the spider's last-known position can go stale by the time
+      // the worker arrives (it wanders on its own) — if the worker is still
+      // alive when the deadline lapses, the aimed-at spot was probably
+      // empty. Re-scout for a fresh spider position (and forget the stale
+      // one) before the outer loop retries, instead of looping forever at
+      // the same dead coordinates.
+      if (state.workers.some((w: any) => w.id === worker.id)) {
+        state = await discoverCreatures(stuckRequest, state, { needSpecies: "spider" });
+        lastKnownSpider = state.creatures.find((c: any) => c.species === "spider");
+      }
     }
     expect(state.workers).toHaveLength(0);
     expect(state.colony.resources.protein).toBeLessThan(REPRODUCE_COST);
@@ -722,7 +968,11 @@ it(
 
     // No in-game recovery: reproduce fails (insufficient protein), and there
     // are no workers left to gather more.
-    const reproduceRes = await stuckRequest("/api/reproduce", { method: "POST" });
+    const reproduceRes = await stuckRequest("/api/reproduce", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ caste: "worker" }),
+    });
     expect(reproduceRes.status).toBe(400);
 
     // Abandon -> Start New Colony recovers it.
@@ -747,5 +997,8 @@ it(
     });
     expect(moveRes.status).toBe(200);
   },
-  60000,
+  // Stage 10: fog of war adds an up-front scouting phase (up to
+  // discoverCreatures' own 60s deadline) before the per-worker kill loop
+  // (4 workers, up to 30s each) even begins.
+  240000,
 );

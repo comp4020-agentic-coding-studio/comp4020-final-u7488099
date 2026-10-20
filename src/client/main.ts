@@ -1,12 +1,21 @@
 import {
   APHID_RADIUS,
+  type Caste,
+  DEFEATED_COLONY_VISION_RADIUS,
   EVOLUTION_TIER_1_POPULATION,
   EVOLUTION_TIER_2_POPULATION,
   EVOLUTION_TIER_3_POPULATION,
   SPIDER_RADIUS,
   TRAIT_DISPLAY_NAMES,
+  VISION_RADIUS,
   WORKER_RADIUS,
 } from "../server/balance.ts";
+
+const CASTES: Caste[] = ["worker", "soldier", "scout"];
+const CASTE_DISPLAY_NAMES: Record<Caste, string> = { worker: "Worker", soldier: "Soldier", scout: "Scout" };
+// Stage 10: caste is communicated by size/stroke, not a second colour axis —
+// own/foreign colouring (blue/gold vs. purple) is unchanged.
+const CASTE_RADIUS: Record<Caste, number> = { worker: WORKER_RADIUS, soldier: 14, scout: 7 };
 
 type EvolutionChoice = "foraging" | "survival" | "brood";
 
@@ -53,7 +62,7 @@ interface ColonyState {
     evolutionTier1: EvolutionChoice | null;
     evolutionTier2: EvolutionChoice | null;
     evolutionTier3: EvolutionChoice | null;
-    reproduceCost: number;
+    reproduceCosts: Record<Caste, number>;
   };
   workers: {
     id: number;
@@ -62,6 +71,7 @@ interface ColonyState {
     carrying: { resourceType: string; amount: number } | null;
     health: number;
     maxHealth: number;
+    caste: Caste;
   }[];
   // Every other colony's workers, visible but never selectable/controllable
   // from this session — see hitTest/selectWorkersInBox, which only ever look
@@ -74,6 +84,7 @@ interface ColonyState {
     carrying: { resourceType: string; amount: number } | null;
     health: number;
     maxHealth: number;
+    caste: Caste;
   }[];
   resourceNodes: {
     id: number;
@@ -106,7 +117,11 @@ const canvas = document.querySelector<HTMLCanvasElement>("#world")!;
 const ctx = canvas.getContext("2d")!;
 const resourcesEl = document.querySelector<HTMLElement>("#resources")!;
 const statusEl = document.querySelector<HTMLElement>("#status")!;
-const reproduceBtn = document.querySelector<HTMLButtonElement>("#reproduce")!;
+const reproduceButtons: Record<Caste, HTMLButtonElement> = {
+  worker: document.querySelector<HTMLButtonElement>("#reproduce-worker")!,
+  soldier: document.querySelector<HTMLButtonElement>("#reproduce-soldier")!,
+  scout: document.querySelector<HTMLButtonElement>("#reproduce-scout")!,
+};
 const helpButton = document.querySelector<HTMLButtonElement>("#help-button")!;
 const helpOverlay = document.querySelector<HTMLElement>("#help-overlay")!;
 const helpClose = document.querySelector<HTMLButtonElement>("#help-close")!;
@@ -163,7 +178,7 @@ function screenToWorld(x: number, y: number): [number, number] {
 // --- rendering (snap-to-latest: always draws the latest known state,
 // no interpolation between updates — see CLAUDE.md) --------------------
 
-function circle(wx: number, wy: number, r: number, fill: string, stroke: string): void {
+function circle(wx: number, wy: number, r: number, fill: string, stroke: string, lineWidth = 2): void {
   const [sx, sy] = worldToScreen(wx, wy);
   if (sx < -r || sy < -r || sx > canvas.width + r || sy > canvas.height + r) return;
   ctx.beginPath();
@@ -171,9 +186,14 @@ function circle(wx: number, wy: number, r: number, fill: string, stroke: string)
   ctx.fillStyle = fill;
   ctx.fill();
   ctx.strokeStyle = stroke;
-  ctx.lineWidth = 2;
+  ctx.lineWidth = lineWidth;
   ctx.stroke();
 }
+
+// Stage 10: caste is communicated by radius (CASTE_RADIUS) and stroke
+// thickness — Soldier thicker-stroked, Scout thinner — never a second
+// colour axis; own/foreign colouring is unchanged.
+const CASTE_STROKE_WIDTH: Record<Caste, number> = { worker: 2, soldier: 3, scout: 1 };
 
 // Stage 5: aphid placeholder marker. A diamond, not a circle, so it reads as
 // visually distinct from every other marker (workers/queen/resource nodes are
@@ -369,9 +389,10 @@ function draw(): void {
     drawHealthBar(colony.queenX, colony.queenY, QUEEN_RADIUS, colony.health, colony.maxHealth);
   }
   for (const worker of state.otherWorkers) {
-    circle(worker.x, worker.y, WORKER_RADIUS, "#ce93d8", "#6a1b9a");
-    if (worker.carrying) drawCarryingBadge(worker.x, worker.y, WORKER_RADIUS, worker.carrying.resourceType);
-    drawHealthBar(worker.x, worker.y, WORKER_RADIUS, worker.health, worker.maxHealth);
+    const r = CASTE_RADIUS[worker.caste];
+    circle(worker.x, worker.y, r, "#ce93d8", "#6a1b9a", CASTE_STROKE_WIDTH[worker.caste]);
+    if (worker.carrying) drawCarryingBadge(worker.x, worker.y, r, worker.carrying.resourceType);
+    drawHealthBar(worker.x, worker.y, r, worker.health, worker.maxHealth);
   }
   if (state.colony.status === "defeated") {
     drawRuin(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS);
@@ -380,13 +401,47 @@ function draw(): void {
     drawHealthBar(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS, state.colony.queenHealth, state.colony.queenMaxHealth);
   }
   for (const worker of state.workers) {
-    circle(worker.x, worker.y, WORKER_RADIUS, "#90caf9", "#1565c0");
-    if (selectedWorkerIds.has(worker.id)) drawSelectionRing(worker.x, worker.y, WORKER_RADIUS + 4);
-    if (worker.carrying) drawCarryingBadge(worker.x, worker.y, WORKER_RADIUS, worker.carrying.resourceType);
-    drawHealthBar(worker.x, worker.y, WORKER_RADIUS, worker.health, worker.maxHealth);
+    const r = CASTE_RADIUS[worker.caste];
+    circle(worker.x, worker.y, r, "#90caf9", "#1565c0", CASTE_STROKE_WIDTH[worker.caste]);
+    if (selectedWorkerIds.has(worker.id)) drawSelectionRing(worker.x, worker.y, r + 4);
+    if (worker.carrying) drawCarryingBadge(worker.x, worker.y, r, worker.carrying.resourceType);
+    drawHealthBar(worker.x, worker.y, r, worker.health, worker.maxHealth);
   }
 
   if (dragMode === "select" && dragged && selectionDrag) drawSelectionBox(selectionDrag);
+
+  drawFogOverlay();
+}
+
+// Stage 10: purely a visual "obscured region" cue — the authoritative
+// hiding already happened server-side (getState() never sends an entity
+// outside the player's own vision sources), so this layer only has to
+// darken ground the player can't see, not hide anything itself. Own units'
+// positions (always present in full, unfiltered — see ColonyState) are
+// exactly the vision sources this punches holes for, mirroring
+// getVisionSources() server-side: queen + every own worker, radius by
+// caste for workers.
+function drawFogOverlay(): void {
+  if (!state) return;
+  ctx.save();
+  ctx.fillStyle = "rgba(10, 15, 10, 0.55)";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.globalCompositeOperation = "destination-out";
+  const punch = (wx: number, wy: number, r: number) => {
+    const [sx, sy] = worldToScreen(wx, wy);
+    ctx.beginPath();
+    ctx.arc(sx, sy, r, 0, Math.PI * 2);
+    ctx.fill();
+  };
+  if (state.colony.status === "active") {
+    punch(state.colony.queenX, state.colony.queenY, VISION_RADIUS.queen);
+    for (const worker of state.workers) {
+      punch(worker.x, worker.y, VISION_RADIUS[worker.caste]);
+    }
+  } else {
+    punch(state.colony.queenX, state.colony.queenY, DEFEATED_COLONY_VISION_RADIUS);
+  }
+  ctx.restore();
 }
 
 function renderResourceCounts(): void {
@@ -396,12 +451,15 @@ function renderResourceCounts(): void {
     .join(" · ");
 }
 
-// Stage 9: the reproduce button always shows the colony's current live
+// Stage 9: each reproduce button always shows its caste's current live
 // effective cost (Brood discounts included) — what's displayed is exactly
-// what's deducted, never a stale static "(50 protein)" label.
-function renderReproduceCost(): void {
+// what's deducted, never a stale static label. Stage 10: one button per
+// caste, Brood's discount scales each caste's own base cost proportionally.
+function renderReproduceCosts(): void {
   if (!state) return;
-  reproduceBtn.textContent = `Reproduce worker (${state.colony.reproduceCost} protein)`;
+  for (const caste of CASTES) {
+    reproduceButtons[caste].textContent = `${CASTE_DISPLAY_NAMES[caste]} (${state.colony.reproduceCosts[caste]} protein)`;
+  }
 }
 
 function renderQueenHealth(): void {
@@ -558,7 +616,7 @@ function renderLifecycle(): void {
   const isDefeated = state.colony.status === "defeated";
   defeatOverlay.hidden = !isDefeated;
   abandonButton.disabled = isDefeated;
-  reproduceBtn.disabled = isDefeated;
+  for (const caste of CASTES) reproduceButtons[caste].disabled = isDefeated;
   if (isDefeated) {
     defeatMessageEl.textContent =
       state.colony.defeatCause === "abandoned"
@@ -587,7 +645,7 @@ function setState(next: ColonyState): void {
   }
   renderResourceCounts();
   renderQueenHealth();
-  renderReproduceCost();
+  renderReproduceCosts();
   renderWorldEvents();
   renderEvolutionPanel();
 }
@@ -699,16 +757,22 @@ function selectWorkersInBox(a: [number, number], b: [number, number]): void {
   const maxY = Math.max(a[1], b[1]);
   const hits = state.workers.filter((w) => w.x >= minX && w.x <= maxX && w.y >= minY && w.y <= maxY);
   selectedWorkerIds = new Set(hits.map((w) => w.id));
-  statusEl.textContent =
-    selectedWorkerIds.size > 0
-      ? `${selectedWorkerIds.size} worker${selectedWorkerIds.size === 1 ? "" : "s"} selected — click a resource node to gather, or empty ground to move.`
-      : "";
+  if (selectedWorkerIds.size > 0) {
+    const counts: Record<Caste, number> = { worker: 0, soldier: 0, scout: 0 };
+    for (const w of hits) counts[w.caste]++;
+    const breakdown = CASTES.filter((c) => counts[c] > 0)
+      .map((c) => `${counts[c]} ${CASTE_DISPLAY_NAMES[c]}${counts[c] === 1 ? "" : "s"}`)
+      .join(", ");
+    statusEl.textContent = `${breakdown} selected — click a resource node to gather, or empty ground to move.`;
+  } else {
+    statusEl.textContent = "";
+  }
 }
 
 function hitTest(wx: number, wy: number): { kind: "worker" | "creature" | "node"; id: number } | null {
   if (!state) return null;
   for (const worker of state.workers) {
-    if (Math.hypot(worker.x - wx, worker.y - wy) <= WORKER_RADIUS) return { kind: "worker", id: worker.id };
+    if (Math.hypot(worker.x - wx, worker.y - wy) <= CASTE_RADIUS[worker.caste]) return { kind: "worker", id: worker.id };
   }
   // Stage 6: creatures are clickable (not selectable) — checked before nodes
   // so a click on an aphid standing over/near a resource node always hits
@@ -883,17 +947,23 @@ startNewColonyButton.addEventListener("click", async () => {
   setState(body);
 });
 
-reproduceBtn.addEventListener("click", async () => {
-  const res = await fetch("/api/reproduce", { method: "POST" });
-  const body = await res.json();
-  if (!res.ok) {
-    statusEl.textContent = body.error ?? "reproduce failed";
-    return;
-  }
-  selectedWorkerIds = new Set();
-  statusEl.textContent = "A new worker hatched!";
-  setState(body);
-});
+for (const caste of CASTES) {
+  reproduceButtons[caste].addEventListener("click", async () => {
+    const res = await fetch("/api/reproduce", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ caste }),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      statusEl.textContent = body.error ?? "reproduce failed";
+      return;
+    }
+    selectedWorkerIds = new Set();
+    statusEl.textContent = `A new ${CASTE_DISPLAY_NAMES[caste].toLowerCase()} hatched!`;
+    setState(body);
+  });
+}
 
 async function refresh(): Promise<void> {
   const res = await fetch("/api/state");

@@ -47,6 +47,7 @@ function mintColony(): number {
       y: worker.y,
       health: worker.health,
       maxHealth: worker.maxHealth,
+      caste: worker.caste,
     });
   return colonyId;
 }

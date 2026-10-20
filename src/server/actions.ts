@@ -1,3 +1,4 @@
+import type { Caste } from "./balance.ts";
 import { db } from "./db.ts";
 import { type EvolutionChoice, getEvolutionModifiers, tierThreshold } from "./evolution.ts";
 import {
@@ -11,12 +12,18 @@ import {
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
 
-export function reproduce(colonyId: number): ActionResult {
+const VALID_CASTES: Caste[] = ["worker", "soldier", "scout"];
+
+// Stage 10 §7/§8: colonyId always resolves exclusively from session
+// middleware at the call site (index.ts) — the client requests a caste,
+// never colony authority.
+export function reproduce(colonyId: number, caste: Caste): ActionResult {
   // Stage 8: a defeated colony has no queen left to reproduce from — checked
   // by lifecycle status itself, not incidentally via "no colony_resources
   // row" (the row is deleted on defeat, but that's not what's being tested
   // here; see §23).
   if (!isColonyActive(colonyId)) return { ok: false, error: "colony defeated" };
+  if (!VALID_CASTES.includes(caste)) return { ok: false, error: "invalid caste" };
 
   const colony = db
     .prepare("SELECT queen_x AS queenX, queen_y AS queenY FROM colonies WHERE id = ?")
@@ -25,9 +32,10 @@ export function reproduce(colonyId: number): ActionResult {
 
   // Stage 9: Brood I/II/III discount the actual cost used for both the
   // affordability check and the deduction — the displayed cost and the
-  // spent cost are always the same number, per §17.
+  // spent cost are always the same number, per §17. Stage 10: the base cost
+  // is now caste-dependent too.
   const evolution = getColonyEvolution(colonyId);
-  const modifiers = getEvolutionModifiers(evolution ?? { tier1: null, tier2: null, tier3: null });
+  const modifiers = getEvolutionModifiers(evolution ?? { tier1: null, tier2: null, tier3: null }, caste);
   const cost = modifiers.reproduceCost;
 
   const protein = db
@@ -46,8 +54,8 @@ export function reproduce(colonyId: number): ActionResult {
       "UPDATE colony_resources SET amount = amount - ? WHERE colony_id = ? AND resource_type = 'protein'",
     ).run(cost, colonyId);
     const info = db
-      .prepare("INSERT INTO workers (colony_id, x, y, health, max_health) VALUES (?, ?, ?, ?, ?)")
-      .run(colonyId, colony.queenX, colony.queenY, maxHealth, maxHealth);
+      .prepare("INSERT INTO workers (colony_id, x, y, health, max_health, caste) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(colonyId, colony.queenX, colony.queenY, maxHealth, maxHealth, caste);
     newWorkerId = Number(info.lastInsertRowid);
   });
   tx();
@@ -61,6 +69,7 @@ export function reproduce(colonyId: number): ActionResult {
     y: colony.queenY,
     health: maxHealth,
     maxHealth,
+    caste,
   });
   // Stage 9: reproduction is the only path that increases a colony's living
   // worker count, so this is the one place peak population needs checking.
