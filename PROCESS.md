@@ -20,9 +20,10 @@ workers — and filtered `otherWorkers`/`resourceNodes`/`creatures`/foreign
 server. `issueGatherCommand`/`issueAttackCommand` also rejected a target
 outright with `"target not visible"` if it wasn't currently in the caller's
 vision. This read as the more defensible design — withhold at the source,
-don't trust the client to self-censor — and it's what `d126617` ("Stage 10:
-worker castes, fog of war, and caste-aware evolution") actually shipped
-first.
+don't trust the client to self-censor — and it's what
+([`d126617`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/d126617))
+("Stage 10: worker castes, fog of war, and caste-aware evolution") actually
+shipped first.
 
 **The problem, observed manually, not from a test failure.** Running the
 dev server for real play — two browser tabs, each its own colony, the
@@ -124,6 +125,11 @@ body (`{ caste: "worker" | "soldier" | "scout" }`, 400 on anything else) —
 layered onto the otherwise fully pre-Stage-10 "two simultaneous reproduce
 calls race for the same protein" test, since that's a genuine, unrelated
 Stage 10 change this revision doesn't touch.
+
+This revision — the fog-of-war rework, the test migrations, and the
+CLAUDE.md/PROCESS.md documentation above — landed in one commit
+([`1fe02d3`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-u7488099/commit/1fe02d3))
+on top of `d126617`'s original server-side-fog version.
 
 ## Stage 9: evolution & colony specialisation
 
