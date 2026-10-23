@@ -1504,12 +1504,10 @@ describe("Stage 6: hunting, combat, carcasses", () => {
   });
 
   it("command override: a second attack retargets the worker, and a move command replaces an attack outright", () => {
-    // Stage 10: fog of war means a creature must be within some vision
-    // source's radius to be a legal attack target at all. The "far"
-    // creature only needs to be far enough from the worker's start that one
-    // tick's movement toward it doesn't close to attack range yet — it
-    // still has to sit inside the worker's own VISION_RADIUS.worker (180)
-    // to be targetable in the first place.
+    // Stage 10 (revised): fog of war is client-side only now — the server
+    // has no visibility gate on attack targets. The "far" creature just
+    // needs to be far enough that one tick's movement toward it doesn't
+    // close to attack range yet, no vision-radius constraint applies.
     const farCreatureId = insertCreature(2000, 1850);
     const nearCreatureId = insertCreature(2000, 2000);
     sim.loadSimulation();

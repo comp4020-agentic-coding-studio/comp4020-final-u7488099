@@ -1499,3 +1499,135 @@ new creature/building/caste system.
   balancing pass on the provisional percentages, no new creature or
   building types, no production world reset.
 
+## Stage 10: Worker Castes & Fog of War
+
+Stage 9 gave colonies a permanent identity but every worker was still
+functionally identical. Stage 10 adds two independent systems on top of
+that: a durable **caste** a worker is born into (worker/soldier/scout, each
+with its own base stats), and **fog of war**, a visibility mechanic that
+hides the shared world outside each colony's own units' sight. The two are
+unrelated except that caste determines a unit's own vision radius.
+
+### Castes
+
+- **Caste is a durable, per-worker property, not a transient UI label.**
+  `workers.caste` (`'worker' | 'soldier' | 'scout'`, `Caste` type in
+  `balance.ts`) is set once at creation (initial seed, `reproduce()`,
+  `createColony()`'s starting workers) and never changes afterward — there
+  is no respec, same precedent Stage 9 already set for evolution tiers.
+  `migrateWorkerCaste()` (`db.ts`) adds the column as `NOT NULL DEFAULT
+  'worker'` directly (no separate backfill pass needed, unlike worker
+  health — `'worker'` is the only honest value for every pre-Stage-10 row,
+  since soldiers/scouts never existed before this stage).
+- **One central table of base stats, same discipline Stage 9's
+  `getEvolutionModifiers` already established for evolution.**
+  `CASTE_BASE_STATS` (`balance.ts`) holds `maxHealth`/`attackDamage`/
+  `speed`/`reproduceCost`/`carryCapacity` per caste. Worker is exactly the
+  pre-Stage-10 baseline (reuses the existing flat constants verbatim, not
+  duplicated numbers), so every pre-Stage-10 worker behavior and test is
+  preserved byte-for-byte. Soldier (higher health/damage, faster, can't
+  gather) and Scout (fragile, fast, wide vision, small carry) are the
+  brief's own suggested placeholders — no balancing pass attempted.
+  Evolution (Stage 9) still applies its own multipliers on top of whichever
+  caste's base stats apply (`getEvolutionModifiers(selections, caste)`) —
+  the two systems compose, neither replaces the other.
+- **A Soldier's `carryCapacity: 0` is what actually prevents it from
+  gathering, structurally — not a UI restriction.**
+  `issueGatherCommand` returns `"wrong caste"` for a Soldier before any
+  other check; this is a real `GatherCommandError` member, not a client-side
+  guess. A Soldier can still be issued an attack or move command exactly
+  like a Worker or Scout.
+- **The player picks a caste when reproducing, never the server.**
+  `POST /api/reproduce` takes `{ caste }` in the body (validated against
+  the three literal strings, `400` on anything else) — authority over
+  *whose* colony is spending resources still comes from the session cookie,
+  exactly as every other mutating route; only the caste choice itself comes
+  from the client.
+
+### Fog of war — a client-side rendering mechanic, not a security boundary
+
+Fog of war was built twice. The first version (shipped, then reverted
+within the same stage before ever reaching production) made
+`getState(colonyId)` filter `otherWorkers`/`resourceNodes`/`creatures`/
+foreign `colonies` server-side through a vision check before the payload
+ever left the server, and rejected a gather/attack command outright with
+`"target not visible"` if the target wasn't currently in the caller's
+vision. That version is **not what shipped** — it was replaced by the
+design below after review concluded fog belongs to gameplay feel, not
+information security, and before it ever had to be reverted out of a
+deployed build.
+
+- **The whole shared world exists and moves the same way under the fog as
+  it does everywhere else — fog never changes what's real, only what's
+  drawn and clickable on one player's own screen.** `getState(colonyId)`
+  (`state.ts`) returns the full, unfiltered world to every colony: every
+  other colony's workers and queen, every resource node, every creature,
+  with no distance/vision filtering anywhere. The only privacy rule that
+  predates and survives this stage is Crit 10's original one — a foreign
+  colony's own resource ledger is never sent, full stop; that's an economy
+  rule, not a fog rule, and is completely unrelated to vision.
+- **Command authorization never depended on visibility to begin with, and
+  still doesn't.** `issueMoveCommand`/`issueGatherCommand`/
+  `issueAttackCommand` (`simulation.ts`) keep every existing ownership/
+  caste/busy/colony-active check unchanged; there has never been a
+  server-side "is this target currently visible to you" gate on any
+  mutation. Server authority is total over *who can do what to which
+  entity* — fog has no opinion on that, and clicking blindly into darkness
+  you can't see is exactly as legitimate a command as clicking something
+  lit.
+- **Vision sources and the darkness they punch through are computed
+  entirely in `main.ts`, not the server.** `computeOwnVisionSources()`
+  builds one source per own unit — the queen (`VISION_RADIUS.queen`, 300)
+  if the colony is active, else a single, smaller consolation source at the
+  ruin (`DEFEATED_COLONY_VISION_RADIUS`, 150) — plus one source per living
+  worker at `VISION_RADIUS[worker.caste]` (Worker/Soldier 180, Scout 400 —
+  a Scout's wide vision is its whole purpose, since it can't gather or
+  fight well). `isVisible(x, y, sources)` is a flat `.some()` distance
+  check reused by three call sites: `draw()` (skip drawing a hidden
+  resource node/creature/foreign colony/foreign worker — own units are
+  never gated, always fully visible), `hitTest()` (skip a hidden
+  creature/node so a click can never resolve to something that isn't
+  drawn), and `drawFogOverlay()` (the actual darkening — a translucent
+  rect with `destination-out` circles punched for every source, same
+  circles the other two consult). All three share the one source list
+  computed once per frame, so what's dark, what's drawn, and what's
+  clickable can never drift out of sync with each other.
+- **A blind click into darkness is just a move command, with zero special
+  casing.** `onCanvasClick()` runs `hitTest()` first; when it returns
+  `null` — which it now does for anything hidden, same as genuinely empty
+  ground — it falls through to `onMoveClick(wx, wy)` exactly as it already
+  did for empty ground before this stage existed. A unit sent into the dark
+  carries its own vision circle with it and reveals whatever's there the
+  moment it arrives, with no code path that needs to know the difference
+  between "empty" and "hidden."
+- **Why the server-side version was abandoned: it was a real, measured,
+  avoidable cost with no spatial index and no measured performance budget,
+  unlike every other stage's tick-cost work (Stage 3's separation grid,
+  Stage 7/9's documented sub-millisecond `advanceSimulation()`
+  measurements).** The old `getVisionSources(colonyId)` scanned every
+  worker in the *entire world* per call, and `getState()` then re-ran a
+  vision check across every foreign worker, every resource node, every
+  creature, and every colony for each request — roughly
+  `O(colonies × avg_workers_per_colony × total_world_entities)` once there
+  are dozens of colonies live, the one subsystem in this codebase that
+  scales that way. This was reproducible and measured (see `PROCESS.md`),
+  not just suspected: removing it was worth roughly a 2x reduction in
+  `getState()` cost at a Stage-9-precedent-shaped population, and a smaller
+  but still real improvement at the live dev world's actual (differently-
+  shaped) population. At that real-world shape a separate, unrelated,
+  pre-existing cost (`getAllColonies()`'s per-colony population scan —
+  O(colonies × workers), introduced in Stage 9, not this stage) happened to
+  dominate the total more than fog filtering did — worth a follow-up
+  optimization note in a later stage, but it doesn't change this stage's
+  conclusion: fog filtering was real, avoidable, unbounded-with-scale cost,
+  and removing it was the right call regardless of which cost was largest
+  at any one measured moment.
+- **No anti-cheat guarantee was ever a goal, so moving fog off the server
+  costs nothing this project actually needs.** A browser devtools user can
+  already see the full world state in the client-side-fog design — exactly
+  as true as it would be for any other single-page game with no
+  server-authoritative-rendering requirement. The brief's security surface
+  is about *mutation* authority (who can move/gather/attack what — Crit
+  10's session/colony model), never about withholding read-only world state
+  from the same browser that's already trusted to render it.
+

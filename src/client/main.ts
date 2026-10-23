@@ -145,6 +145,8 @@ const evolutionConfirmOverlay = document.querySelector<HTMLElement>("#evolution-
 const evolutionConfirmText = document.querySelector<HTMLElement>("#evolution-confirm-text")!;
 const evolutionConfirmCancel = document.querySelector<HTMLButtonElement>("#evolution-confirm-cancel")!;
 const evolutionConfirmButton = document.querySelector<HTMLButtonElement>("#evolution-confirm-confirm")!;
+const returnToQueenButton = document.querySelector<HTMLButtonElement>("#return-to-queen-button")!;
+const recallAllButton = document.querySelector<HTMLButtonElement>("#recall-all-button")!;
 
 const QUEEN_RADIUS = 20;
 const NODE_RADIUS: Record<string, number> = { sugar: 8, protein: 14, biomass: 20 };
@@ -356,15 +358,50 @@ function drawSelectionBox(box: { startWorld: [number, number]; currentWorld: [nu
   ctx.restore();
 }
 
+// Stage 10 (revised): fog of war is purely a client-side rendering/
+// interaction concern — the server now sends the full, unfiltered shared
+// world (see CLAUDE.md's Stage 10 section and state.ts). "Illuminated
+// darkness": the whole map exists underneath the fog; a colony's own queen
+// and units are light sources whose circles combine, and everything else is
+// filtered out of rendering and hit-testing (not deleted from `state`) when
+// it falls outside every circle. This single source list is also what
+// drawFogOverlay() punches holes for, so the lit area and the
+// drawn/clickable area can never drift apart.
+interface VisionSource {
+  x: number;
+  y: number;
+  radius: number;
+}
+
+function computeOwnVisionSources(): VisionSource[] {
+  if (!state) return [];
+  if (state.colony.status !== "active") {
+    return [{ x: state.colony.queenX, y: state.colony.queenY, radius: DEFEATED_COLONY_VISION_RADIUS }];
+  }
+  const sources: VisionSource[] = [{ x: state.colony.queenX, y: state.colony.queenY, radius: VISION_RADIUS.queen }];
+  for (const worker of state.workers) {
+    sources.push({ x: worker.x, y: worker.y, radius: VISION_RADIUS[worker.caste] });
+  }
+  return sources;
+}
+
+function isVisible(x: number, y: number, sources: VisionSource[]): boolean {
+  return sources.some((s) => Math.hypot(s.x - x, s.y - y) <= s.radius);
+}
+
 function draw(): void {
   ctx.fillStyle = "#eef7ee";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   if (!state) return;
 
+  const vision = computeOwnVisionSources();
+
   for (const node of state.resourceNodes) {
+    if (!isVisible(node.x, node.y, vision)) continue;
     drawResourceNode(node);
   }
   for (const creature of state.creatures) {
+    if (!isVisible(creature.x, creature.y, vision)) continue;
     if (creature.species === "spider") {
       drawSpider(creature.x, creature.y, SPIDER_RADIUS);
       drawHealthBar(creature.x, creature.y, SPIDER_RADIUS, creature.health, creature.maxHealth);
@@ -378,9 +415,11 @@ function draw(): void {
   // "other colony" purple so the convention reads consistently across unit
   // types — but never selectable/commandable (otherWorkers is never consulted
   // by hitTest or selectWorkersInBox). Resources stay private: getState()
-  // never sends another colony's economy.
+  // never sends another colony's economy. Stage 10 (revised): now also
+  // gated by this colony's own vision, since the server no longer does it.
   for (const colony of state.colonies) {
     if (colony.id === state.colony.id) continue;
+    if (!isVisible(colony.queenX, colony.queenY, vision)) continue;
     if (colony.status === "defeated") {
       drawRuin(colony.queenX, colony.queenY, QUEEN_RADIUS);
       continue;
@@ -389,6 +428,7 @@ function draw(): void {
     drawHealthBar(colony.queenX, colony.queenY, QUEEN_RADIUS, colony.health, colony.maxHealth);
   }
   for (const worker of state.otherWorkers) {
+    if (!isVisible(worker.x, worker.y, vision)) continue;
     const r = CASTE_RADIUS[worker.caste];
     circle(worker.x, worker.y, r, "#ce93d8", "#6a1b9a", CASTE_STROKE_WIDTH[worker.caste]);
     if (worker.carrying) drawCarryingBadge(worker.x, worker.y, r, worker.carrying.resourceType);
@@ -410,38 +450,58 @@ function draw(): void {
 
   if (dragMode === "select" && dragged && selectionDrag) drawSelectionBox(selectionDrag);
 
-  drawFogOverlay();
+  drawFogOverlay(vision);
 }
 
-// Stage 10: purely a visual "obscured region" cue — the authoritative
-// hiding already happened server-side (getState() never sends an entity
-// outside the player's own vision sources), so this layer only has to
-// darken ground the player can't see, not hide anything itself. Own units'
-// positions (always present in full, unfiltered — see ColonyState) are
-// exactly the vision sources this punches holes for, mirroring
-// getVisionSources() server-side: queen + every own worker, radius by
-// caste for workers.
-function drawFogOverlay(): void {
-  if (!state) return;
-  ctx.save();
-  ctx.fillStyle = "rgba(10, 15, 10, 0.55)";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.globalCompositeOperation = "destination-out";
-  const punch = (wx: number, wy: number, r: number) => {
-    const [sx, sy] = worldToScreen(wx, wy);
-    ctx.beginPath();
-    ctx.arc(sx, sy, r, 0, Math.PI * 2);
-    ctx.fill();
-  };
-  if (state.colony.status === "active") {
-    punch(state.colony.queenX, state.colony.queenY, VISION_RADIUS.queen);
-    for (const worker of state.workers) {
-      punch(worker.x, worker.y, VISION_RADIUS[worker.caste]);
-    }
-  } else {
-    punch(state.colony.queenX, state.colony.queenY, DEFEATED_COLONY_VISION_RADIUS);
+// Fog is built as a mask, not a light: an offscreen buffer is filled with
+// opaque darkness, then each vision source *erases* (destination-out) a
+// soft-edged disc from that buffer only — never a translucent white circle
+// painted onto the world. Erasing can't push alpha below zero, so overlap
+// from several sources can only ever reach "fully erased" (= the normal,
+// unfogged world), never past it — brightness is capped at the world's own
+// appearance regardless of how many vision circles cover a pixel. The
+// gradient's inner stop (fully erased) matches the hard VISION_RADIUS used by
+// computeOwnVisionSources()/isVisible() for hit-testing; only a small band
+// just inside that radius fades out, so the softened edge is purely visual
+// and never changes what's actually visible/clickable. Finally the finished
+// mask is composited (plain source-over) on top of the normally-drawn world.
+const VISION_FALLOFF = 48; // world units of soft edge, inside the hard radius — visual only
+const FOG_FILL = "rgba(10, 15, 10, 0.55)";
+
+let fogCanvas: HTMLCanvasElement | null = null;
+let fogCtx: CanvasRenderingContext2D | null = null;
+
+function getFogCanvas(): CanvasRenderingContext2D {
+  if (!fogCanvas || fogCanvas.width !== canvas.width || fogCanvas.height !== canvas.height) {
+    fogCanvas = document.createElement("canvas");
+    fogCanvas.width = canvas.width;
+    fogCanvas.height = canvas.height;
+    fogCtx = fogCanvas.getContext("2d")!;
   }
-  ctx.restore();
+  return fogCtx!;
+}
+
+function drawFogOverlay(vision: VisionSource[]): void {
+  if (!state) return;
+  const fctx = getFogCanvas();
+  fctx.clearRect(0, 0, fogCanvas!.width, fogCanvas!.height);
+  fctx.fillStyle = FOG_FILL;
+  fctx.fillRect(0, 0, fogCanvas!.width, fogCanvas!.height);
+  fctx.save();
+  fctx.globalCompositeOperation = "destination-out";
+  for (const source of vision) {
+    const [sx, sy] = worldToScreen(source.x, source.y);
+    const innerRadius = Math.max(source.radius - VISION_FALLOFF, 0);
+    const gradient = fctx.createRadialGradient(sx, sy, innerRadius, sx, sy, source.radius);
+    gradient.addColorStop(0, "rgba(0, 0, 0, 1)");
+    gradient.addColorStop(1, "rgba(0, 0, 0, 0)");
+    fctx.fillStyle = gradient;
+    fctx.beginPath();
+    fctx.arc(sx, sy, source.radius, 0, Math.PI * 2);
+    fctx.fill();
+  }
+  fctx.restore();
+  ctx.drawImage(fogCanvas!, 0, 0);
 }
 
 function renderResourceCounts(): void {
@@ -616,6 +676,7 @@ function renderLifecycle(): void {
   const isDefeated = state.colony.status === "defeated";
   defeatOverlay.hidden = !isDefeated;
   abandonButton.disabled = isDefeated;
+  recallAllButton.disabled = isDefeated;
   for (const caste of CASTES) reproduceButtons[caste].disabled = isDefeated;
   if (isDefeated) {
     defeatMessageEl.textContent =
@@ -774,14 +835,21 @@ function hitTest(wx: number, wy: number): { kind: "worker" | "creature" | "node"
   for (const worker of state.workers) {
     if (Math.hypot(worker.x - wx, worker.y - wy) <= CASTE_RADIUS[worker.caste]) return { kind: "worker", id: worker.id };
   }
+  // Stage 10 (revised): a click can only ever resolve to something inside
+  // this colony's own vision — a hidden creature/node is never hit, so a
+  // blind click into fog always falls through to onCanvasClick's plain-move
+  // branch, exactly like clicking any other empty ground.
+  const vision = computeOwnVisionSources();
   // Stage 6: creatures are clickable (not selectable) — checked before nodes
   // so a click on an aphid standing over/near a resource node always hits
   // the creature, never falls through to the node underneath it.
   for (const creature of state.creatures) {
+    if (!isVisible(creature.x, creature.y, vision)) continue;
     const r = creature.species === "spider" ? SPIDER_RADIUS : APHID_RADIUS;
     if (Math.hypot(creature.x - wx, creature.y - wy) <= r + 4) return { kind: "creature", id: creature.id };
   }
   for (const node of state.resourceNodes) {
+    if (!isVisible(node.x, node.y, vision)) continue;
     const r = NODE_RADIUS[node.resourceType] ?? 10;
     if (Math.hypot(node.x - wx, node.y - wy) <= r) return { kind: "node", id: node.id };
   }
@@ -830,6 +898,39 @@ async function onMoveClick(wx: number, wy: number): Promise<void> {
     return;
   }
   statusEl.textContent = describeBatchOutcome(workerIds.length, body.errors, "moving");
+  setState(body);
+}
+
+// Pure camera/navigation — no fetch, no server round-trip, no selection
+// change. Mirrors the same recentre setState() already does on first load.
+function onReturnToQueenClick(): void {
+  if (!state) return;
+  camera.x = state.colony.queenX;
+  camera.y = state.colony.queenY;
+  clampCamera();
+}
+
+// Reuses the move command's existing group-destination spacing
+// (computeGroupDestinations, server-side) by sending every living unit's id
+// in one batch move to the queen's position — same spiral spacing a
+// multi-worker click-to-move already gets, just targeting the queen instead
+// of a clicked point. Never teleports: this is the same travel command as
+// any other move, just with a destination and a wider worker set.
+async function onRecallAllClick(): Promise<void> {
+  if (!state || state.colony.status !== "active") return;
+  const workerIds = state.workers.map((w) => w.id);
+  if (workerIds.length === 0) return;
+  const res = await fetch("/api/command/move", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds, x: state.colony.queenX, y: state.colony.queenY }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    statusEl.textContent = body.error ?? "recall failed";
+    return;
+  }
+  statusEl.textContent = describeBatchOutcome(workerIds.length, body.errors, "recalled");
   setState(body);
 }
 
@@ -935,6 +1036,9 @@ abandonConfirm.addEventListener("click", async () => {
   statusEl.textContent = "Colony abandoned.";
   setState(body);
 });
+
+returnToQueenButton.addEventListener("click", onReturnToQueenClick);
+recallAllButton.addEventListener("click", onRecallAllClick);
 
 startNewColonyButton.addEventListener("click", async () => {
   const res = await fetch("/api/start-new-colony", { method: "POST" });

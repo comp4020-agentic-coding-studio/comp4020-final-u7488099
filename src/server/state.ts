@@ -5,10 +5,8 @@ import {
   getAllColonies,
   getColonySnapshot,
   getCreaturesForWorld,
-  getVisionSources,
   getWorkersExcludingColony,
   getWorkersForColony,
-  isVisible,
   type Carrying,
 } from "./simulation.ts";
 import { getWorldEvents } from "./log.ts";
@@ -119,22 +117,24 @@ export function getState(colonyId: number): ColonyState {
 
   // Live positions come from in-memory simulation state, not straight from
   // SQLite — the table only ever holds the last checkpoint. See simulation.ts.
-  // Stage 10: own data (workers/colony) is never fog-filtered — only ever
-  // the OTHER colonies'/world's spatial entities below, per §16.
+  // Stage 10 (revised): fog of war is a client-side rendering concern only —
+  // the server returns the full, unfiltered shared world to every colony.
+  // Server authority is still total over *mutations* (ownership/caste/busy
+  // checks in simulation.ts are untouched); it's just no longer the thing
+  // deciding what a client is allowed to see. See CLAUDE.md's Stage 10
+  // section for why this moved off the server (a non-indexed, per-colony
+  // vision scan was the leading suspect for observed lag at scale).
   const workers = getWorkersForColony(colonyRow.id);
 
-  const visionSources = getVisionSources(colonyRow.id);
-  const otherWorkers = getWorkersExcludingColony(colonyRow.id).filter((w) => isVisible(w.x, w.y, visionSources));
+  const otherWorkers = getWorkersExcludingColony(colonyRow.id);
 
-  const resourceNodes = (
-    db
-      .prepare(
-        "SELECT id, x, y, resource_type AS resourceType, amount, max_amount AS maxAmount, kind FROM resource_nodes WHERE world_id = ? ORDER BY id",
-      )
-      .all(world.id) as ColonyState["resourceNodes"]
-  ).filter((n) => isVisible(n.x, n.y, visionSources));
+  const resourceNodes = db
+    .prepare(
+      "SELECT id, x, y, resource_type AS resourceType, amount, max_amount AS maxAmount, kind FROM resource_nodes WHERE world_id = ? ORDER BY id",
+    )
+    .all(world.id) as ColonyState["resourceNodes"];
 
-  const creatures = getCreaturesForWorld(world.id).filter((c) => isVisible(c.x, c.y, visionSources));
+  const creatures = getCreaturesForWorld(world.id);
 
   // defeat_cause is a durable SQLite column, never part of the in-memory sim
   // cache (it never changes after defeat) — fetched once here rather than
@@ -145,14 +145,10 @@ export function getState(colonyId: number): ColonyState {
     ),
   );
 
-  // Stage 10 §17/§23: a foreign colony (active queen or ruin) is only
-  // included when it falls inside this colony's own vision — except this
-  // colony's own entry, always included regardless of geometry (own-ness,
-  // not position, gates it — keeps a defeated viewer's own ruin visible to
-  // themselves).
-  const colonies: ColonyState["colonies"] = getAllColonies()
-    .filter((c) => c.id === colonyRow.id || isVisible(c.x, c.y, visionSources))
-    .map(({ id, x, y, health, maxHealth, status, population, peakPopulation, evolution }) => ({
+  // Stage 10 (revised): every colony in the world is always included — fog
+  // only governs client-side rendering, not what the server reports.
+  const colonies: ColonyState["colonies"] = getAllColonies().map(
+    ({ id, x, y, health, maxHealth, status, population, peakPopulation, evolution }) => ({
       id,
       queenX: x,
       queenY: y,
@@ -165,7 +161,8 @@ export function getState(colonyId: number): ColonyState {
       evolutionTier2: evolution.tier2,
       evolutionTier3: evolution.tier3,
       defeatCause: defeatCauses.get(id) ?? null,
-    }));
+    }),
+  );
 
   const worldEvents = getWorldEvents();
 

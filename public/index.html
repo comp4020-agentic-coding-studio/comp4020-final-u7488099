@@ -134,6 +134,20 @@
       #evolution-button:hover {
         background: #004d40;
       }
+      #return-to-queen-button,
+      #recall-all-button {
+        font-weight: 600;
+        background: #455a64;
+        color: white;
+        border: none;
+        border-radius: 999px;
+        padding: 0.4rem 1rem;
+        cursor: pointer;
+      }
+      #return-to-queen-button:hover,
+      #recall-all-button:hover {
+        background: #263238;
+      }
       #evolution-badge {
         display: inline-block;
         margin-left: 0.4rem;
@@ -238,7 +252,8 @@
       #abandon-button:disabled,
       #reproduce-worker:disabled,
       #reproduce-soldier:disabled,
-      #reproduce-scout:disabled {
+      #reproduce-scout:disabled,
+      #recall-all-button:disabled {
         opacity: 0.5;
         cursor: default;
       }
@@ -334,6 +349,12 @@
         </button>
         <button id="evolution-button" type="button" aria-haspopup="dialog" aria-controls="evolution-overlay">
           Evolution <span id="evolution-badge" hidden>AVAILABLE</span>
+        </button>
+        <button id="return-to-queen-button" type="button" title="Centre the camera on your queen">
+          Return to Queen
+        </button>
+        <button id="recall-all-button" type="button" title="Order every living unit to move back near your queen">
+          Recall All Units
         </button>
       </div>
       <p id="resources">sugar: 0 · protein: 0 · biomass: 0</p>
@@ -512,18 +533,22 @@
         <h2>Fog of War</h2>
         <ul>
           <li>
-            You can only see what's within vision range of your own queen and your own units — everything else is
-            hidden, not just undiscovered. There's no persistent "explored" memory: moving a unit away hides
-            whatever it revealed again.
+            Your own queen and units each act like a light source, revealing a circle of vision around themselves on
+            your screen — everything outside every circle is drawn as darkness. There's no persistent "explored"
+            memory: moving a unit away darkens whatever it revealed again.
           </li>
           <li>
-            Scouts see much farther than Workers or Soldiers, so sending one ahead is the best way to reveal distant
-            parts of the map before committing other units there.
+            Scouts see much farther than Workers or Soldiers, so sending one ahead is the best way to light up
+            distant parts of the map before committing other units there.
           </li>
           <li>
             Hidden entities — other colonies' queens and workers, ruins, resource nodes, carcasses, aphids, and
-            spiders — keep existing and moving while out of sight; they simply aren't sent to you until something of
-            yours can see them again.
+            spiders — keep existing and moving in the shared world the whole time; fog only governs what your own
+            screen draws and what you can click, not whether they're really there.
+          </li>
+          <li>
+            You can still click into darkness to send a selected unit there — it's a normal move order, it just
+            carries its own vision circle with it into the dark.
           </li>
           <li>
             If your colony falls, you keep a small consolation view around your own ruin instead of a black screen.

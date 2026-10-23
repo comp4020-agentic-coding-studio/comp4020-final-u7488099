@@ -6,7 +6,6 @@ import {
   type Caste,
   CASTE_BASE_STATS,
   CREATURE_PROTEIN_VALUE,
-  DEFEATED_COLONY_VISION_RADIUS,
   DEPOSIT_RANGE,
   GATHER_DURATION,
   GATHER_RANGE,
@@ -29,7 +28,6 @@ import {
   SPIDER_IDLE_MIN,
   SPIDER_SPEED,
   SPIDER_WANDER_RADIUS,
-  VISION_RADIUS,
   WORKER_ATTACK_COOLDOWN,
   WORKER_ATTACK_RANGE,
 } from "./balance.ts";
@@ -91,13 +89,11 @@ export type GatherCommandError =
   | "no such resource node"
   | "worker is busy returning resources"
   | "wrong caste"
-  | "target not visible"
   | "colony defeated";
 export type AttackCommandError =
   | "no such worker"
   | "no such creature"
   | "worker is busy returning resources"
-  | "target not visible"
   | "colony defeated";
 
 // Stage 5: a neutral creature (first species: aphid). Stage 6 makes it
@@ -708,39 +704,6 @@ export function getSpiderPositions(): { x: number; y: number }[] {
   return [...creatures.values()].filter((c) => c.species === "spider").map(({ x, y }) => ({ x, y }));
 }
 
-// Stage 10: fog of war. A colony's vision is the union of circles centred on
-// its queen and every one of its own living units, each sized by
-// VISION_RADIUS — never anything persisted or exploration-memory based (see
-// CLAUDE.md's Stage 10 section). Lives here, not a separate module, because
-// it reads directly from the live workers/colonies Maps the same way
-// buildSpatialGrid/separationDelta already do, rather than through a
-// snapshot-returning accessor.
-export interface VisionSource {
-  x: number;
-  y: number;
-  radius: number;
-}
-
-export function getVisionSources(colonyId: number): VisionSource[] {
-  const colony = colonies.get(colonyId);
-  if (!colony) return [];
-  if (colony.status !== "active") {
-    // §18: a defeated colony keeps a small consolation view of its own ruin
-    // rather than a black screen or omniscience.
-    return [{ x: colony.x, y: colony.y, radius: DEFEATED_COLONY_VISION_RADIUS }];
-  }
-  const sources: VisionSource[] = [{ x: colony.x, y: colony.y, radius: VISION_RADIUS.queen }];
-  for (const worker of workers.values()) {
-    if (worker.colonyId !== colonyId) continue;
-    sources.push({ x: worker.x, y: worker.y, radius: VISION_RADIUS[worker.caste] });
-  }
-  return sources;
-}
-
-export function isVisible(x: number, y: number, sources: VisionSource[]): boolean {
-  return sources.some((s) => Math.hypot(s.x - x, s.y - y) <= s.radius);
-}
-
 // Multiplayer visibility fix: the shared world has exactly one population of
 // workers, and every colony's workers are visible to every other colony (only
 // *commanding* them is restricted — see the ownership check below). Returns
@@ -875,11 +838,6 @@ export function issueGatherCommand(
     | { x: number; y: number }
     | undefined;
   if (!node) return "no such resource node";
-  // Stage 10: a hidden target id is rejected at command-issue time, even if
-  // guessed — see CLAUDE.md's Stage 10 section. Once issued, the traveling
-  // worker's own position is itself a vision source, so the command is never
-  // re-checked after this (§21).
-  if (!isVisible(node.x, node.y, getVisionSources(ownerColonyId))) return "target not visible";
   worker.command = { type: "gather", resourceId, lastKnownX: node.x, lastKnownY: node.y };
   return null;
 }
@@ -901,9 +859,6 @@ export function issueAttackCommand(
   if (worker.carrying) return "worker is busy returning resources";
   const creature = creatures.get(creatureId);
   if (!creature) return "no such creature";
-  // Stage 10: same hidden-target authorization as gather (§20/§21) — checked
-  // once at issue time; an in-progress chase is never re-validated.
-  if (!isVisible(creature.x, creature.y, getVisionSources(ownerColonyId))) return "target not visible";
   worker.command = { type: "attack", creatureId, cooldownRemaining: 0 };
   return null;
 }

@@ -1,5 +1,130 @@
 # Process overview
 
+## Stage 10: worker castes, and a fog-of-war revision
+
+Stage 10's brief asked for two things: a durable per-worker caste
+(worker/soldier/scout, each with its own base stats and a soldier that
+can't gather) and fog of war. Castes were straightforward — `getEvolutionModifiers`'s
+precedent (Stage 9) already showed the shape for "one central table of base
+numbers, every call site reads a field instead of branching locally," so
+`CASTE_BASE_STATS` just reused it. Fog of war is the part worth recording
+in detail, because I built it twice, and the second build came from a real
+measurement contradicting what I'd assumed the first time.
+
+**First pass: fog as a server-side information boundary.** My first reading
+of "fog of war" was literal: a colony shouldn't be *told* about what it
+can't see, so `getState(colonyId)` computed a `getVisionSources(colonyId)` —
+one circle per the colony's own queen and every one of its own living
+workers — and filtered `otherWorkers`/`resourceNodes`/`creatures`/foreign
+`colonies` through an `isVisible()` check before the payload ever left the
+server. `issueGatherCommand`/`issueAttackCommand` also rejected a target
+outright with `"target not visible"` if it wasn't currently in the caller's
+vision. This read as the more defensible design — withhold at the source,
+don't trust the client to self-censor — and it's what `d126617` ("Stage 10:
+worker castes, fog of war, and caste-aware evolution") actually shipped
+first.
+
+**The problem, observed manually, not from a test failure.** Running the
+dev server for real play — two browser tabs, each its own colony, the
+world accumulating colonies over several days of manual testing and
+targeted test runs — produced noticeably laggy broadcasts as the number of
+live colonies grew into the dozens. Nothing in the test suite caught this,
+because `spec/`'s black-box tests never build a world at that scale; it
+only showed up playing the actual game against the actual, multi-day-old
+dev DB. The `getVisionSources`/`isVisible` filtering was the obvious
+suspect: it was the one subsystem added this stage with no spatial index
+and no prior performance budget, re-run from scratch on every
+`getState()` call — once per distinct colony, per broadcast tick
+(`broadcastState()`'s existing per-tick memoization, unchanged since
+Crit 10) — unlike Stage 3's separation grid or Stage 7/9's own measured,
+sub-millisecond `advanceSimulation()` costs.
+
+**Why fog moved client-side instead of being optimized in place.** Before
+reaching for a spatial index or caching vision sources, I reconsidered
+whether server-side filtering was buying anything the brief actually
+needed. It wasn't: the brief's security surface has only ever been about
+*mutation* authority (Crit 10's session→colony model — who can move/
+gather/attack what), never about withholding read-only world state from
+the same browser already trusted to render it. There's no anti-cheat
+requirement anywhere in this project, so a devtools user seeing the full
+world in a client-side-fog design costs nothing the game actually needs.
+Once visibility stopped being an information-security problem, it became a
+much smaller rendering problem — and the client already had almost all of
+the logic it needed: `drawFogOverlay()` already built the exact same
+queen-plus-worker vision-circle punch-list server-side `getVisionSources`
+did, purely to draw the darkness overlay on top of a world the server was
+already filtering. The revision deletes the server-side filtering
+entirely — `getState()` returns the full, unfiltered shared world to every
+colony, same as every stage before this one — and makes that existing
+client-side punch-list the single source of truth for what's drawn,
+clickable (`hitTest()`), and darkened (`drawFogOverlay()`), so the three
+can never drift out of sync with each other. `issueGatherCommand`/
+`issueAttackCommand` drop the `"target not visible"` rejection; every other
+check in those two functions (ownership, caste, busy, colony-active) is
+untouched, since fog never had anything to do with command authorization in
+the first place. A click into fog needed no new code at all — `onCanvasClick`
+already fell through to a plain move command whenever `hitTest()` found
+nothing, which is exactly what a hidden entity now also produces.
+
+**Measuring it, rather than taking the lag report on faith.** I wrote a
+throwaway script (not committed, following Stage 7/9's own precedent)
+reconstructing the exact deleted `getVisionSources`/`isVisible` code from
+`d126617` and comparing it against the current, unfiltered `getState()`
+over a simulated broadcast tick (one `getState()` call per active colony,
+matching `broadcastState()`'s own per-colony-per-tick shape), at two
+different population shapes:
+
+- Against the real, multi-day-accumulated dev DB (170 active colonies,
+  heavily churned down by abandon/restart and combat testing to an average
+  of under 3 workers per colony): removing fog filtering was a **~1.15x**
+  speedup on `getState()` (old ~96ms/tick, new ~84ms/tick across all active
+  colonies). Breaking that down further showed fog filtering itself
+  accounted for only ~13% of the old total at this specific, atypical
+  shape — the actual majority of the cost (~64%) was `getAllColonies()`'s
+  pre-existing, Stage-9-introduced `population: getWorkersForColony(id).length`
+  computation, an unrelated O(colonies × that colony's own workers) scan
+  that fog never touched and this revision does not change. Worth a
+  follow-up note in a later stage, but out of scope here.
+- Against a population shaped like Stage 9's own precedent benchmark (30
+  colonies, 20 workers each — closer to what a healthy, actively-played
+  world looks like than the dev DB's churned-down shape): removing fog
+  filtering was a **~2.0x** speedup (old ~6.0ms/tick, new ~3.0ms/tick).
+  Scaling either dimension up (60 colonies × 20 workers, or 30 colonies ×
+  40 workers) kept the speedup in the 1.2x–1.6x range and growing with
+  population, consistent with the filtering cost's own
+  `O(colonies × own_workers × world_entities)` shape compounding against
+  whatever else `getState()` is doing.
+
+The honest conclusion: fog filtering was real, measurable, avoidable
+per-request cost that scales multiplicatively with colony count and has no
+spatial index — exactly the category of thing worth removing on general
+principle — but at the literal moment I went looking, a different,
+unrelated pre-existing cost (`getAllColonies()`'s population scan) had grown
+to dominate the picture more than fog had, specifically because of how
+lopsided the dev DB's population had become after days of churn. This
+doesn't change the design decision (removing server-side fog was still the
+right simplification, since it bought nothing the brief needed in exchange
+for its cost) but it does mean the lag I observed playing the game was
+likely a combination of both costs, not purely the one I originally
+suspected.
+
+**Tests.** `spec/multiplayer.test.ts` and `spec/realtime.test.ts` both had
+a scout-first-then-assert-visibility choreography woven through roughly a
+dozen tests each, built specifically to exercise the now-deleted
+server-side filtering (approach a hidden entity, assert it appears; command
+a hidden target, assert `"target not visible"`). Both files were migrated
+back to their pre-Stage-10 shape (the last commit before any fog-filtering
+scaffolding existed, `0bc1e13`) rather than patched incrementally, since
+the underlying mechanic the scouting setup existed to exercise no longer
+exists server-side at all — the real, still-true contract is simply "every
+session's own `/api/state`/WS payload already contains the full world,
+unconditionally," which needs no setup to assert. The one genuine Stage 10
+behavior preserved in the rewrite is `POST /api/reproduce`'s caste-aware
+body (`{ caste: "worker" | "soldier" | "scout" }`, 400 on anything else) —
+layered onto the otherwise fully pre-Stage-10 "two simultaneous reproduce
+calls race for the same protein" test, since that's a genuine, unrelated
+Stage 10 change this revision doesn't touch.
+
 ## Stage 9: evolution & colony specialisation
 
 Stage 8 made colony growth survivable but still purely numerical: gather →
