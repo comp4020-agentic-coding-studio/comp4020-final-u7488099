@@ -111,6 +111,7 @@ interface ColonyState {
     defeatCause: string | null;
   }[];
   worldEvents: { message: string }[];
+  identity: { status: "guest" | "account"; username: string | null; role: "player" | "admin" | null };
 }
 
 const canvas = document.querySelector<HTMLCanvasElement>("#world")!;
@@ -147,6 +148,35 @@ const evolutionConfirmCancel = document.querySelector<HTMLButtonElement>("#evolu
 const evolutionConfirmButton = document.querySelector<HTMLButtonElement>("#evolution-confirm-confirm")!;
 const returnToQueenButton = document.querySelector<HTMLButtonElement>("#return-to-queen-button")!;
 const recallAllButton = document.querySelector<HTMLButtonElement>("#recall-all-button")!;
+
+const identityIndicatorEl = document.querySelector<HTMLElement>("#identity-indicator")!;
+const saveProgressButton = document.querySelector<HTMLButtonElement>("#save-progress-button")!;
+const accountButton = document.querySelector<HTMLButtonElement>("#account-button")!;
+const logoutButton = document.querySelector<HTMLButtonElement>("#logout-button")!;
+const adminLink = document.querySelector<HTMLAnchorElement>("#admin-link")!;
+
+const entryOverlay = document.querySelector<HTMLElement>("#entry-overlay")!;
+const entryStatusEl = document.querySelector<HTMLElement>("#entry-status")!;
+const entryGuestButton = document.querySelector<HTMLButtonElement>("#entry-guest-button")!;
+const entryRegisterForm = document.querySelector<HTMLFormElement>("#entry-register-form")!;
+const entryRegisterUsername = document.querySelector<HTMLInputElement>("#entry-register-username")!;
+const entryRegisterPassword = document.querySelector<HTMLInputElement>("#entry-register-password")!;
+const entryLoginForm = document.querySelector<HTMLFormElement>("#entry-login-form")!;
+const entryLoginUsername = document.querySelector<HTMLInputElement>("#entry-login-username")!;
+const entryLoginPassword = document.querySelector<HTMLInputElement>("#entry-login-password")!;
+
+const registerOverlay = document.querySelector<HTMLElement>("#register-overlay")!;
+const registerStatusEl = document.querySelector<HTMLElement>("#register-status")!;
+const registerForm = document.querySelector<HTMLFormElement>("#register-form")!;
+const registerUsername = document.querySelector<HTMLInputElement>("#register-username")!;
+const registerPassword = document.querySelector<HTMLInputElement>("#register-password")!;
+const registerCancel = document.querySelector<HTMLButtonElement>("#register-cancel")!;
+
+const accountOverlay = document.querySelector<HTMLElement>("#account-overlay")!;
+const accountStatusEl = document.querySelector<HTMLElement>("#account-status")!;
+const accountClose = document.querySelector<HTMLButtonElement>("#account-close")!;
+const resetProgressConfirm = document.querySelector<HTMLInputElement>("#reset-progress-confirm")!;
+const resetProgressButton = document.querySelector<HTMLButtonElement>("#reset-progress-button")!;
 
 const QUEEN_RADIUS = 20;
 const NODE_RADIUS: Record<string, number> = { sugar: 8, protein: 14, biomass: 20 };
@@ -709,6 +739,24 @@ function setState(next: ColonyState): void {
   renderReproduceCosts();
   renderWorldEvents();
   renderEvolutionPanel();
+  renderIdentity();
+}
+
+function renderIdentity(): void {
+  if (!state) return;
+  const { identity } = state;
+  if (identity.status === "account") {
+    identityIndicatorEl.textContent = `Signed in as ${identity.username}`;
+    saveProgressButton.hidden = true;
+    accountButton.hidden = false;
+    logoutButton.hidden = false;
+  } else {
+    identityIndicatorEl.textContent = "Playing as guest";
+    saveProgressButton.hidden = false;
+    accountButton.hidden = true;
+    logoutButton.hidden = true;
+  }
+  adminLink.hidden = identity.role !== "admin";
 }
 
 // --- WASD / arrow-key panning ------------------------------------------
@@ -1075,20 +1123,180 @@ async function refresh(): Promise<void> {
   setState(await res.json());
 }
 
-// Crit 10: the WebSocket connects only after this first fetch resolves, not
-// alongside it. The very first request from a fresh browser profile is what
-// sets the `sid` session cookie; opening the WS connection before that
-// response lands would race the cookie and let the WS handshake go out
-// cookie-less, minting a second, separate colony for the same player. See
-// CLAUDE.md's Crit 10 section.
-refresh()
-  .then(() => {
-    const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${wsProtocol}//${location.host}/ws`);
-    ws.addEventListener("message", (event) => {
-      setState(JSON.parse(event.data as string));
-    });
-  })
-  .catch((err) => {
-    statusEl.textContent = `Failed to load the colony: ${String(err)}`;
+let activeWs: WebSocket | null = null;
+// Sockets we closed ourselves (as part of re-running enterGame for an auth
+// transition) so their own "close" event doesn't also trigger a reconnect —
+// only a close we didn't initiate (e.g. the server force-closing every
+// connection after admin Reset World) should do that.
+const intentionallyClosedSockets = new WeakSet<WebSocket>();
+
+// Crit 10: the WebSocket connects only after the first /api/state fetch
+// resolves, not alongside it. The very first request from a fresh browser
+// profile is what sets the `sid` session cookie; opening the WS connection
+// before that response lands would race the cookie and let the WS handshake
+// go out cookie-less, minting a second, separate colony for the same player.
+// See CLAUDE.md's Crit 10 section.
+//
+// Stage 11: factored into a named function so every auth transition
+// (register/login/logout/reset-progress) can re-run it after closing any
+// previously open socket, rather than only ever running once at page load.
+// It's also the reconnect target for a server-forced close (admin Reset
+// World closes every wss.clients connection) — see the "close" listener
+// below, which re-invokes this; a now-unrecognized/wiped session degrades
+// safely back to the entry gate because GET /api/session simply reports
+// "anonymous" for it, reusing Stage 6b's existing wiped-sessions precedent.
+async function enterGame(): Promise<void> {
+  entryOverlay.hidden = true;
+  if (activeWs) {
+    intentionallyClosedSockets.add(activeWs);
+    activeWs.close();
+    activeWs = null;
+  }
+  await refresh();
+  const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${wsProtocol}//${location.host}/ws`);
+  activeWs = ws;
+  ws.addEventListener("message", (event) => {
+    setState(JSON.parse(event.data as string));
   });
+  ws.addEventListener("close", () => {
+    if (intentionallyClosedSockets.has(ws)) return;
+    if (activeWs !== ws) return;
+    activeWs = null;
+    bootstrap().catch((err) => {
+      statusEl.textContent = `Connection lost: ${String(err)}`;
+    });
+  });
+}
+
+entryGuestButton.addEventListener("click", async () => {
+  entryStatusEl.textContent = "";
+  const res = await fetch("/api/auth/guest", { method: "POST" });
+  if (!res.ok) {
+    entryStatusEl.textContent = "Failed to continue as guest.";
+    return;
+  }
+  await enterGame();
+});
+
+entryRegisterForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  entryStatusEl.textContent = "";
+  const res = await fetch("/api/auth/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: entryRegisterUsername.value, password: entryRegisterPassword.value }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    entryStatusEl.textContent = body.error ?? "Registration failed.";
+    return;
+  }
+  entryRegisterForm.reset();
+  await enterGame();
+});
+
+entryLoginForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  entryStatusEl.textContent = "";
+  const res = await fetch("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: entryLoginUsername.value, password: entryLoginPassword.value }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    entryStatusEl.textContent = body.error ?? "Login failed.";
+    return;
+  }
+  entryLoginForm.reset();
+  await enterGame();
+});
+
+saveProgressButton.addEventListener("click", () => {
+  registerStatusEl.textContent = "";
+  registerForm.reset();
+  registerOverlay.hidden = false;
+});
+
+registerCancel.addEventListener("click", () => {
+  registerOverlay.hidden = true;
+});
+
+registerForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  registerStatusEl.textContent = "";
+  const res = await fetch("/api/auth/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: registerUsername.value, password: registerPassword.value }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    registerStatusEl.textContent = body.error ?? "Registration failed.";
+    return;
+  }
+  registerOverlay.hidden = true;
+  statusEl.textContent = `Account created. Signed in as ${body.username}.`;
+  await enterGame();
+});
+
+logoutButton.addEventListener("click", async () => {
+  const res = await fetch("/api/auth/logout", { method: "POST" });
+  if (!res.ok) {
+    statusEl.textContent = "Logout failed.";
+    return;
+  }
+  entryOverlay.hidden = false;
+  entryStatusEl.textContent = "";
+  await enterGame();
+});
+
+accountButton.addEventListener("click", () => {
+  accountStatusEl.textContent = "";
+  resetProgressConfirm.value = "";
+  resetProgressButton.disabled = true;
+  accountOverlay.hidden = false;
+});
+
+accountClose.addEventListener("click", () => {
+  accountOverlay.hidden = true;
+});
+
+resetProgressConfirm.addEventListener("input", () => {
+  resetProgressButton.disabled = resetProgressConfirm.value !== "RESET";
+});
+
+resetProgressButton.addEventListener("click", async () => {
+  if (resetProgressConfirm.value !== "RESET") return;
+  const res = await fetch("/api/account/reset-progress", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ confirm: resetProgressConfirm.value }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    accountStatusEl.textContent = body.error ?? "Reset failed.";
+    return;
+  }
+  accountOverlay.hidden = true;
+  selectedWorkerIds = new Set();
+  statusEl.textContent = "Your progress has been reset. A new colony has begun.";
+  setState(body);
+});
+
+async function bootstrap(): Promise<void> {
+  try {
+    const res = await fetch("/api/session");
+    const session: { status: "anonymous" | "guest" | "account" } = await res.json();
+    if (session.status === "anonymous") {
+      entryOverlay.hidden = false;
+      return;
+    }
+    await enterGame();
+  } catch (err) {
+    statusEl.textContent = `Failed to load the colony: ${String(err)}`;
+  }
+}
+
+bootstrap();

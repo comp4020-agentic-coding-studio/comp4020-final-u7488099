@@ -640,3 +640,76 @@ it(
   },
   60000,
 );
+
+// Stage 11 (Step 9): proves the server-side half of a login/logout mid-
+// connection transition — the WebSocket handler caches only `sessionId`
+// (Stage 8's fix) and broadcastState() re-resolves colonyId fresh via
+// getColonyForSession() every time it runs, including the immediate
+// broadcastState() call each /api/auth/* route already makes on success. A
+// connection that stays open the whole time, with no reconnect, must see
+// the account's own colony the instant it logs in — not the guest colony
+// its session started out pointing at. The client-only reconnect UX this
+// motivated (closing/reopening the socket on every auth transition, for the
+// sake of resetting in-memory UI state) is covered separately in main.ts/
+// spec/world.test.ts; this test is strictly about the server never serving
+// a stale colony over an already-open socket.
+function uniqueUsername(label: string) {
+  return `${label}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+it(
+  "a login on an already-open WebSocket connection's session re-points the very next broadcast frame to the account's own colony, with no reconnect",
+  async () => {
+    // A separate session registers an account with no pre-existing guest
+    // colony, so the account gets a freshly minted colony of its own
+    // (distinct from any guest colony involved below).
+    const owner = createOtherSession();
+    const username = uniqueUsername("midconn");
+    const password = "correcthorsebattery";
+    const regRes = await owner.request("/api/auth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    expect(regRes.status).toBe(200);
+    const ownerState = await owner.request("/api/state").then((r) => r.json());
+    const accountColonyId = ownerState.colony.id;
+
+    // The viewer session is a plain guest with its own distinct colony, and
+    // opens a WebSocket connection while still a guest.
+    const viewer = createOtherSession();
+    const viewerState = await viewer.request("/api/state").then((r) => r.json());
+    const guestColonyId = viewerState.colony.id;
+    expect(guestColonyId).not.toBe(accountColonyId);
+
+    const ws = await viewer.connect();
+    try {
+      // Logging in re-points only this session's account_id, server-side,
+      // without closing the socket or touching the cookie — exactly the
+      // "re-pointed mid-connection" scenario the per-tick re-resolution
+      // contract exists for.
+      const loginRes = await viewer.request("/api/auth/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      expect(loginRes.status).toBe(200);
+
+      const deadline = Date.now() + 10000;
+      let sawAccountColony = false;
+      while (!sawAccountColony && Date.now() < deadline) {
+        const message = await nextMessage(ws, 10000);
+        if (message.colony.id === accountColonyId) sawAccountColony = true;
+        // Never expect a frame to regress to showing the orphaned guest
+        // colony as "current" — login must not merge or flip back to it.
+        expect(message.colony.id).not.toBe(guestColonyId);
+      }
+      expect(sawAccountColony, "no broadcast frame on the open socket showed the account's own colony after login").toBe(
+        true,
+      );
+    } finally {
+      ws.close();
+    }
+  },
+  20000,
+);

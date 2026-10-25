@@ -16,6 +16,7 @@ import {
   WORKER_MAX_HEALTH,
   WORLD,
 } from "./balance.ts";
+import { DEFAULT_SCRYPT_PARAMS, hashPassword, type PasswordHash } from "./password.ts";
 
 // Stage 7: seedCreaturesIfEmpty() loops over every species' seed-position
 // list instead of hardcoding 'aphid', so a brand-new world seeds spiders
@@ -47,6 +48,8 @@ migrateWorkerHealth();
 migrateColonyLifecycle();
 migrateColonyEvolution();
 migrateWorkerCaste();
+migrateSessionsAccountId();
+migrateActionLogAccountId();
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS worlds (
@@ -148,28 +151,63 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
-  -- Crit 10: one row per anonymous browser session, mapping it to the one
-  -- colony it owns. The session id itself is the cookie value (an opaque
-  -- random token, never a password/account) — durable here so a returning
-  -- cookie resolves to the same colony across a server restart, not just
-  -- within one process's lifetime. See CLAUDE.md's Crit 10 section.
+  -- Crit 10: one row per browser session, mapping it to the one colony it
+  -- owns. The session id itself is the cookie value (an opaque random
+  -- token, never a password/account) — durable here so a returning cookie
+  -- resolves to the same colony across a server restart, not just within
+  -- one process's lifetime. See CLAUDE.md's Crit 10 section.
+  -- Stage 11: account_id is nullable — NULL means an anonymous guest
+  -- session, exactly the only kind that existed before this column did, so
+  -- colony_id keeps meaning what it always meant for every pre-Stage-11 row.
+  -- When account_id IS set, colony_id is vestigial (never cleared, never
+  -- read) — the authoritative colony for an authenticated session is always
+  -- accounts.active_colony_id, looked up fresh. See sessions.ts/auth.ts.
   CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     colony_id INTEGER NOT NULL REFERENCES colonies(id),
+    account_id INTEGER REFERENCES accounts(id),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
   -- Crit 10: durable, queryable record of "who did what" — GET /api/log
   -- reads this straight back. colony_id is the acting colony (the only
-  -- identity that exists in an anonymous-session model); detail is
-  -- free-form JSON, never parsed back into relational columns because the
-  -- shape differs per action type and nothing needs to query inside it.
+  -- identity that existed in the original anonymous-session model); detail
+  -- is free-form JSON, never parsed back into relational columns because
+  -- the shape differs per action type and nothing needs to query inside it.
+  -- Stage 11: account_id is nullable — set only for actions taken by an
+  -- authenticated session (login/register/reset-progress/admin actions),
+  -- NULL for every guest action, exactly as before this column existed.
   CREATE TABLE IF NOT EXISTS action_log (
     id INTEGER PRIMARY KEY,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     colony_id INTEGER NOT NULL,
+    account_id INTEGER,
     action TEXT NOT NULL,
     detail TEXT
+  );
+
+  -- Stage 11: one row per registered account. username uniqueness is
+  -- DB-enforced and case-insensitive (COLLATE NOCASE) so "Alice" and "alice"
+  -- can never both register. Password is never stored in any recoverable
+  -- form — only a scrypt hash + its own random salt; scrypt_n/r/p are
+  -- stored per-row (not read from a shared constant) so a future change to
+  -- the cost parameters never invalidates already-issued hashes.
+  -- active_colony_id is the authoritative "current colony" for every
+  -- session with account_id pointing here — looked up fresh on every
+  -- request, never cached (see getColonyForSession()/Stage 8's lesson).
+  -- No email column: email verification/password-reset-by-email is an
+  -- explicit Stage 11 non-goal.
+  CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    password_salt TEXT NOT NULL,
+    scrypt_n INTEGER NOT NULL,
+    scrypt_r INTEGER NOT NULL,
+    scrypt_p INTEGER NOT NULL,
+    role TEXT NOT NULL DEFAULT 'player',
+    active_colony_id INTEGER REFERENCES colonies(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
 
@@ -180,6 +218,7 @@ backfillCreatureHealth();
 backfillWorkerHealth();
 backfillColonyLifecycle();
 backfillColonyEvolution();
+bootstrapAdminAccount();
 
 // Pre-Stage-1 deployments have a `colonies` table from the Crit 8/9 schema:
 // integer grid coordinates, a flat `protein` column, no `world_id`. That
@@ -371,6 +410,55 @@ function migrateWorkerCaste(): void {
   db.exec("ALTER TABLE workers ADD COLUMN caste TEXT NOT NULL DEFAULT 'worker'");
 }
 
+// Stage 11: sessions gain an optional account_id. NULL is the exactly-
+// correct value for every pre-Stage-11 row (a guest session, which is all
+// that existed before accounts did) — no backfill needed, mirrors
+// migrateWorkersCarrying()'s guard pattern.
+function migrateSessionsAccountId(): void {
+  const columns = db.prepare("PRAGMA table_info(sessions)").all() as { name: string }[];
+  if (columns.length === 0) return; // table doesn't exist yet; CREATE TABLE below defines it with the column
+  if (columns.some((c) => c.name === "account_id")) return;
+  db.exec("ALTER TABLE sessions ADD COLUMN account_id INTEGER REFERENCES accounts(id)");
+}
+
+// Stage 11: action_log gains an optional account_id, NULL for every
+// pre-Stage-11 row (every action before accounts existed was taken by a
+// guest session) — same reasoning as migrateSessionsAccountId().
+function migrateActionLogAccountId(): void {
+  const columns = db.prepare("PRAGMA table_info(action_log)").all() as { name: string }[];
+  if (columns.length === 0) return; // table doesn't exist yet; CREATE TABLE below defines it with the column
+  if (columns.some((c) => c.name === "account_id")) return;
+  db.exec("ALTER TABLE action_log ADD COLUMN account_id INTEGER");
+}
+
+// Stage 11: idempotent create-or-promote admin bootstrap, run on every boot.
+// ADMIN_USERNAME/ADMIN_PASSWORD are set via `flyctl secrets set` in
+// production and a gitignored mise.local.toml in dev — never committed to
+// the repo. A no-op if either env var is unset. Never resets an existing
+// admin's password on reboot: an operator may have since changed it via the
+// normal login flow, and clobbering that every redeploy would be hostile.
+function bootstrapAdminAccount(): void {
+  const username = process.env.ADMIN_USERNAME;
+  const password = process.env.ADMIN_PASSWORD;
+  if (!username || !password) return;
+
+  const existing = db.prepare("SELECT id, role FROM accounts WHERE username = ? COLLATE NOCASE").get(username) as
+    | { id: number; role: string }
+    | undefined;
+
+  if (existing) {
+    if (existing.role !== "admin") {
+      db.prepare("UPDATE accounts SET role = 'admin' WHERE id = ?").run(existing.id);
+    }
+    return;
+  }
+
+  const { hash, salt, params } = hashPassword(password, DEFAULT_SCRYPT_PARAMS);
+  db.prepare(
+    "INSERT INTO accounts (username, password_hash, password_salt, scrypt_n, scrypt_r, scrypt_p, role) VALUES (?, ?, ?, ?, ?, ?, 'admin')",
+  ).run(username, hash, salt, params.n, params.r, params.p);
+}
+
 // Pre-Crit-10 this was "the" one global colony. It still seeds exactly the
 // same way (same world-centre queen position, same 3 starting workers) — but
 // as of Crit 10 it starts out unowned, and becomes whichever session asks
@@ -461,10 +549,21 @@ function spawnStartingWorkers(
 // someone's "fresh" colony. A defeated, unclaimed spare is simply invisible
 // here; the very next claim attempt mints a brand-new one in its place (see
 // sessions.ts), same as today's "mint if none unclaimed" behavior.
+// Stage 11: also excludes any colony already claimed via
+// accounts.active_colony_id. claimFreshColony() (sessions.ts) is used by the
+// account-based register()/login()/resetProgress() paths, which record a
+// claim via setAccountColony() — never a sessions row — so without this
+// second exclusion, a colony an account just claimed would still look
+// "unclaimed" here and get handed out again to the very next guest/account
+// claim, silently giving two identities the same colony.
 export function getUnclaimedColonyId(): number | undefined {
   const row = db
     .prepare(
-      "SELECT c.id AS id FROM colonies c LEFT JOIN sessions s ON s.colony_id = c.id WHERE s.colony_id IS NULL AND c.status = 'active' LIMIT 1",
+      `SELECT c.id AS id FROM colonies c
+       LEFT JOIN sessions s ON s.colony_id = c.id
+       LEFT JOIN accounts a ON a.active_colony_id = c.id
+       WHERE s.colony_id IS NULL AND a.active_colony_id IS NULL AND c.status = 'active'
+       LIMIT 1`,
     )
     .get() as { id: number } | undefined;
   return row?.id;
@@ -536,6 +635,7 @@ export function resetForTests(): void {
     DELETE FROM colonies;
     DELETE FROM creatures;
     DELETE FROM worlds;
+    DELETE FROM accounts;
   `);
   seedIfEmpty();
   seedCreaturesIfEmpty();
@@ -543,6 +643,7 @@ export function resetForTests(): void {
   backfillWorkerHealth();
   backfillColonyLifecycle();
   backfillColonyEvolution();
+  bootstrapAdminAccount();
 }
 
 // Stage 6b: the production-safe, intentionally-invoked counterpart to
@@ -560,6 +661,14 @@ export function resetForTests(): void {
 // colonies are wiped together, inside one transaction. Does not call
 // logAction itself (that would import log.ts, which imports this module) —
 // the caller (scripts/reset-world.ts) logs the event after this returns.
+//
+// Stage 11: accounts themselves (usernames/password hashes/roles) are never
+// wiped by a world reset — only the shared game world is destructive here,
+// not player identity. accounts.active_colony_id is cleared to NULL in the
+// same transaction so no account is left pointing at a colony id that no
+// longer exists; the next request from an authenticated session simply
+// claims/mints a fresh colony, exactly like a guest session whose sid cookie
+// survived the reset (see getColonyForSession()/resolveIdentity()).
 export function resetProductionWorld(): {
   colonies: number;
   workers: number;
@@ -573,6 +682,7 @@ export function resetProductionWorld(): {
 
   const tx = db.transaction(() => {
     db.exec(`
+      UPDATE accounts SET active_colony_id = NULL;
       DELETE FROM resource_nodes;
       DELETE FROM workers;
       DELETE FROM colony_resources;
@@ -662,11 +772,45 @@ export function createColony(avoid: { x: number; y: number; radius: number }[] =
 
 // Crit 10: resolves a session cookie value to the colony it owns, or
 // undefined if the cookie is missing/stale (e.g. from a wiped test DB).
+// Stage 8: this is the fresh-every-tick lookup broadcastState() uses — never
+// cached per connection, so a session re-pointed mid-connection (Start New
+// Colony) is picked up on the very next broadcast.
+// Stage 11: extended for the account indirection. A guest session
+// (account_id IS NULL) resolves exactly as before, straight from
+// sessions.colony_id. An authenticated session resolves through a fresh
+// accounts.active_colony_id lookup instead — never sessions.colony_id,
+// which becomes vestigial the moment account_id is set — so login/logout/
+// Reset Progress re-pointing an account's colony is picked up on the very
+// next broadcast tick with zero WebSocket-side caching, the same Stage 8
+// guarantee this function already gave guest sessions.
 export function getColonyForSession(sessionId: string): number | undefined {
-  const row = db.prepare("SELECT colony_id AS colonyId FROM sessions WHERE id = ?").get(sessionId) as
-    | { colonyId: number }
+  const row = db.prepare("SELECT colony_id AS colonyId, account_id AS accountId FROM sessions WHERE id = ?").get(sessionId) as
+    | { colonyId: number; accountId: number | null }
     | undefined;
-  return row?.colonyId;
+  if (!row) return undefined;
+  if (row.accountId == null) return row.colonyId;
+  const account = getAccountById(row.accountId);
+  return account?.activeColonyId ?? undefined;
+}
+
+// Stage 11: the raw, un-resolved session row — used by auth.ts's
+// peekIdentity() to tell "guest session" from "authenticated session"
+// before deciding which colony lookup applies. Deliberately separate from
+// getColonyForSession() above, which already resolves the account
+// indirection and is what every pre-Stage-11 call site still wants.
+export function getSessionAccountId(sessionId: string): number | null | undefined {
+  const row = db.prepare("SELECT account_id AS accountId FROM sessions WHERE id = ?").get(sessionId) as
+    | { accountId: number | null }
+    | undefined;
+  return row?.accountId;
+}
+
+// Stage 11: points a session at an account (login/register), or clears that
+// pointer back to NULL (logout) — never touches colony_id, which saveSession
+// already manages independently. Requires the session row to already exist
+// (callers call saveSession() first for a brand-new session id).
+export function setSessionAccount(sessionId: string, accountId: number | null): void {
+  db.prepare("UPDATE sessions SET account_id = ? WHERE id = ?").run(accountId, sessionId);
 }
 
 // Stage 8: an upsert, not a plain INSERT — Start New Colony re-points an
@@ -679,4 +823,78 @@ export function saveSession(sessionId: string, colonyId: number): void {
     sessionId,
     colonyId,
   );
+}
+
+export interface AccountRow {
+  id: number;
+  username: string;
+  passwordHash: string;
+  passwordSalt: string;
+  scryptN: number;
+  scryptR: number;
+  scryptP: number;
+  role: string;
+  activeColonyId: number | null;
+}
+
+const ACCOUNT_COLUMNS = `
+  id, username,
+  password_hash AS passwordHash, password_salt AS passwordSalt,
+  scrypt_n AS scryptN, scrypt_r AS scryptR, scrypt_p AS scryptP,
+  role, active_colony_id AS activeColonyId
+`;
+
+export function getAccountById(accountId: number): AccountRow | undefined {
+  return db.prepare(`SELECT ${ACCOUNT_COLUMNS} FROM accounts WHERE id = ?`).get(accountId) as AccountRow | undefined;
+}
+
+// COLLATE NOCASE here matches the column's own declared collation, so this
+// lookup is case-insensitive the same way the UNIQUE constraint is —
+// "Alice" and "alice" resolve to the same row.
+export function getAccountByUsername(username: string): AccountRow | undefined {
+  return db.prepare(`SELECT ${ACCOUNT_COLUMNS} FROM accounts WHERE username = ? COLLATE NOCASE`).get(username) as
+    | AccountRow
+    | undefined;
+}
+
+// Stage 11's account-side counterpart to saveSession(): re-points an
+// account's single active_colony_id, the authoritative colony for every
+// session with account_id set. Never deletes the old colony row — same
+// "old colony persists as a ruin" discipline saveSession() already uses for
+// guest sessions (see Start New Colony / Reset Progress).
+export function setAccountColony(accountId: number, colonyId: number): void {
+  db.prepare("UPDATE accounts SET active_colony_id = ? WHERE id = ?").run(colonyId, accountId);
+}
+
+export function createAccount(
+  username: string,
+  passwordHash: PasswordHash,
+  role: "player" | "admin" = "player",
+): number {
+  const { lastInsertRowid } = db
+    .prepare(
+      "INSERT INTO accounts (username, password_hash, password_salt, scrypt_n, scrypt_r, scrypt_p, role) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .run(username, passwordHash.hash, passwordHash.salt, passwordHash.params.n, passwordHash.params.r, passwordHash.params.p, role);
+  return Number(lastInsertRowid);
+}
+
+// Stage 11 admin: the one place /api/admin/accounts reads from — explicit
+// safe columns only (id, username, role, activeColonyId, createdAt), same
+// never-SELECT-* discipline as ACCOUNT_COLUMNS, so password_hash/salt/scrypt
+// params can never leak into an admin response by accident.
+export interface AdminAccountRow {
+  id: number;
+  username: string;
+  role: string;
+  activeColonyId: number | null;
+  createdAt: string;
+}
+
+export function getAllAccounts(): AdminAccountRow[] {
+  return db
+    .prepare(
+      "SELECT id, username, role, active_colony_id AS activeColonyId, created_at AS createdAt FROM accounts ORDER BY id",
+    )
+    .all() as AdminAccountRow[];
 }

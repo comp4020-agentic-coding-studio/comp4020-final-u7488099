@@ -6,15 +6,21 @@ import { type EvolutionChoice, traitDisplayName } from "./evolution.ts";
 // actually reads via `flyctl logs`, since nobody tails a SQLite table in
 // production. Both happen on every call; neither is optional. See CLAUDE.md's
 // Crit 10 section for why the log is keyed by colonyId rather than a player
-// account (there are no accounts).
-export function logAction(colonyId: number, action: string, detail?: Record<string, unknown>): void {
-  db.prepare("INSERT INTO action_log (colony_id, action, detail) VALUES (?, ?, ?)").run(
+// account for every pre-Stage-11 action.
+// Stage 11: accountId is optional — set only for actions taken by an
+// authenticated session (login/register/reset-progress/admin actions), so
+// admin activity can be attributed to a specific operator without changing
+// the signature every other call site already uses.
+export function logAction(colonyId: number, action: string, detail?: Record<string, unknown>, accountId?: number): void {
+  db.prepare("INSERT INTO action_log (colony_id, account_id, action, detail) VALUES (?, ?, ?, ?)").run(
     colonyId,
+    accountId ?? null,
     action,
     detail ? JSON.stringify(detail) : null,
   );
   const suffix = detail ? ` ${JSON.stringify(detail)}` : "";
-  console.log(`[action] colony=${colonyId} ${action}${suffix}`);
+  const accountSuffix = accountId !== undefined ? ` account=${accountId}` : "";
+  console.log(`[action] colony=${colonyId}${accountSuffix} ${action}${suffix}`);
 }
 
 export interface LogEntry {

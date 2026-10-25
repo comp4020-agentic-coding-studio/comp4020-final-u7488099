@@ -334,6 +334,143 @@
         background: #00695c;
         color: white;
       }
+      #identity-indicator {
+        font-size: 0.9rem;
+        color: #555;
+      }
+      #save-progress-button,
+      #account-button {
+        font-weight: 600;
+        background: #2e7d32;
+        color: white;
+        border: none;
+        border-radius: 999px;
+        padding: 0.4rem 1rem;
+        cursor: pointer;
+      }
+      #save-progress-button:hover,
+      #account-button:hover {
+        background: #1b5e20;
+      }
+      #logout-button {
+        font-weight: 600;
+        background: #455a64;
+        color: white;
+        border: none;
+        border-radius: 999px;
+        padding: 0.4rem 1rem;
+        cursor: pointer;
+      }
+      #logout-button:hover {
+        background: #263238;
+      }
+      #admin-link {
+        font-weight: 600;
+        color: #6a1b9a;
+      }
+      #entry-overlay,
+      #register-overlay,
+      #account-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.55);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 2rem;
+        z-index: 30;
+      }
+      #register-overlay,
+      #account-overlay {
+        z-index: 10;
+      }
+      #entry-overlay[hidden],
+      #register-overlay[hidden],
+      #account-overlay[hidden] {
+        display: none;
+      }
+      #entry-panel,
+      #register-panel,
+      #account-panel {
+        background: white;
+        color: #1a1a1a;
+        max-width: 480px;
+        width: 100%;
+        border-radius: 8px;
+        padding: 1.5rem 2rem;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+      }
+      .auth-form {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+        margin-block: 0.75rem;
+      }
+      .auth-form label {
+        font-size: 0.85rem;
+        font-weight: 600;
+      }
+      .auth-form input {
+        padding: 0.4rem 0.6rem;
+        border: 1px solid #aaa;
+        border-radius: 4px;
+        font-size: 1rem;
+      }
+      .auth-form button {
+        align-self: flex-start;
+        padding: 0.5rem 1rem;
+        border-radius: 6px;
+        border: none;
+        cursor: pointer;
+        font-weight: 600;
+        background: #1565c0;
+        color: white;
+      }
+      #entry-guest-button {
+        font-weight: 600;
+        background: #455a64;
+        color: white;
+        border: none;
+        border-radius: 999px;
+        padding: 0.5rem 1.2rem;
+        cursor: pointer;
+      }
+      .auth-status {
+        min-height: 1.2rem;
+        color: #b71c1c;
+        font-size: 0.9rem;
+      }
+      .danger-zone {
+        margin-top: 1.5rem;
+        border: 2px solid #b71c1c;
+        border-radius: 8px;
+        padding: 1rem;
+      }
+      .danger-zone h3 {
+        margin-top: 0;
+        color: #b71c1c;
+      }
+      #reset-progress-confirm {
+        padding: 0.4rem 0.6rem;
+        border: 1px solid #aaa;
+        border-radius: 4px;
+        font-size: 1rem;
+        width: 100%;
+        box-sizing: border-box;
+        margin-block: 0.5rem;
+      }
+      #reset-progress-button {
+        background: #b71c1c;
+        color: white;
+      }
+      #reset-progress-button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      #register-cancel,
+      #account-close {
+        background: #e0e0e0;
+      }
     </style>
   </head>
   <body>
@@ -356,6 +493,15 @@
         <button id="recall-all-button" type="button" title="Order every living unit to move back near your queen">
           Recall All Units
         </button>
+        <span id="identity-indicator"></span>
+        <button id="save-progress-button" type="button" aria-haspopup="dialog" aria-controls="register-overlay" hidden>
+          Save Progress / Create Account
+        </button>
+        <button id="account-button" type="button" aria-haspopup="dialog" aria-controls="account-overlay" hidden>
+          Account
+        </button>
+        <button id="logout-button" type="button" hidden>Logout</button>
+        <a id="admin-link" href="/admin" hidden>Admin</a>
       </div>
       <p id="resources">sugar: 0 · protein: 0 · biomass: 0</p>
       <canvas id="world" width="960" height="600"></canvas>
@@ -669,6 +815,76 @@
         <p>The shared world continues on. Your old colony remains behind as a ruin — other players may encounter it.</p>
         <div class="modal-actions">
           <button id="start-new-colony" type="button">Start New Colony</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="entry-overlay" role="dialog" aria-modal="true" aria-labelledby="entry-title" hidden>
+      <div id="entry-panel">
+        <h2 id="entry-title">Welcome to the Colony</h2>
+        <p>
+          Play as a guest, or create an account to keep your colony across browsers and devices.
+          <strong>Guest progress lives only in this browser — clearing cookies or switching devices will lose it
+          unless you create an account first.</strong>
+        </p>
+        <p id="entry-status" class="auth-status"></p>
+        <button id="entry-guest-button" type="button">Continue as Guest</button>
+        <h3>Create Account</h3>
+        <form id="entry-register-form" class="auth-form">
+          <label for="entry-register-username">Username</label>
+          <input id="entry-register-username" type="text" autocomplete="username" required />
+          <label for="entry-register-password">Password</label>
+          <input id="entry-register-password" type="password" autocomplete="new-password" required />
+          <button type="submit">Create Account</button>
+        </form>
+        <h3>Log In</h3>
+        <form id="entry-login-form" class="auth-form">
+          <label for="entry-login-username">Username</label>
+          <input id="entry-login-username" type="text" autocomplete="username" required />
+          <label for="entry-login-password">Password</label>
+          <input id="entry-login-password" type="password" autocomplete="current-password" required />
+          <button type="submit">Log In</button>
+        </form>
+      </div>
+    </div>
+
+    <div id="register-overlay" role="dialog" aria-modal="true" aria-labelledby="register-title" hidden>
+      <div id="register-panel">
+        <h2 id="register-title">Save Progress / Create Account</h2>
+        <p>
+          Creating an account keeps <strong>this</strong> colony and converts your guest progress — nothing is lost
+          or duplicated.
+        </p>
+        <p id="register-status" class="auth-status"></p>
+        <form id="register-form" class="auth-form">
+          <label for="register-username">Username</label>
+          <input id="register-username" type="text" autocomplete="username" required />
+          <label for="register-password">Password</label>
+          <input id="register-password" type="password" autocomplete="new-password" required />
+          <div class="modal-actions">
+            <button id="register-cancel" type="button">CANCEL</button>
+            <button type="submit">Create Account</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div id="account-overlay" role="dialog" aria-modal="true" aria-labelledby="account-title" hidden>
+      <div id="account-panel">
+        <h2 id="account-title">Account</h2>
+        <p id="account-status" class="auth-status"></p>
+        <div class="danger-zone">
+          <h3>Reset Progress</h3>
+          <p>
+            This permanently ends your current colony and starts a fresh one, exactly like Abandon Colony, but is
+            meant as a full progress reset. Your account itself is not deleted.
+          </p>
+          <label for="reset-progress-confirm">Type RESET to confirm</label>
+          <input id="reset-progress-confirm" type="text" autocomplete="off" />
+          <button id="reset-progress-button" type="button" disabled>Reset Progress</button>
+        </div>
+        <div class="modal-actions">
+          <button id="account-close" type="button">CLOSE</button>
         </div>
       </div>
     </div>

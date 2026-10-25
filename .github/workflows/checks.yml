@@ -32,14 +32,25 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Build and start the app
         # the same image Fly deploys, with a throwaway /data in place of the
-        # volume; the spec runs against it
+        # volume; the spec runs against it. ADMIN_USERNAME/PASSWORD here are
+        # CI-only, throwaway credentials for this ephemeral container (wiped
+        # with it) — distinct from the real admin credentials set via
+        # `flyctl secrets set` in prod — so spec/admin.test.ts's bootstrapped-
+        # admin coverage runs in CI too, not just locally.
         run: |
           docker build -t app .
-          docker run -d --init --name app -p 8080:8080 -e PORT=8080 --tmpfs /data app
+          docker run -d --init --name app -p 8080:8080 -e PORT=8080 \
+            -e ADMIN_USERNAME=ci-admin -e ADMIN_PASSWORD=ci-admin-password-1 \
+            --tmpfs /data app
       - name: Run the spec
         run: pnpm check
         env:
           APP_URL: http://localhost:8080
+          # Must match the container's own ADMIN_USERNAME/PASSWORD above —
+          # spec/admin.test.ts reads these from its own process.env to log in
+          # as the admin account the running container already bootstrapped.
+          ADMIN_USERNAME: ci-admin
+          ADMIN_PASSWORD: ci-admin-password-1
       - name: Show the app's output
         # what the container printed, so a crash or slow boot is visible
         if: ${{ failure() }}

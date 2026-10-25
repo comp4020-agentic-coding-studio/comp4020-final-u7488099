@@ -1,5 +1,131 @@
 # Process overview
 
+## Stage 11: accounts, entry flow, guest persistence, reset & admin
+
+Every stage through Crit 10/Stage 10 had exactly one identity concept: a
+`sid` cookie resolving straight to a colony, with no login, no durability
+across devices, and no way for a player to deliberately wipe their own bad
+run short of abandoning (Stage 8) and starting over under the same session.
+This stage's brief asked for real accounts, a guest-preserving entry flow,
+a player-triggered Reset Progress, and a minimal admin surface — all without
+rewriting Crit 10's resolution chain or touching the live production volume
+destructively. Two decisions were locked in before any code: admin accounts
+are provisioned via boot-time env vars (idempotent create-or-promote, never
+clobbering a changed password), and the admin interface is a separate
+`/admin` page rather than a view folded into the game SPA, since it's a
+surface only admins ever see and gains nothing from sharing a bundle with
+the player client.
+
+**Architecture: one more indirection, not a rewrite.** The existing
+`sessions` table gained a single nullable `account_id` column — every
+pre-Stage-11 row simply reads `NULL`, which is exactly the correct "this is
+a guest" value, so every returning guest's colony keeps resolving identically
+to before with zero special-cased "legacy session" branch anywhere. A new
+`accounts` table (`username` unique case-insensitively, scrypt hash/salt/
+params per row, `active_colony_id`, `role`) is the only genuinely new
+concept; `getColonyForSession()` — the one function `broadcastState()` and
+every request already funnel through — simply got one more branch: an
+account session's authoritative colony is `accounts.active_colony_id`, read
+fresh every time, never cached. This mattered specifically because of the
+Stage 8 lesson recorded above: a WebSocket connection must never cache a
+value that can be re-pointed mid-connection. Stage 8 taught that lesson for
+colony restarts; Stage 11 is the first time a *different kind* of
+re-pointing (an identity switch, not a colony defeat) exercises the exact
+same hazard, and caching only `sessionId` on the connection — never
+`colonyId`, never `accountId` — turned out to require no new code at all,
+just confirming the existing discipline already covered the new case.
+
+**Guest-preserving conversion fell out of "ownership was never on the colony
+row" for free.** The spec asked for guest→account conversion to adopt the
+guest's existing progress, not duplicate it. Because a colony's owner has
+always been *whatever points at it* (a session row or, now, an account row)
+rather than a field on the colony itself, `register()`'s conversion path is
+a two-line reassignment — point the new account's `active_colony_id` at the
+session's current colony, then point the session at the account — with no
+copy, no merge, and no new schema. The harder design question was login with
+an *existing* account on a browser that already has unrelated guest
+progress: the spec was explicit that this must not auto-merge, so `login()`
+simply never touches the guest colony at all. It becomes an orphaned ruin
+from the session's perspective — structurally identical to a Stage 8
+defeated colony sitting unreferenced in `colonies`, just reached by an
+identity switch instead of a queen's death. No new "orphaned colony" concept
+needed inventing; the shape already existed.
+
+**Reset World's isolation discipline was treated as the load-bearing
+requirement it is, not a nice-to-have.** The brief and the user's own
+standing instruction were unambiguous: Reset World must never be exercised
+against the real dev or production database during implementation, only
+manually, later, by a human through the live admin UI. `spec/
+admin-reset-world.test.ts` was written to make that true by construction
+rather than by care: it spawns a genuinely separate child `node
+src/server/index.ts` process, pointed at its own throwaway DB file
+(`./.data/colony.admin-reset-world-test.db`) on its own port, with its own
+admin credentials — sharing no process, no port, and no file with the dev
+server or any other test. Every assertion inspects that isolated database
+directly with a second, independent `better-sqlite3` handle (not just the
+HTTP response), to actually prove the reset's SQL-level semantics: accounts
+and `action_log` survive, colonies/workers/resources/sessions are wiped and
+reseeded, the admin can still authenticate afterward, a stale pre-reset
+cookie no longer resolves to anything, and a repeated reset is idempotent.
+This test was run repeatedly during development; the real dev database was
+never reset by it, and Reset World itself was never invoked against
+anything but this one disposable file for the entire stage.
+
+**An unrelated incident, encountered mid-stage and worth recording for the
+same reason Crit 8's prompt-injection anecdote and Stage 10's fog-of-war
+reversal are recorded here: a marker reading this file should be told about
+it, not have it silently absorbed.** While re-verifying the suite late in
+this stage, the real dev database files (`.data/colony.db` and its `-wal`/
+`-shm` companions) were discovered to have been deleted from disk by a cause
+that was never identified, despite a thorough check: no test file points at
+that path, no reset mechanism had been invoked, and a search of shell
+history and every deletion call site in the codebase (`rmSync`, `unlinkSync`,
+`rm -rf`/`rm -f`) turned up nothing that could explain it. The data was not
+actually lost at the moment of discovery — the still-running dev server
+process held open file descriptors to the now-unlinked inodes, and under
+SQLite's WAL journal mode a process with a file already open keeps reading
+and writing that file's real content without error even after every
+directory entry pointing at it is gone; a separate `sqlite3` CLI invocation
+against the same path saw a completely different, auto-created, empty file
+instead (confirmed via inode-number comparison, `lsof -p <pid>` against a
+plain `ls -lai`). This meant the data was recoverable — `better-sqlite3`'s
+`db.backup()` could still reach it from inside the live process — but only
+until that process ever exited. Given the choice between a live-process
+backup-and-restore and simply accepting the loss and reseeding fresh, the
+explicit decision made was to restart clean: the accumulated dev/test data
+had no durable value worth a riskier recovery attempt, and a fresh, verified
+reseed (colony id 1 landing exactly at world center, matching the documented
+Crit 10 invariant) was confirmed correct before continuing. This was never
+an invocation of Reset World, and the real dev database's current state as
+of this stage is that clean restart — not a recovery of whatever state
+preceded it.
+
+**Staged build order, verified incrementally.** Schema/migration first
+(`accounts` table, the two new nullable columns, `bootstrapAdminAccount`),
+verified against the full pre-existing suite with zero behavior change.
+Password hashing and identity resolution next (`src/server/password.ts`,
+`src/server/auth.ts`), as pure functions with their own direct-import unit
+tests before anything touched HTTP. Auth routes and the one genuinely
+behavior-changing edit — the `/api` middleware no longer being the only way
+to resolve identity, since `GET /api/session` had to exist as a
+non-minting read specifically so the entry gate could ask "who is this?"
+without side effects — came only after that foundation was solid. Reset
+Progress, the admin role/API, and the admin UI followed in that order so
+each layer could be tested against a working layer beneath it rather than
+all at once. Reset World's isolated-DB test suite and the entry/landing UI
+came next, and WebSocket transition hardening (client reconnect-on-close,
+plus a server-side test proving a login mid-connection is reflected on the
+very next broadcast tick with no reconnect required) came last, closing the
+same category of gap Stage 8 first identified for colony restarts.
+
+**Tests needed one small adaptation, not a rewrite.** `colony.test.ts`,
+`multiplayer.test.ts`, `realtime.test.ts`, and `world.test.ts` all gained a
+single `POST /api/auth/guest` call before their first `/api/state` request —
+the same colony/seed behavior as before, just an explicit call site now that
+`/api/session` exists as the non-minting alternative. Nothing else in those
+files needed to change, since every existing route still resolves identity
+exactly the way it always has for a guest session.
+
 ## Stage 10: worker castes, and a fog-of-war revision
 
 Stage 10's brief asked for two things: a durable per-worker caste

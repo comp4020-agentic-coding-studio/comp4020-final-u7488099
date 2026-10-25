@@ -50,11 +50,16 @@ co-presence.
   across natural, deterministically-seeded clusters rather than a grid —
   with room for many colonies to each spawn somewhere with their own nearby
   resources.
-- **Real multiplayer, server-enforced.** An anonymous session cookie resolves
-  to one colony; every other colony's queen is visible in the shared world,
-  but you can only ever select and command your own workers, and your
-  resources are private to you. There are no accounts or passwords — the
-  colony itself is the identity.
+- **Real multiplayer, server-enforced.** A session cookie resolves to one
+  colony; every other colony's queen is visible in the shared world, but you
+  can only ever select and command your own workers, and your resources are
+  private to you.
+- **Guest play by default, with an optional account.** Jump straight in as a
+  guest with no signup, or register/log in to make your colony durable
+  across browsers and devices. Converting a guest to an account keeps the
+  exact colony you already have; logging into an existing account never
+  silently merges in unrelated guest progress. A typed-confirmation Reset
+  Progress lets you deliberately start over without losing your account.
 - **RTS-style control**: drag-select workers, then click to move, gather, or
   attack. Gathering is real travel — a worker walks to a node, claims some of
   it, carries it home, and deposits it, not an instant credit. Sugar and
@@ -111,18 +116,29 @@ co-presence.
   small, fixed set of rules producing colonies that diverge from each other
   in ways nobody scripted, purely from the choices players make as they
   grow.
+- **Worker castes.** Choose worker, soldier, or scout when a new worker
+  hatches — each with its own base health, speed, attack, carry capacity,
+  and vision, permanent for that worker's lifetime. A soldier is tougher and
+  hits harder but can't gather; a scout is fragile but sees much further
+  than it can fight.
+- **Fog of war.** Each colony only sees what its own queen and living
+  workers can currently see; everything else — other colonies' units,
+  unclaimed resources, wandering creatures — is dark until a unit of yours
+  gets close enough to reveal it.
 
 ## What's deliberately not here yet
 
 No PvP (still no way to attack another player's workers or queen, ever), no
 worker corpses (a dead worker is simply removed), no ruin looting or decay,
 no multiple predator species, no aphid respawning, no respec or un-evolving,
-no soldier/scout castes or genetics, no buildings or territory, no automated
-colony defenses, no queen movement, no eggs/larvae, no formal biomes or
-runtime procedural spawning (the world's content is seeded once,
-deterministically, not generated live). No art pass beyond simple
-shape/colour readability, and no balancing pass on evolution's percentages.
-Each of these is a layer to add on top of what's here, not a rewrite of it.
+no genetics/breeding, no buildings or territory, no automated colony
+defenses, no queen movement, no eggs/larvae, no formal biomes or runtime
+procedural spawning (the world's content is seeded once, deterministically,
+not generated live). No email, password reset, OAuth, or account deletion;
+a single `admin` role, no finer-grained permissions. No art pass beyond
+simple shape/colour readability, and no balancing pass on evolution's
+percentages or caste stats. Each of these is a layer to add on top of what's
+here, not a rewrite of it.
 
 ## Stack
 

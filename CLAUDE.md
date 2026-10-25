@@ -1631,3 +1631,166 @@ deployed build.
   10's session/colony model), never about withholding read-only world state
   from the same browser that's already trusted to render it.
 
+## Stage 11: accounts, entry flow, guest persistence, reset & admin
+
+Every stage through 10 had exactly one identity concept: a `sid` cookie
+resolving straight to `sessions.colony_id` (Crit 10). Stage 11 adds durable,
+cross-device accounts, a deliberate player-level Reset Progress, and a small
+admin role/interface — without touching that resolution chain's core
+guarantee, only extending it.
+
+- **One extra indirection, one new resolution root.** A session row is
+  either a guest (`sessions.account_id IS NULL`, `colony_id` means what it
+  always has) or authenticated (`account_id` set). For an authenticated
+  session the authoritative colony is `accounts.active_colony_id`, looked up
+  fresh every time — never `sessions.colony_id`, which goes vestigial (never
+  cleared) the instant `account_id` is set. `src/server/auth.ts`'s
+  `resolveIdentity(cookieHeader)` is the one new function every `/api` route
+  resolves through: it calls the existing `resolveOrCreateColony` first
+  (still always mints a guest session/colony exactly as before), then reads
+  through `getSessionAccountId`/`getAccountById` if one exists. A guest's
+  `role`/`username`/`accountId` are `null` — never `"player"`, which would
+  misleadingly imply an account exists. `getColonyForSession` (used by
+  `broadcastState()`) got the same extension: `accountId == null` → return
+  `sessions.colony_id` directly; otherwise look up
+  `accounts.active_colony_id`. **The WebSocket connection still caches only
+  `sessionId`, nothing else** — the Stage 8 lesson (never cache a value
+  across a connection that can be re-pointed mid-connection) applies
+  identically to the new accounts indirection, not just to colony restarts.
+- **The browser never gets to declare which colony it owns — unchanged,
+  extended one level deeper.** Every account/auth mutation
+  (`register`/`login`/`logout`/`resetProgress` in `auth.ts`) takes
+  `sessionId` from the resolved cookie and, where relevant, `accountId` from
+  the already-resolved identity — never a client-supplied id. The one
+  genuinely new read, `GET /api/session`, is deliberately **non-minting**:
+  `peekIdentity(cookieHeader)` only parses an existing cookie and looks up
+  what's already there, returning `"anonymous"` for anything that doesn't
+  resolve, so a first-time visitor can be shown the entry gate without a
+  colony being minted just for asking. This route is registered ahead of
+  the general `/api` middleware (which still mints unconditionally for
+  every other route) specifically so it can stay mint-free.
+- **Guest→account conversion adopts the existing colony; it never copies or
+  duplicates it.** `register()` sets the new account's
+  `active_colony_id` to `getColonyForSession(sessionId) ?? claimFreshColony().colonyId`
+  — if the session already owns a guest colony, that exact row becomes the
+  account's colony; nothing about ownership was ever encoded on the colony
+  row itself, only on whatever points at it, so there's no merge logic to
+  write. Username uniqueness is enforced DB-side (`UNIQUE COLLATE NOCASE`),
+  surfaced as a generic `409`.
+- **Login never merges a guest colony into an existing account — the guest
+  colony is orphaned, not deleted.** `login()` re-points only
+  `sessions.account_id`; it never touches `accounts.active_colony_id` or any
+  colony the browser's prior guest session owned. That guest colony keeps
+  existing, unreferenced by this session going forward, exactly the same
+  "ruin" shape a defeated colony already has (Stage 8) — just reached via a
+  different path (identity switch instead of defeat). Login also never
+  distinguishes "no such user" from "wrong password": both produce the
+  identical `401 "invalid username or password"`, so a failed login can't
+  be used to enumerate usernames.
+- **Logout invalidates the session's authentication, never the account or
+  its colony.** `logout()` is exactly `setSessionAccount(sessionId, null)`
+  plus a log line — no colony/account row is ever touched. The client
+  treats a successful logout as "return to the entry gate," not "resume
+  whatever `sessions.colony_id` is still sitting there" (that column is
+  vestigial for an account session, per the first point above).
+- **Reset Progress reuses the existing colony-defeat/claim lifecycle —
+  there is no second destructive path.** `resetProgress()` requires body
+  confirmation of the exact literal `"RESET"` (`400` on anything else,
+  checked before any mutation), then calls the same `defeatColony(colonyId,
+  "reset")` Stage 8's abandon flow already uses (just a different `cause`
+  literal) and the same `claimFreshColony()` every other "this identity now
+  owns a different colony" transition uses. A guest re-points via
+  `saveSession`; an authenticated session re-points via `setAccountColony`
+  instead — never both, mirroring exactly how each identity's authoritative
+  colony is resolved elsewhere.
+- **Passwords are never stored plaintext, and never compared with `===`.**
+  `src/server/password.ts` is a small, dependency-free module (no
+  bcrypt/argon2 installed) built only on `node:crypto`'s `scryptSync`/
+  `randomBytes`/`timingSafeEqual`. Each account stores its own random
+  16-byte salt and its own scrypt cost parameters (`n/r/p`, currently
+  `{n: 16384, r: 8, p: 1}`, sized for the 256MB Fly machine this app
+  actually runs on — a desktop-class higher `n` risks OOM under a concurrent
+  login burst) rather than a single shared constant, so a future change to
+  those numbers can never invalidate an already-issued hash. Verification
+  always uses `timingSafeEqual` on equal-length buffers (returning `false`,
+  not throwing, on any length mismatch from a malformed/legacy hash) — never
+  a plain `===`, which would leak timing information about how many leading
+  bytes matched.
+- **Admin role is resolved server-side only, from the same `resolveIdentity`
+  every other route already calls — never from client-controlled data.**
+  `requireAdmin` middleware in `index.ts` is a one-line check,
+  `req.role !== "admin" → 403 {error: "forbidden"}`, sitting directly in
+  front of each `/api/admin/*` route; `req.role` was already set once per
+  request inside the shared `/api` middleware from a fresh DB lookup, so
+  there's no second, separate trust decision for admin routes to get wrong.
+  Every admin `SELECT` lists safe columns explicitly (`getAllAccounts()`
+  etc.) — never `SELECT *` — so `password_hash`/`password_salt` can never
+  leak into an admin response by accident, even as the schema grows later.
+- **Admin accounts are provisioned by boot-time env vars, idempotently, and
+  never clobber an operator's changed password.** `bootstrapAdminAccount()`
+  is a no-op if `ADMIN_USERNAME`/`ADMIN_PASSWORD` are unset; if the named
+  account doesn't exist it's created as `role: "admin"`; if it exists but
+  isn't admin, it's promoted; if it's already an admin, its password is left
+  alone on every subsequent boot/redeploy. Dev values live in
+  `mise.local.toml` (gitignored) — never commit real admin credentials or
+  echo them in logs.
+- **`/admin` is a separate standalone page, not a view inside the game
+  SPA.** `public/admin.html` + `src/client/admin.ts` are a second esbuild
+  entry point with their own bootstrap: it calls `GET /api/admin/stats`
+  first, and a `403` renders "Not authorized" and stops — no private data is
+  ever embedded in the page's own markup or bundle for a non-admin to read
+  out of devtools. `GET /admin` itself serves the HTML unconditionally (the
+  real gate is every subsequent `/api/admin/*` call); the in-game "Admin"
+  link is shown only when `identity.role === "admin"`, client-side
+  convenience only, never the actual authorization boundary.
+- **Admin "Reset World" is a capability that ships untriggered — it was
+  never invoked against any real database during this stage's
+  implementation, and it must only ever be triggered later, manually, by a
+  human operator through the live admin UI.** The route requires body
+  confirmation of the exact literal `"RESET WORLD"` (deliberately distinct
+  from player Reset Progress's `"RESET"`, so the two can never be confused
+  by a copy-paste) and calls the existing `resetProductionWorld()`
+  in-process — the same function `scripts/reset-world.ts` already used
+  safely for the one Stage 6b production reset — rather than shelling out to
+  that script, avoiding a new child-process failure surface for something
+  already safe and synchronous. Immediately after it commits, the handler
+  force-closes every open `wss.clients` socket (`index.ts`, right after
+  `resetProductionWorld()` and the `admin_reset_world` log line) — this is
+  the one case in the whole app where the server proactively closes
+  connections rather than waiting for the next tick's re-resolution, because
+  a world reset can invalidate *every* open tab's identity simultaneously,
+  not just the acting admin's own. **This stage's own test suite
+  (`spec/admin-reset-world.test.ts`) enforces its own isolation discipline:
+  it spawns a genuinely separate child server process against its own
+  throwaway DB file and its own admin credentials, on a different port —
+  the real dev and production databases are never touched by any test, and
+  Reset World was not run against either during this stage's development.**
+- **Client-driven reconnect, not server-forced closure, is the mechanism for
+  every *other* auth transition.** Register/login/logout/Reset Progress all
+  only affect the acting browser's own identity, so after each one succeeds
+  the client itself closes its socket, clears ephemeral UI state (selection,
+  overlays), and re-runs the same bootstrap (`GET /api/session` → entry gate
+  or `enterGame()`) a fresh page load would run — there is no server-side
+  force-close for these. `main.ts`'s `ws.on("close", ...)` handler
+  distinguishes an intentional close (tracked via an
+  `intentionallyClosedSockets` WeakSet, or a socket already superseded by a
+  newer one) from an unexpected one — only the latter triggers the
+  reconnect-via-bootstrap path, which is also exactly what makes Reset
+  World's server-forced closures self-heal on every affected tab with no
+  special-case client code: they arrive at the same handler as any other
+  unexpected close.
+- **Existing mutating routes needed zero changes for ownership to keep
+  working post-accounts.** `/api/state`, `/api/reproduce`, `/api/abandon`,
+  `/api/start-new-colony`, `/api/evolve`, `/api/command/*` all still read
+  only `req.colonyId`, populated by the same session middleware as always —
+  the account layer is invisible to them by construction, the same way
+  Crit 10's authorization model was already invisible to `actions.ts`/
+  `simulation.ts` internals.
+- **No new runtime dependencies.** No bcrypt/argon2, no express-session, no
+  cookie-parser, no passport — `node:crypto` and the existing hand-rolled
+  cookie/session code (`sessions.ts`) cover everything this stage needed.
+- **Explicitly out of scope, same as the brief:** no email, no password
+  reset flow, no OAuth/SSO, no multi-admin roles beyond the single `admin`
+  role, no account deletion, no guest-to-account auto-merge on login, no
+  rate limiting on auth routes, no CAPTCHA.
+

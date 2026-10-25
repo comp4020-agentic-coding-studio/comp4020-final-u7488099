@@ -52,6 +52,32 @@ function mintColony(): number {
   return colonyId;
 }
 
+// Stage 11: factored out of claimColonyForSession() so the account-based
+// Reset Progress path (auth.ts) can claim/mint a colony and re-top-up the
+// spare invariant exactly like a guest session does, without duplicating
+// this logic or going through saveSession() (which would write the wrong
+// table for an authenticated session — see setAccountColony() in db.ts).
+// Callers are responsible for recording the claimed colonyId against
+// whichever identity owns it (a session row or an account row).
+//
+// Always keeps one spare, unclaimed colony ready in the world. Without
+// this, a session's own `colonies` roster (state.ts) could never include
+// the colony the *next* claimant is about to claim — that colony simply
+// wouldn't exist yet at the moment this request's response is serialized.
+// Pre-minting it here means it's already a visible part of the shared world
+// the instant this request returns, exactly like any other colony. See
+// spec/multiplayer.test.ts's "shows both sessions the same shared world..."
+// test and CLAUDE.md's Crit 10 section.
+export function claimFreshColony(): { colonyId: number; claimedExisting: boolean } {
+  let colonyId = getUnclaimedColonyId();
+  const claimedExisting = colonyId !== undefined;
+  if (colonyId === undefined) colonyId = mintColony();
+
+  if (getUnclaimedColonyId() === undefined) mintColony();
+
+  return { colonyId, claimedExisting };
+}
+
 // Shared by both resolveOrCreateColony (a session with no row yet) and
 // startNewColony (Stage 8: a defeated session restarting) — claims whatever
 // colony is currently sitting unclaimed, or mints a fresh one, saves the
@@ -59,17 +85,20 @@ function mintColony(): number {
 // invariant. Never mints two spares: the "ensure a spare exists" check runs
 // once, after this session's own claim is already persisted.
 //
-// saveSession must happen *before* the spare check, not after it, in this
-// same function — not left to the caller. getUnclaimedColonyId() has no way
-// to tell "claimed in memory a moment ago" from "still genuinely unclaimed"
-// except by querying the `sessions` table itself; if this session's own
-// claim isn't saved yet when that query runs, it sees its own
-// about-to-be-claimed colony as the available spare and skips minting a
-// real one — leaving the shared world with zero unclaimed colonies until
-// the *next* session lazily mints its own, which is too late for *this*
-// session's already-serialized response to ever have listed it. (A real
-// regression caught by spec/multiplayer.test.ts's "shows both sessions the
-// same shared world..." and otherWorkers-visibility tests.)
+// Deliberately NOT built on top of claimFreshColony() above: saveSession
+// must happen *between* the claim and the spare top-up check, not before or
+// after both — getUnclaimedColonyId() has no way to tell "claimed in memory
+// a moment ago" from "still genuinely unclaimed" except by querying the
+// `sessions` table itself; if this session's own claim isn't saved yet when
+// that query runs, it sees its own about-to-be-claimed colony as the
+// available spare and skips minting a real one — leaving the shared world
+// with zero unclaimed colonies until the *next* session lazily mints its
+// own, which is too late for *this* session's already-serialized response
+// to ever have listed it. (A real regression caught by
+// spec/multiplayer.test.ts's "shows both sessions the same shared world..."
+// and otherWorkers-visibility tests.) The account-based Reset Progress path
+// (auth.ts) has the exact same shape but writes accounts.active_colony_id
+// via setAccountColony() instead of saveSession() — see claimFreshColony().
 function claimColonyForSession(sessionId: string): { colonyId: number; claimedExisting: boolean } {
   let colonyId = getUnclaimedColonyId();
   const claimedExisting = colonyId !== undefined;
@@ -77,14 +106,6 @@ function claimColonyForSession(sessionId: string): { colonyId: number; claimedEx
 
   saveSession(sessionId, colonyId);
 
-  // Always keep one spare, unclaimed colony ready in the world. Without
-  // this, a session's own `colonies` roster (state.ts) could never include
-  // the colony the *next* session is about to claim — that colony simply
-  // wouldn't exist yet at the moment this session's response is serialized.
-  // Pre-minting it here means it's already a visible part of the shared
-  // world the instant this request returns, exactly like any other colony.
-  // See spec/multiplayer.test.ts's "shows both sessions the same shared
-  // world..." test and CLAUDE.md's Crit 10 section.
   if (getUnclaimedColonyId() === undefined) mintColony();
 
   return { colonyId, claimedExisting };

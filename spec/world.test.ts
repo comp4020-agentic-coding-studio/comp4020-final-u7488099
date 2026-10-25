@@ -234,9 +234,18 @@ describe("resetProductionWorld (Section 16E: reset mechanism)", () => {
     expect(getUnclaimedColonyId()).toBe(freshColony.id); // no dangling session -> colony reference survives
   });
 
-  it("src/server/index.ts never imports or calls resetProductionWorld — it is reachable only via the deliberate CLI script", () => {
+  it("Stage 11: src/server/index.ts calls resetProductionWorld only from inside the requireAdmin-gated /api/admin/reset-world route, never from an unauthenticated or automatic code path", () => {
     const serverSource = readFileSync("src/server/index.ts", "utf8");
-    expect(serverSource).not.toContain("resetProductionWorld");
+    // Exactly one actual *call* (as opposed to a mention in an import or a
+    // comment) is allowed anywhere in the file — a second call (e.g. at
+    // module load, or from some other route) would mean a hidden,
+    // unauthenticated reset path snuck in.
+    const callSites = serverSource.match(/=\s*resetProductionWorld\(\)/g) ?? [];
+    expect(callSites.length).toBe(1);
+    // And that one call site must live inside the requireAdmin-gated
+    // /api/admin/reset-world route, not anywhere else in the file.
+    const adminRoute = serverSource.match(/app\.post\("\/api\/admin\/reset-world",\s*requireAdmin,[\s\S]*?resetProductionWorld\(\)/);
+    expect(adminRoute).not.toBeNull();
   });
 
   it("the CLI script (scripts/reset-world.ts) refuses to touch the world without --yes, and only resets when explicitly told to", () => {
@@ -490,5 +499,78 @@ describe("in-game help (Section 16H)", () => {
     const js = await res.text();
     expect(js).toContain("help-button");
     expect(js).toContain("help-overlay");
+  });
+});
+
+// --- Stage 11: entry gate markup, checked the same jsdom way as the Help
+// overlay above — the required guest-data-loss disclaimer must actually be
+// present in the served markup, not just asserted to exist in a design doc.
+
+describe("entry gate and account controls (Stage 11)", () => {
+  const baseUrl = inject("baseUrl");
+
+  it("serves a forced, no-dismiss entry overlay with guest/register/login actions and a data-loss disclaimer", async () => {
+    const res = await fetch(new URL("/", baseUrl));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const dom = new JSDOM(html);
+    const doc = dom.window.document;
+
+    const overlay = doc.querySelector("#entry-overlay");
+    expect(overlay, "no #entry-overlay in the served page").not.toBeNull();
+    expect(overlay!.hasAttribute("hidden"), "entry overlay should start hidden until bootstrap decides to show it").toBe(
+      true,
+    );
+    // Forced/no-dismiss, same as #defeat-overlay: no close/cancel control anywhere in it.
+    expect(overlay!.querySelector("[id*='close' i], [id*='cancel' i]")).toBeNull();
+
+    expect(doc.querySelector("#entry-guest-button"), "no Continue as Guest button").not.toBeNull();
+    expect(doc.querySelector("#entry-register-form"), "no register form in the entry overlay").not.toBeNull();
+    expect(doc.querySelector("#entry-login-form"), "no login form in the entry overlay").not.toBeNull();
+
+    const overlayText = overlay!.textContent ?? "";
+    expect(overlayText).toMatch(/guest/i);
+    // The required guest-data-loss disclaimer: losing a browser/device loses guest progress.
+    expect(overlayText).toMatch(/guest progress.{0,80}(only|lost|lose)/i);
+    expect(overlayText).toMatch(/clearing cookies|switching devices/i);
+  });
+
+  it("serves in-game account controls: identity indicator, save-progress, logout, and account overlay with typed-RESET confirmation", async () => {
+    const res = await fetch(new URL("/", baseUrl));
+    const html = await res.text();
+    const dom = new JSDOM(html);
+    const doc = dom.window.document;
+
+    expect(doc.querySelector("#identity-indicator")).not.toBeNull();
+    expect(doc.querySelector("#save-progress-button")).not.toBeNull();
+    expect(doc.querySelector("#logout-button")).not.toBeNull();
+    expect(doc.querySelector("#admin-link")).not.toBeNull();
+
+    const accountOverlay = doc.querySelector("#account-overlay");
+    expect(accountOverlay, "no #account-overlay in the served page").not.toBeNull();
+    expect(accountOverlay!.hasAttribute("hidden")).toBe(true);
+
+    const confirmInput = doc.querySelector("#reset-progress-confirm");
+    expect(confirmInput, "no typed-confirmation input for Reset Progress").not.toBeNull();
+    const resetButton = doc.querySelector("#reset-progress-button");
+    expect(resetButton, "no Reset Progress button").not.toBeNull();
+    expect(resetButton!.hasAttribute("disabled"), "Reset Progress should start disabled until RESET is typed").toBe(
+      true,
+    );
+    expect(accountOverlay!.textContent ?? "").toMatch(/RESET/);
+  });
+
+  it("the client bundle wires up the entry gate and account controls", async () => {
+    const res = await fetch(new URL("/app.js", baseUrl));
+    expect(res.status).toBe(200);
+    const js = await res.text();
+    expect(js).toContain("entry-overlay");
+    expect(js).toContain("entry-guest-button");
+    expect(js).toContain("api/auth/guest");
+    expect(js).toContain("api/auth/register");
+    expect(js).toContain("api/auth/login");
+    expect(js).toContain("api/auth/logout");
+    expect(js).toContain("api/account/reset-progress");
+    expect(js).toContain("api/session");
   });
 });

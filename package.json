@@ -5,7 +5,7 @@
   "scripts": {
     "prepare": "git rev-parse --git-dir >/dev/null 2>&1 && git config core.hooksPath .githooks || true",
     "typecheck": "tsc --noEmit",
-    "build:client": "esbuild src/client/main.ts --bundle --outfile=dist/client/app.js --format=esm",
+    "build:client": "esbuild src/client/main.ts --bundle --outfile=dist/client/app.js --format=esm && esbuild src/client/admin.ts --bundle --outfile=dist/client/admin.js --format=esm",
     "dev": "node --watch src/server/index.ts",
     "start": "node src/server/index.ts",
     "check": "pnpm typecheck && pnpm test",
