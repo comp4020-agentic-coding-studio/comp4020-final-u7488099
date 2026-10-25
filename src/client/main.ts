@@ -151,6 +151,7 @@ const recallAllButton = document.querySelector<HTMLButtonElement>("#recall-all-b
 
 const identityIndicatorEl = document.querySelector<HTMLElement>("#identity-indicator")!;
 const saveProgressButton = document.querySelector<HTMLButtonElement>("#save-progress-button")!;
+const loginButton = document.querySelector<HTMLButtonElement>("#login-button")!;
 const accountButton = document.querySelector<HTMLButtonElement>("#account-button")!;
 const logoutButton = document.querySelector<HTMLButtonElement>("#logout-button")!;
 const adminLink = document.querySelector<HTMLAnchorElement>("#admin-link")!;
@@ -171,6 +172,13 @@ const registerForm = document.querySelector<HTMLFormElement>("#register-form")!;
 const registerUsername = document.querySelector<HTMLInputElement>("#register-username")!;
 const registerPassword = document.querySelector<HTMLInputElement>("#register-password")!;
 const registerCancel = document.querySelector<HTMLButtonElement>("#register-cancel")!;
+
+const loginOverlay = document.querySelector<HTMLElement>("#login-overlay")!;
+const loginStatusEl = document.querySelector<HTMLElement>("#login-status")!;
+const loginForm = document.querySelector<HTMLFormElement>("#login-form")!;
+const loginUsername = document.querySelector<HTMLInputElement>("#login-username")!;
+const loginPassword = document.querySelector<HTMLInputElement>("#login-password")!;
+const loginCancel = document.querySelector<HTMLButtonElement>("#login-cancel")!;
 
 const accountOverlay = document.querySelector<HTMLElement>("#account-overlay")!;
 const accountStatusEl = document.querySelector<HTMLElement>("#account-status")!;
@@ -748,11 +756,13 @@ function renderIdentity(): void {
   if (identity.status === "account") {
     identityIndicatorEl.textContent = `Signed in as ${identity.username}`;
     saveProgressButton.hidden = true;
+    loginButton.hidden = true;
     accountButton.hidden = false;
     logoutButton.hidden = false;
   } else {
     identityIndicatorEl.textContent = "Playing as guest";
     saveProgressButton.hidden = false;
+    loginButton.hidden = false;
     accountButton.hidden = true;
     logoutButton.hidden = true;
   }
@@ -1238,6 +1248,34 @@ registerForm.addEventListener("submit", async (e) => {
   }
   registerOverlay.hidden = true;
   statusEl.textContent = `Account created. Signed in as ${body.username}.`;
+  await enterGame();
+});
+
+loginButton.addEventListener("click", () => {
+  loginStatusEl.textContent = "";
+  loginForm.reset();
+  loginOverlay.hidden = false;
+});
+
+loginCancel.addEventListener("click", () => {
+  loginOverlay.hidden = true;
+});
+
+loginForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  loginStatusEl.textContent = "";
+  const res = await fetch("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: loginUsername.value, password: loginPassword.value }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    loginStatusEl.textContent = body.error ?? "Login failed.";
+    return;
+  }
+  loginOverlay.hidden = true;
+  statusEl.textContent = `Signed in as ${body.username}.`;
   await enterGame();
 });
 

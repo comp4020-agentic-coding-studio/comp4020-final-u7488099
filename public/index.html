@@ -352,6 +352,18 @@
       #account-button:hover {
         background: #1b5e20;
       }
+      #login-button {
+        font-weight: 600;
+        background: #1565c0;
+        color: white;
+        border: none;
+        border-radius: 999px;
+        padding: 0.4rem 1rem;
+        cursor: pointer;
+      }
+      #login-button:hover {
+        background: #0d47a1;
+      }
       #logout-button {
         font-weight: 600;
         background: #455a64;
@@ -370,6 +382,7 @@
       }
       #entry-overlay,
       #register-overlay,
+      #login-overlay,
       #account-overlay {
         position: fixed;
         inset: 0;
@@ -381,16 +394,19 @@
         z-index: 30;
       }
       #register-overlay,
+      #login-overlay,
       #account-overlay {
         z-index: 10;
       }
       #entry-overlay[hidden],
       #register-overlay[hidden],
+      #login-overlay[hidden],
       #account-overlay[hidden] {
         display: none;
       }
       #entry-panel,
       #register-panel,
+      #login-panel,
       #account-panel {
         background: white;
         color: #1a1a1a;
@@ -496,6 +512,9 @@
         <span id="identity-indicator"></span>
         <button id="save-progress-button" type="button" aria-haspopup="dialog" aria-controls="register-overlay" hidden>
           Save Progress / Create Account
+        </button>
+        <button id="login-button" type="button" aria-haspopup="dialog" aria-controls="login-overlay" hidden>
+          Log In
         </button>
         <button id="account-button" type="button" aria-haspopup="dialog" aria-controls="account-overlay" hidden>
           Account
@@ -864,6 +883,28 @@
           <div class="modal-actions">
             <button id="register-cancel" type="button">CANCEL</button>
             <button type="submit">Create Account</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div id="login-overlay" role="dialog" aria-modal="true" aria-labelledby="login-title" hidden>
+      <div id="login-panel">
+        <h2 id="login-title">Log In</h2>
+        <p>
+          Logging into an existing account does not merge your current guest colony into it.
+          <strong>Your current guest colony will be left behind as-is, not deleted</strong> — you can only return to
+          it by logging out again, and it won't be joined with the account you're logging into.
+        </p>
+        <p id="login-status" class="auth-status"></p>
+        <form id="login-form" class="auth-form">
+          <label for="login-username">Username</label>
+          <input id="login-username" type="text" autocomplete="username" required />
+          <label for="login-password">Password</label>
+          <input id="login-password" type="password" autocomplete="current-password" required />
+          <div class="modal-actions">
+            <button id="login-cancel" type="button">CANCEL</button>
+            <button type="submit">Log In</button>
           </div>
         </form>
       </div>

@@ -543,6 +543,7 @@ describe("entry gate and account controls (Stage 11)", () => {
 
     expect(doc.querySelector("#identity-indicator")).not.toBeNull();
     expect(doc.querySelector("#save-progress-button")).not.toBeNull();
+    expect(doc.querySelector("#login-button"), "no in-game Log In button for a guest to reach an existing account").not.toBeNull();
     expect(doc.querySelector("#logout-button")).not.toBeNull();
     expect(doc.querySelector("#admin-link")).not.toBeNull();
 
