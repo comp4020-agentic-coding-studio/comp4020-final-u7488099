@@ -91,8 +91,8 @@ interface ColonyState {
     x: number;
     y: number;
     resourceType: string;
-    amount: number | null;
-    maxAmount: number | null;
+    amount: number;
+    maxAmount: number;
     kind: "source" | "item";
   }[];
   creatures: { id: number; species: string; x: number; y: number; health: number; maxHealth: number }[];

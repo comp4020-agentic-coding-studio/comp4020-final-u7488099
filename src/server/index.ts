@@ -3,8 +3,9 @@ import { readFileSync } from "node:fs";
 import { WebSocket, WebSocketServer } from "ws";
 import { abandon, reproduce, selectEvolution } from "./actions.ts";
 import { login, logout, peekIdentity, register, resetProgress, resolveIdentity } from "./auth.ts";
-import { SIMULATION } from "./balance.ts";
+import { ECOLOGY_EVAL_INTERVAL_MS, SIMULATION } from "./balance.ts";
 import { getAllAccounts, getColonyForSession, resetProductionWorld } from "./db.ts";
+import { advanceEcology, getEcologySnapshot } from "./ecology.ts";
 import { getLog, logAction } from "./log.ts";
 import { resolveOrCreateColony, SESSION_COOKIE, startNewColony } from "./sessions.ts";
 import {
@@ -251,6 +252,13 @@ app.get("/api/admin/colonies", requireAdmin, (_req, res) => {
 // table shouldn't have to render every row ever written as action_log grows.
 app.get("/api/admin/log", requireAdmin, (_req, res) => {
   res.json(getLog().slice(-200).reverse());
+});
+
+// Stage 12: read-only ecology diagnostic — computed on demand from the same
+// read path advanceEcology itself uses, never stored. No controls here, just
+// visibility into per-zone density/target/pending-regen state.
+app.get("/api/admin/ecology", requireAdmin, (_req, res) => {
+  res.json(getEcologySnapshot());
 });
 
 // Reuses the exact same idempotent defeatColony() pipeline every other
@@ -550,6 +558,12 @@ setInterval(() => {
 // load. SIGTERM/SIGINT also checkpoint so a graceful restart never loses
 // more than one interval's worth of movement.
 setInterval(() => checkpointSimulation(), SIMULATION.checkpointIntervalMs);
+
+// Stage 12: ecology evaluation is deliberately its own, much slower interval
+// (~5s), decoupled from the 10Hz hot loop above — a global pass over every
+// resource node/creature belongs nowhere near tickHz. See ecology.ts /
+// CLAUDE.md's Stage 12 section for why this can't just ride advanceSimulation.
+setInterval(() => advanceEcology(Date.now()), ECOLOGY_EVAL_INTERVAL_MS);
 
 function shutdown(): void {
   checkpointSimulation();

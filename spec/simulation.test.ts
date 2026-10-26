@@ -149,7 +149,7 @@ function queenPosition(): { x: number; y: number } {
   };
 }
 
-function insertNode(x: number, y: number, resourceType: string, amount: number | null): number {
+function insertNode(x: number, y: number, resourceType: string, amount: number): number {
   const worldRow = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number };
   const { lastInsertRowid } = db
     .prepare("INSERT INTO resource_nodes (world_id, x, y, resource_type, amount, max_amount) VALUES (?, ?, ?, ?, ?, ?)")
@@ -705,7 +705,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
 
   it("a claim within deposit range of the queen still takes a second tick to deposit", () => {
     const queen = queenPosition();
-    const nodeId = insertNode(queen.x + 20, queen.y, "sugar", null);
+    const nodeId = insertNode(queen.x + 20, queen.y, "sugar", SUGAR_NODE_MAX_AMOUNT);
     const worker = registerTestWorker(9105, queen.x + 20, queen.y);
     const beforeColony = resourceAmount("sugar");
 
@@ -751,7 +751,7 @@ describe("Stage 4: carry, return, deposit economy", () => {
   it("a completed deposit stays complete across a reload — no double-credit", () => {
     const [worker] = sim.getWorkersForColony(colony.id);
     const queen = queenPosition();
-    const nodeId = insertNode(queen.x + 20, queen.y, "sugar", null);
+    const nodeId = insertNode(queen.x + 20, queen.y, "sugar", SUGAR_NODE_MAX_AMOUNT);
     sim.registerWorker({
       id: worker.id,
       colonyId: colony.id,

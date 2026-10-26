@@ -40,6 +40,19 @@ interface AdminStats {
   actionLogRows: number;
 }
 
+interface AdminEcologyAnchor {
+  key: string;
+  tier: "anchor" | "background";
+  density: number;
+  target: number;
+  pendingMsRemaining: number | null;
+}
+
+interface AdminEcologySnapshot {
+  anchors: AdminEcologyAnchor[];
+  background: { zoneCount: number; averageDensity: number; pendingCount: number };
+}
+
 const unauthorizedEl = document.getElementById("unauthorized") as HTMLDivElement;
 const rootEl = document.getElementById("admin-root") as HTMLDivElement;
 const whoamiEl = document.getElementById("whoami") as HTMLParagraphElement;
@@ -47,6 +60,8 @@ const statsGridEl = document.getElementById("stats-grid") as HTMLDivElement;
 const accountsBodyEl = document.getElementById("accounts-body") as HTMLTableSectionElement;
 const coloniesBodyEl = document.getElementById("colonies-body") as HTMLTableSectionElement;
 const logListEl = document.getElementById("log-list") as HTMLDivElement;
+const ecologyAnchorsBodyEl = document.getElementById("ecology-anchors-body") as HTMLTableSectionElement;
+const ecologyBackgroundSummaryEl = document.getElementById("ecology-background-summary") as HTMLParagraphElement;
 const statusEl = document.getElementById("status") as HTMLParagraphElement;
 const resetWorldConfirmEl = document.getElementById("reset-world-confirm") as HTMLInputElement;
 const resetWorldButtonEl = document.getElementById("reset-world-button") as HTMLButtonElement;
@@ -107,19 +122,40 @@ function renderLog(entries: AdminLogEntry[]): void {
     .join("");
 }
 
+function renderEcology(snapshot: AdminEcologySnapshot): void {
+  ecologyAnchorsBodyEl.innerHTML = snapshot.anchors
+    .map((a) => {
+      const pending = a.pendingMsRemaining === null ? "—" : `${Math.ceil(a.pendingMsRemaining / 1000)}s`;
+      return `<tr>
+        <td>${escapeHtml(a.key)}</td>
+        <td>${a.density.toFixed(1)}</td>
+        <td>${a.target.toFixed(1)}</td>
+        <td>${pending}</td>
+      </tr>`;
+    })
+    .join("");
+
+  const bg = snapshot.background;
+  ecologyBackgroundSummaryEl.textContent =
+    `Background: ${bg.zoneCount} zones measured, average density ${bg.averageDensity.toFixed(2)}, ` +
+    `${bg.pendingCount} pending regen.`;
+}
+
 function escapeHtml(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 async function loadAll(): Promise<void> {
-  const [accounts, colonies, log] = await Promise.all([
+  const [accounts, colonies, log, ecology] = await Promise.all([
     fetch("/api/admin/accounts").then((r) => r.json()),
     fetch("/api/admin/colonies").then((r) => r.json()),
     fetch("/api/admin/log").then((r) => r.json()),
+    fetch("/api/admin/ecology").then((r) => r.json()),
   ]);
   renderAccounts(accounts);
   renderColonies(colonies);
   renderLog(log);
+  renderEcology(ecology);
 }
 
 async function defeatColony(colonyId: number): Promise<void> {

@@ -1,5 +1,207 @@
 # Process overview
 
+## Stage 12: persistent world ecology, regeneration & finite resources
+
+Every stage through 11 left the world's resources/creatures as a one-time
+seed that only ever depleted — nothing ever replaced a gathered-out node or
+a hunted-out aphid/spider population, and a defeated colony's ruin blocked
+its ground forever. The brief asked for a lightweight ecology layer that
+keeps a long-lived shared world alive without turning into a new gameplay
+system. A plan was written and locked in before any code — zone shape,
+density targets, regen gating, scarcity weighting, the global entity cap,
+queen/ruin exclusion, and the admin visibility endpoint were all decided up
+front, then implemented against that plan rather than discovered along the
+way.
+
+**Deciding the zone shape was the first real design question, and the
+answer came from refusing to invent a second layout for the same world.**
+A uniform grid was the obvious starting point, but Stage 6b's anchor
+clusters don't align to any grid — a 300-unit cell can split one anchor's
+cluster across a boundary, breaking the "one cell ≈ one anchor" assumption
+a uniform grid needs. The fix was to stop treating zones as a new concept
+and instead reuse Stage 6b's own shape directly: 10 anchor-centered circles
+at the exact same `colonySpiralPosition(i)` coordinates `createColony()`
+and world generation already use, plus a background grid for everywhere
+else. This meant zero new coordinates to invent or store — calling the same
+pure function from any process at any time reproduces the same 10 centers
+forever.
+
+**Two revisions were made mid-design, both from the same instinct: don't
+let an ecology-scoped fix leave a contradiction sitting next to it.** The
+first draft scoped "finite resources" to only ecology-spawned entities,
+leaving the pre-existing `amount: null` infinite-resource path untouched
+everywhere else in the game. Investigation found that path was already
+almost entirely vestigial in production — every seeded constant was already
+finite, and the only code that could ever create a null-amount node was two
+test fixtures that didn't even assert infinite-ness. That made the
+reversal cheap: the plan was rewritten to make "no gatherable resource may
+be infinitely gatherable" a global invariant, not an ecology-scoped one,
+and the one line that actually implemented infinite gathering at runtime
+was deleted outright. The second revision reversed the first draft's
+"ruins get no ecological protection" position — a visible ruin is still
+occupying its ground for exactly as long as it's drawn on screen, so a
+resource node spawning directly on top of a still-visible ruin would read
+as broken, not as a feature. Both revisions were made by re-deriving the
+actual requirement rather than patching around the first draft's gap.
+
+**`MAX_ECOLOGY_ENTITIES` needed its own unit conversion before it meant
+anything.** The density-target math throughout the plan is a *weighted*
+sum (sugar×1, biomass×1.5, protein×2, aphid×2, spider×5) — useful for
+deciding what each zone should regenerate toward, but the wrong unit for a
+population safety cap, which has to count raw rows regardless of type.
+Converting the same per-tier mix back to raw counts gave a 160-195 raw
+entity "normal" range, and `300` was chosen as roughly 1.5-1.9x that range
+— comfortably above ordinary variance (several zones catching up at once
+after a busy session) without being so high it stops meaning anything as a
+backstop.
+
+**Performance was measured against both a normal and a stress population,
+not assumed safe by extension from Stage 7/9's precedent.** A throwaway
+script (not committed, following the exact pattern of Stage 9's own
+throwaway benchmark) used `spec/ecology.test.ts`'s direct-import,
+isolated-`DB_PATH` harness to seed ~180 raw entities (the plan's normal
+steady-state range) and separately 300 (the hard cap), forced every zone
+past its regen deadline every tick so the measurement exercises real
+scarcity-weighted selection and placement-retry work rather than a cheap
+"still waiting" early-out, and timed `advanceEcology()` over 500 ticks in
+each scenario: **~0.153ms/tick average at the normal population (~32,765x
+headroom) and ~0.178ms/tick average at the stress population (~28,070x
+headroom)** under the 5-second evaluation interval. Both numbers land in
+the same trivial-at-this-scale territory Stage 7/9 already established for
+`advanceSimulation()`, confirming the single-global-pass design (explicitly
+modeled on Stage 10's postmortem of the *reverted* server-side fog system,
+which had no spatial index and no measured budget) stayed cheap in
+practice, not just in theory.
+
+**The admin ecology endpoint followed the existing admin-page pattern
+exactly, with no new idiom introduced.** `GET /api/admin/ecology` behind
+the same `requireAdmin` middleware every other admin route already uses;
+`public/admin.html`/`src/client/admin.ts` gained one more plain `<table>`
+section following Stage 11's established per-section shape (typed
+interface matching the server JSON, `escapeHtml()`, fetched in the same
+`Promise.all` as every other section) — deliberately no charts or new
+visual language for a page that's otherwise entirely tables.
+
+**Verification ran targeted tests before the full suite, matching the
+plan's own order.** `spec/ecology.test.ts` (new, originally 17 tests
+covering zone membership, density measurement, regen gating, scarcity
+weighting, the global cap, queen/ruin exclusion and its proportional
+target reduction, ruin-lifetime filtering, restart safety, and the
+finite-resource invariant) was run in isolation first, then the full
+`pnpm check` suite. Full-suite runs surfaced failures in three black-box
+spec files — `spec/colony.test.ts`, `spec/multiplayer.test.ts`, and
+`spec/realtime.test.ts` — and an earlier report of this stage's results
+undercounted and mis-categorized them ("4 spider-related + 2
+movement-related"). Re-checked carefully: the correct breakdown across two
+consecutive full-suite runs was **3 spider-related + 2 movement-related**
+on the first run, and 3 spider-related + 3 movement-related on an
+immediately following second run with no code changes in between — the
+movement-related count itself varies run to run, consistent with the
+wall-clock distance-tolerance flakiness `vitest.config.ts`'s own header
+comment already documents. The spider-related failures, by contrast, were
+identical across both runs and traced to a real cause, not flakiness:
+these three spec files have no isolated `DB_PATH` override and instead run
+as black-box HTTP tests against the live, shared dev database through a
+running server — so an assertion like "seed should always include at
+least one spider" fails whenever the live world's spider population has
+actually hit zero. That is precisely the extinction problem the addendum
+below fixes at the code level; the live dev server was not yet confirmed
+to be running the fix at the time these failures were observed, so they
+remain open until it's restarted and re-verified — see that section.
+All of this was confirmed by reading the actual failing code
+paths, not patched around — per the standing instruction for this stage,
+the dev world was not reset to chase these failures down.
+
+**A real extinction in the shared dev world exposed a gap the original
+plan hadn't considered: WHEN to regenerate and WHAT to regenerate were
+answering two different questions, and only one of them accounted for a
+species going globally extinct.** The original scarcity weighting inside
+`pickSpawnType` only ever compared a zone's current count of a type
+against that zone's own local expectation — and spiders were never part
+of any zone's local baseline to begin with (`ANCHOR_BASE_SHARE.spider` and
+`BACKGROUND_BASE_SHARE.spider` are both 0, since spiders are seeded
+scattered, never anchor-clustered). That meant `pickSpawnType` excluded
+spiders from ecology-driven selection unconditionally — once the seeded
+population was hunted to zero, nothing in the system could ever bring one
+back, regardless of how depleted the species was globally. Local density
+alone can't see a global extinction; it was never designed to.
+
+The fix adds a second, independent multiplier to WHAT gets selected —
+rarity x local scarcity x global scarcity — while leaving WHEN
+regeneration happens (the continuous-depletion-deadline gate) completely
+untouched, exactly as asked. Resolving that design meant deciding what a
+type with no local baseline at all should do in the local-scarcity term:
+excluding it (the old behavior) was the bug, and inventing an artificial
+nonzero local baseline for spiders would have meant fabricating a cluster
+affinity they were never designed to have. The chosen resolution was a
+neutral local multiplier of 1 whenever a zone/tier has no local
+expectation for a type — local scarcity still fully governs every type
+that does have one, and the new global term is what now gives
+zone-invisible species like spiders a path back from zero. Four explicit
+rarity ranks (Common/Uncommon/Rare/Extremely Rare, with sugar/biomass+
+aphid/protein/spider assigned in that order) and a bounded exponential
+global-scarcity curve (`exp(K * deficiency^2)` capped at 50x, K=4) turn
+"how far below its desired population is this species, globally" into a
+weight — tuned so mild depletion barely moves the needle (~1.28x at 75% of
+target) while a fully extinct species' weight can be large enough to
+outweigh an abundant common type's, without ever hard-capping or deleting
+an oversupplied type (the desired populations are ecological targets, not
+caps — only `MAX_ECOLOGY_ENTITIES=300` remains a hard technical ceiling,
+unchanged and untouched by this addendum). Desired populations scale with
+world area rather than being hardcoded absolutes, reusing Stage 6b's own
+original seeded totals as the reference values at today's 3000x3000
+world — so the same formula keeps meaning the same thing if the world
+ever grows. An apex-predator concept was discussed as a natural next step
+once a species can go locally extinct and recover, but was deliberately
+left as a documented future non-goal rather than implemented here, since
+it's a different kind of system (trophic interaction, not population
+scarcity) and out of scope for this addendum.
+
+Twelve new deterministic tests were added to `spec/ecology.test.ts`
+(29 total, up from 17 — all 17 original tests pass unchanged), covering
+the multiplier at and above target, mild vs. severe depletion, the
+extinction cap, world-size-proportional scaling, an extinct rare type
+outweighing a healthy common one, a recovered type falling back to
+neutral, local scarcity still biasing selection between equally-rare
+types, the global entity cap still holding under maximal extinction
+pressure, and deterministic RNG-driven selection. Rather than reset the
+live dev world's genuine zero-spider state to make a test pass, the
+instruction was the opposite: leave it alone and watch. A read-only
+inspection of the shared dev database shortly afterward showed the spider
+count at exactly 10 and was initially reported as organic ecology-driven
+recovery — **that report was wrong, and was corrected before being handed
+back.** Every one of the 10 rows shares one identical `created_at` and
+matches `SPIDER_SEED_POSITIONS` position-for-position — the signature of
+`db.ts`'s pre-existing, Stage-7-era `seedSpidersIfMissing()` boot
+migration bulk-firing (triggered by a separate, stale `node --watch`
+process restarting on the source edits and briefly re-importing `db.ts`
+against the live DB), not of this addendum's scarcity-weighted spawning.
+The dev server actually serving the shared world on port 8080 was started
+hours before this addendum's code was written and was not running under
+`--watch`, so it has almost certainly not even loaded the new global-
+scarcity code yet. No genuine live-world observation of ecology-driven
+spider recovery was made this round — unit tests are the only verification
+this addendum currently has.
+
+**Follow-up fix, same round:** the false-positive investigation above
+pointed at a real bug in `seedSpidersIfMissing()` itself, not just an
+accident of a stale `--watch` process. Its gate was a live species count
+(`COUNT(*) FROM creatures WHERE species='spider' == 0`), which can't tell
+"never had spiders" apart from "legitimately hunted to extinction" — so
+*any* restart landing while a world's spider count was at zero, intended
+or not, would have silently re-seeded it. This directly conflicts with
+Stage 12's whole premise (ecology, not boot migration, owns population
+recovery), so it was fixed before moving on: `worlds` gained a durable
+`creatures_seeded` marker column, consumed exactly once by a merged
+`seedCreaturesIfEmpty()` (which now folds in what `seedSpidersIfMissing()`
+used to do) and never consulted again. `resetForTests()`/
+`resetProductionWorld()` needed no change — a fresh world row always
+starts unmarked. Three new regression tests (32 total) prove a world's
+extinction — spider-only or total — survives any number of simulated
+restarts, and that a genuinely new world is still seeded exactly once. See
+`CLAUDE.md`'s "Stage 12 fix: the legacy spider seeder could undo a real
+in-game extinction" section for the full design and the fix's limits.
+
 ## Stage 11: accounts, entry flow, guest persistence, reset & admin
 
 Every stage through Crit 10/Stage 10 had exactly one identity concept: a

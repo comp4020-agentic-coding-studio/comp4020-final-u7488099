@@ -3,8 +3,10 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
   APHID_SEED_POSITIONS,
+  BIOMASS_NODE_MAX_AMOUNT,
   type Caste,
   colonySpiralPosition,
+  PROTEIN_NODE_AMOUNT,
   QUEEN_MAX_HEALTH,
   RESOURCE_NODES,
   RESOURCE_TYPES,
@@ -20,12 +22,14 @@ import { DEFAULT_SCRYPT_PARAMS, hashPassword, type PasswordHash } from "./passwo
 
 // Stage 7: seedCreaturesIfEmpty() loops over every species' seed-position
 // list instead of hardcoding 'aphid', so a brand-new world seeds spiders
-// alongside aphids in the same empty-table pass. seedSpidersIfMissing() below
-// is the separate, independently-gated pass that adds spiders to an
-// already-populated (pre-Stage-7) world without touching this gate. Declared
-// here (not next to seedCreaturesIfEmpty further down) because the module-
-// level seedCreaturesIfEmpty() call below runs before a `const` declared
-// later in the file would be initialized.
+// alongside aphids in the same empty-table pass. The same function also
+// folds in the legacy pre-Stage-7 top-up (a world that already has aphids
+// but was never seeded with spiders at all) — see seedCreaturesIfEmpty()'s
+// own comment for why this is gated on a one-time marker column, not a live
+// species count (Stage 12 fix). Declared here (not next to
+// seedCreaturesIfEmpty further down) because the module-level
+// seedCreaturesIfEmpty() call below runs before a `const` declared later in
+// the file would be initialized.
 const SPECIES_SEED_POSITIONS: Record<string, { x: number; y: number }[]> = {
   aphid: APHID_SEED_POSITIONS,
   spider: SPIDER_SEED_POSITIONS,
@@ -41,7 +45,7 @@ db.pragma("journal_mode = WAL");
 
 dropLegacySchema();
 migrateWorkersCarrying();
-migrateSugarNodesFinite();
+migrateResourceNodesFinite();
 migrateResourceNodeKind();
 migrateCreatureHealth();
 migrateWorkerHealth();
@@ -50,12 +54,20 @@ migrateColonyEvolution();
 migrateWorkerCaste();
 migrateSessionsAccountId();
 migrateActionLogAccountId();
+migrateWorldsCreaturesSeeded();
 
 db.exec(`
+  -- Stage 12: creatures_seeded is a durable, one-time "initial population
+  -- already established" marker — see migrateWorldsCreaturesSeeded() and
+  -- seedCreaturesIfEmpty() below for why this exists (replaces a bug where
+  -- a live species count was used as the gate, letting a routine restart
+  -- undo a legitimate in-game extinction). Defaults to 0 so a brand-new
+  -- world (via seedIfEmpty() or a full reset) is always still seeded once.
   CREATE TABLE IF NOT EXISTS worlds (
     id INTEGER PRIMARY KEY,
     width REAL NOT NULL,
     height REAL NOT NULL,
+    creatures_seeded INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -212,8 +224,8 @@ db.exec(`
 `);
 
 seedIfEmpty();
+backfillWorldsCreaturesSeeded();
 seedCreaturesIfEmpty();
-seedSpidersIfMissing();
 backfillCreatureHealth();
 backfillWorkerHealth();
 backfillColonyLifecycle();
@@ -254,15 +266,31 @@ function migrateWorkersCarrying(): void {
   `);
 }
 
-// Stage 5: sugar nodes change from infinite (amount: null) to finite +
-// renewable. Idempotent — after the first run no sugar row has amount IS
-// NULL left to match, so this is a no-op on every later boot.
-function migrateSugarNodesFinite(): void {
+// Stage 5 introduced this for sugar only (amount: null -> finite +
+// renewable); Stage 12 makes finite resources a global invariant, so this
+// now backfills every resource_type via its own finite default, not just
+// sugar. Idempotent — after the first run no row has amount IS NULL left to
+// match, so this is a no-op on every later boot. Schema itself stays
+// nullable (SQLite can't retroactively add NOT NULL) — the invariant is
+// enforced by this migration plus the application code, same pattern as
+// every other backfill migration in this file.
+function migrateResourceNodesFinite(): void {
   const columns = db.prepare("PRAGMA table_info(resource_nodes)").all() as { name: string }[];
   if (columns.length === 0) return; // table doesn't exist yet; CREATE TABLE + seedIfEmpty seed it finite directly
-  db.prepare(
-    "UPDATE resource_nodes SET amount = ?, max_amount = ? WHERE resource_type = 'sugar' AND amount IS NULL",
-  ).run(SUGAR_NODE_MAX_AMOUNT, SUGAR_NODE_MAX_AMOUNT);
+  // Declared locally, not at module scope: this function runs at module-load
+  // time (see the top-of-file migration call sequence), before a module-level
+  // const initializer here would have run — a TDZ ReferenceError.
+  const FINITE_DEFAULT_AMOUNT: Record<string, number> = {
+    sugar: SUGAR_NODE_MAX_AMOUNT,
+    biomass: BIOMASS_NODE_MAX_AMOUNT,
+    protein: PROTEIN_NODE_AMOUNT,
+  };
+  const stmt = db.prepare(
+    "UPDATE resource_nodes SET amount = ?, max_amount = ? WHERE resource_type = ? AND (amount IS NULL OR max_amount IS NULL)",
+  );
+  for (const [resourceType, defaultAmount] of Object.entries(FINITE_DEFAULT_AMOUNT)) {
+    stmt.run(defaultAmount, defaultAmount, resourceType);
+  }
 }
 
 // Stage 6: distinguishes a renewable "source" from a finite dropped "item"
@@ -431,6 +459,42 @@ function migrateActionLogAccountId(): void {
   db.exec("ALTER TABLE action_log ADD COLUMN account_id INTEGER");
 }
 
+// Stage 12: worlds gain a durable one-time "initial creature population
+// already established" marker, replacing the live species-count gate that
+// seedSpidersIfMissing() used to use (COUNT(*) FROM creatures WHERE
+// species='spider' == 0) — that gate couldn't distinguish "this world
+// predates spiders/aphids entirely" from "this world legitimately had them
+// hunted to extinction by players/ecology," so any restart after a real
+// extinction silently undid it. ALTER adds the column NOT NULL DEFAULT 0 so
+// every pre-existing row starts unseeded; backfillWorldsCreaturesSeeded()
+// immediately marks any world that already has at least one creature as
+// seeded, so an existing world with living creatures is never re-seeded on
+// the very next boot after this migration ships. A world with zero
+// creatures at the moment this migration runs is deliberately left
+// unmarked — ambiguous between "never had any" and "already extinct before
+// this fix shipped," and seedCreaturesIfEmpty() resolves that ambiguity the
+// same way a fresh world always has: by seeding it once, exactly here, one
+// time only. Mirrors migrateWorkerCaste()'s ALTER ... DEFAULT pattern.
+function migrateWorldsCreaturesSeeded(): void {
+  const columns = db.prepare("PRAGMA table_info(worlds)").all() as { name: string }[];
+  if (columns.length === 0) return; // table doesn't exist yet; CREATE TABLE below defines it with the column
+  if (columns.some((c) => c.name === "creatures_seeded")) return;
+  db.exec("ALTER TABLE worlds ADD COLUMN creatures_seeded INTEGER NOT NULL DEFAULT 0");
+}
+
+// Idempotent: only marks a world that isn't already marked AND already has
+// at least one creature — a world with zero creatures right now is left
+// unmarked so seedCreaturesIfEmpty() below still seeds it exactly once (see
+// migrateWorldsCreaturesSeeded()'s comment for the full reasoning). Runs
+// every boot; a no-op once every existing world has been classified.
+function backfillWorldsCreaturesSeeded(): void {
+  db.exec(`
+    UPDATE worlds SET creatures_seeded = 1
+    WHERE creatures_seeded = 0
+      AND EXISTS (SELECT 1 FROM creatures WHERE creatures.world_id = worlds.id)
+  `);
+}
+
 // Stage 11: idempotent create-or-promote admin bootstrap, run on every boot.
 // ADMIN_USERNAME/ADMIN_PASSWORD are set via `flyctl secrets set` in
 // production and a gitignored mise.local.toml in dev — never committed to
@@ -570,51 +634,58 @@ export function getUnclaimedColonyId(): number | undefined {
 }
 
 // Independent of seedIfEmpty()'s colonies-count gate: an already-deployed
-// world has colonies > 0 (seedIfEmpty no-ops) but creatures = 0 (this still
-// fires), so Stage 5 backfills aphids into existing worlds too. Called after
-// seedIfEmpty() so a brand-new world's row already exists either way.
+// world has colonies > 0 (seedIfEmpty no-ops) but may still need its initial
+// creature population. Called after seedIfEmpty() (and
+// backfillWorldsCreaturesSeeded()) so a brand-new world's row already exists
+// either way.
 //
+// Stage 12 fix: gated on the world's own durable `creatures_seeded` column,
+// not a live species/table count. The original Stage 5/7 design used
+// `COUNT(*) FROM creatures == 0` (then, for spiders specifically, a second
+// independently-gated seedSpidersIfMissing() using
+// `COUNT(*) FROM creatures WHERE species='spider' == 0`) — a live count that
+// looks identical whether a world never had that species or legitimately
+// hunted it to extinction, so a routine restart after a real in-game
+// extinction would silently undo it by re-inserting the full original seed
+// list. A one-time marker column fixes this: a world is seeded for its
+// initial population at most once, ever, regardless of how its creature
+// count fluctuates afterward. Once Stage 12's ecology takes over (see
+// ecology.ts's advanceEcology()), it — not this boot-time function — is
+// solely responsible for repopulating any species that later drops to zero.
+// This also folds in what used to be the separate seedSpidersIfMissing()
+// pass: every species in SPECIES_SEED_POSITIONS is seeded together, in one
+// gated pass, exactly once per world.
 function seedCreaturesIfEmpty(): void {
-  const row = db.prepare("SELECT COUNT(*) AS n FROM creatures").get() as { n: number };
-  if (row.n > 0) return;
-  const world = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number } | undefined;
-  if (!world) return;
+  const worlds = db.prepare("SELECT id FROM worlds WHERE creatures_seeded = 0").all() as { id: number }[];
+  if (worlds.length === 0) return;
   const insertCreature = db.prepare(
     "INSERT INTO creatures (world_id, species, x, y, health, max_health) VALUES (?, ?, ?, ?, ?, ?)",
   );
-  for (const [species, positions] of Object.entries(SPECIES_SEED_POSITIONS)) {
-    const maxHealth = SPECIES_MAX_HEALTH[species];
-    for (const pos of positions) {
-      insertCreature.run(world.id, species, pos.x, pos.y, maxHealth, maxHealth);
+  const markSeeded = db.prepare("UPDATE worlds SET creatures_seeded = 1 WHERE id = ?");
+  for (const world of worlds) {
+    for (const [species, positions] of Object.entries(SPECIES_SEED_POSITIONS)) {
+      const maxHealth = SPECIES_MAX_HEALTH[species];
+      for (const pos of positions) {
+        insertCreature.run(world.id, species, pos.x, pos.y, maxHealth, maxHealth);
+      }
     }
+    markSeeded.run(world.id);
   }
 }
 
-// Stage 7 production-safe migration: seedCreaturesIfEmpty() above only fires
-// against a genuinely empty creatures table, so an already-deployed world
-// (which already has aphids from before Stage 7 shipped) never reaches it
-// anymore. This is the independently-gated pass that adds spiders to that
-// kind of world instead — counts spiders specifically, inserts
-// SPIDER_SEED_POSITIONS only if there are none yet, else no-ops. Run
-// unconditionally at every boot, right after seedCreaturesIfEmpty(): on a
-// fresh DB this sees the spiders that pass just inserted and no-ops; on an
-// existing production DB it fires exactly once, on the first boot after
-// this code ships, and never again. Safe without a transaction or lock
-// because this app runs as a single shared-cpu-1x machine with --ha=false
-// (see fly.toml) — there is never a second process racing this same count-
-// then-insert sequence. See CLAUDE.md.
-function seedSpidersIfMissing(): void {
-  const row = db.prepare("SELECT COUNT(*) AS n FROM creatures WHERE species = 'spider'").get() as { n: number };
-  if (row.n > 0) return;
-  const world = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number } | undefined;
-  if (!world) return;
-  const insertSpider = db.prepare(
-    "INSERT INTO creatures (world_id, species, x, y, health, max_health) VALUES (?, 'spider', ?, ?, ?, ?)",
-  );
-  const maxHealth = SPECIES_MAX_HEALTH.spider;
-  for (const pos of SPIDER_SEED_POSITIONS) {
-    insertSpider.run(world.id, pos.x, pos.y, maxHealth, maxHealth);
-  }
+// Test-only seam (Stage 12): re-runs exactly the boot-time seed/migration
+// calls a real process restart would run (see the module-level call
+// sequence near the top of this file), against whatever state the DB is
+// already in — no table wipe, unlike resetForTests() below. This is what
+// lets a test simulate "the server restarts while an existing, already-
+// initialized world happens to have zero spiders right now" without faking
+// a fresh module import (ESM caches the module, so re-importing the same
+// path doesn't re-run its top-level code — calling this instead reproduces
+// the same idempotent effect a real restart has).
+export function runBootSeedSequenceForTests(): void {
+  seedIfEmpty();
+  backfillWorldsCreaturesSeeded();
+  seedCreaturesIfEmpty();
 }
 
 // Test-only isolation seam (Stage 4): wipes every table, then reseeds via

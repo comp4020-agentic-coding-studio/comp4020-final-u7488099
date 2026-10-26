@@ -10,6 +10,7 @@ import {
   type Carrying,
 } from "./simulation.ts";
 import { getWorldEvents } from "./log.ts";
+import { isRuinExpired } from "./ecology.ts";
 
 const ALL_CASTES: Caste[] = ["worker", "soldier", "scout"];
 
@@ -60,8 +61,8 @@ export interface ColonyState {
     x: number;
     y: number;
     resourceType: string;
-    amount: number | null;
-    maxAmount: number | null;
+    amount: number;
+    maxAmount: number;
     kind: "source" | "item";
   }[];
   creatures: { id: number; species: string; x: number; y: number; health: number; maxHealth: number }[];
@@ -136,19 +137,28 @@ export function getState(colonyId: number): ColonyState {
 
   const creatures = getCreaturesForWorld(world.id);
 
-  // defeat_cause is a durable SQLite column, never part of the in-memory sim
-  // cache (it never changes after defeat) — fetched once here rather than
-  // threading it through getAllColonies()'s per-tick-safe shape.
-  const defeatCauses = new Map(
-    (db.prepare("SELECT id, defeat_cause AS defeatCause FROM colonies").all() as { id: number; defeatCause: string | null }[]).map(
-      (row) => [row.id, row.defeatCause],
-    ),
+  // defeat_cause/defeated_at are durable SQLite columns, never part of the
+  // in-memory sim cache (they never change after defeat) — fetched once
+  // here rather than threading them through getAllColonies()'s
+  // per-tick-safe shape.
+  const defeatInfo = new Map(
+    (
+      db.prepare("SELECT id, defeat_cause AS defeatCause, defeated_at AS defeatedAt FROM colonies").all() as {
+        id: number;
+        defeatCause: string | null;
+        defeatedAt: string | null;
+      }[]
+    ).map((row) => [row.id, row]),
   );
 
   // Stage 10 (revised): every colony in the world is always included — fog
   // only governs client-side rendering, not what the server reports.
-  const colonies: ColonyState["colonies"] = getAllColonies().map(
-    ({ id, x, y, health, maxHealth, status, population, peakPopulation, evolution }) => ({
+  // Stage 12: an expired ruin disappears from the live game view entirely —
+  // same isRuinExpired gate ecology.ts uses for spawn exclusion, so a ruin's
+  // visibility and its exclusion radius can never disagree.
+  const colonies: ColonyState["colonies"] = getAllColonies()
+    .filter((c) => c.status === "active" || !isRuinExpired(defeatInfo.get(c.id)?.defeatedAt ?? null))
+    .map(({ id, x, y, health, maxHealth, status, population, peakPopulation, evolution }) => ({
       id,
       queenX: x,
       queenY: y,
@@ -160,9 +170,8 @@ export function getState(colonyId: number): ColonyState {
       evolutionTier1: evolution.tier1,
       evolutionTier2: evolution.tier2,
       evolutionTier3: evolution.tier3,
-      defeatCause: defeatCauses.get(id) ?? null,
-    }),
-  );
+      defeatCause: defeatInfo.get(id)?.defeatCause ?? null,
+    }));
 
   const worldEvents = getWorldEvents();
 

@@ -1794,3 +1794,369 @@ guarantee, only extending it.
   role, no account deletion, no guest-to-account auto-merge on login, no
   rate limiting on auth routes, no CAPTCHA.
 
+## Stage 12: persistent world ecology, regeneration & finite resources
+
+Every stage through 11 left the world's resources/creatures as a one-time
+seed (Stage 6b) that only ever depletes — nothing replaces a fully-gathered
+node or a hunted-out aphid/spider population, and a defeated colony's ruin
+blocks its ground forever. Stage 12 adds a lightweight ecology layer that
+keeps the world alive over a long-lived shared session, and closes a
+pre-existing economy gap (truly infinite resources) along the way. This is
+explicitly economy-pressure/world-liveliness work, not a new gameplay
+system: no queen movement, no buildings, no hatching, no PvP, no breeding/
+genetics, no new species or resource types, no seasons/weather/territory
+simulation.
+
+- **Ecology state is pure in-memory/derived — no new DB table, and zone
+  membership is computed, not stored.** `src/server/ecology.ts` recomputes
+  every zone's density from scratch each evaluation tick, reading the same
+  authoritative sources `getState()` already reads (resource nodes,
+  `creatures` Map). Per-zone depletion-deadline state lives in a plain
+  in-memory `Map`, lost on restart — accepted the same way as Stage 5's "no
+  catch-up regen on boot": this is timing noise, not economic state.
+- **Zones reuse Stage 6b's own shape instead of a uniform grid, because a
+  uniform grid would split an anchor cluster across a cell boundary.** 10
+  anchor zones (`ECOLOGY_ANCHOR_ZONE_RADIUS = 300`) are centered at
+  `colonySpiralPosition(i)` for `i = 0..SPAWN_ANCHOR_COUNT-1` — the exact
+  same deterministic function Stage 6b's generation and `createColony()`'s
+  spawn placement already use, so there's nothing new to store. Everywhere
+  else falls into a `300x300` background grid (`ECOLOGY_BACKGROUND_CELL_SIZE`),
+  with a cell only counting as its own zone if its *center* lies outside
+  every anchor's radius — giving every point in the world exactly one zone
+  membership via the pure function `zoneForPosition(x, y)`, with no
+  double-counting and no boundary ambiguity.
+- **Density is a weighted sum of exactly 5 ecology-eligible types; player-
+  owned entities (workers, queens) contribute zero.**
+  `ECOLOGY_DENSITY_WEIGHTS = {sugar:1, biomass:1.5, protein:2, aphid:2,
+  spider:5}` (`balance.ts`). Anchor zones target `ECOLOGY_ANCHOR_TARGET_DENSITY
+  = 15` (matching what one Stage-6b anchor originally held) and background
+  cells target `ECOLOGY_BACKGROUND_TARGET_DENSITY = 1` (matching the
+  original scatter density) — two tiers, not bespoke per-zone numbers, by
+  design. This keeps the world's steady-state population the same order of
+  magnitude as Stage 6b's original seed, not several times denser.
+- **Regeneration requires continuous depletion past a randomized deadline,
+  not a one-time dip — this is what prevents flicker right at the
+  threshold.** A zone that drops below target starts a pending deadline
+  (`random(ECOLOGY_REGEN_DEADLINE_MIN_MS=15_000, ECOLOGY_REGEN_DEADLINE_MAX_MS=60_000)`
+  out); recovering above target before the deadline clears it with no
+  spawn. A deadline that elapses while still below target spawns exactly
+  one entity and immediately gets a fresh randomized deadline, so a
+  persistently-depleted zone keeps trying every 15-60s rather than firing
+  once. All of this is driven by one shared `ECOLOGY_EVAL_INTERVAL_MS =
+  5000` `setInterval` in `index.ts` — deliberately its own timer, decoupled
+  from `SIMULATION.tickHz`/`broadcastHz`, a single `O(resourceNodes +
+  creatures)` pass every 5s rather than a per-tick scan (Stage 10's
+  documented anti-pattern for exactly this shape of cost).
+- **Which of the 5 types spawns is scarcity-weighted, with a strong enough
+  boost to matter next to abundance.** `weight = baseShare × (1 +
+  SCARCITY_BOOST_FACTOR × max(0, 1 − currentCount/expectedCount))`, with
+  `SCARCITY_BOOST_FACTOR = 8` — modeling during design showed a lower
+  factor (3) was too weak to make a zone with zero protein meaningfully
+  more likely to spawn protein next to abundant sugar. A type at or above
+  its expected share still keeps a nonzero floor weight (`baseShare`), so
+  nothing is ever fully excluded from a weighted draw.
+- **`MAX_ECOLOGY_ENTITIES = 300` is a raw-entity count, not a weighted
+  density sum — a global emergency backstop, not a target ecology is meant
+  to brush up against.** Derived from the per-tier raw mix (≈95 anchor +
+  ≈90 background + ≈10 spider ≈ 195 raw entities at full provisioning,
+  ~160 as the conservative typical figure), `300` sits at roughly 1.5-1.9x
+  that range. Checked once per evaluation tick via a plain live count
+  (sugar+biomass+protein nodes with `kind='source'`, plus aphid/spider
+  creatures) before any spawn is attempted; at or over the cap, no spawns
+  happen that tick regardless of per-zone eligibility.
+- **Active queens and non-expired ruins both exert spatial exclusion on
+  ecology placement, via the same `isRuinExpired` gate that controls ruin
+  visibility — a visible ruin is still occupying that ground exactly as
+  long as it's drawn on screen.** `ECOLOGY_QUEEN_EXCLUSION_RADIUS = 250`
+  from every colony that is either `status === 'active'` or
+  `status === 'defeated' && !isRuinExpired(defeatedAt)`. This deliberately
+  does **not** reuse `isClearOfNests`'s "active only" precedent — that
+  precedent answers "can a spider aggro here," where an inert ruin poses no
+  threat; ecology exclusion answers "is this ground currently disturbed,"
+  where a spawning resource node directly on top of a still-visible ruin
+  would read as broken. The instant `isRuinExpired()` flips true, the ruin
+  loses both live-game visibility and ecology exclusion in the same tick —
+  there is no window where one lags the other, because both read the same
+  `defeated_at` column through the same function.
+- **A zone partly covered by an exclusion circle has its effective target
+  reduced proportionally, not an all-or-nothing block.** `effectiveTarget =
+  target × (1 − overlapAreaFraction)`, via standard circle-circle
+  intersection area between the zone's own circle (or an equal-area circle
+  approximation for a background cell) and the exclusion circle. This stops
+  a zone mostly inside a thriving colony's exclusion ring from endlessly
+  reporting "eligible to spawn" while every placement attempt fails — it
+  simply expects less of itself.
+- **The infinite-resource path (`amount: null`) is gone — this is now a
+  global invariant, not scoped to ecology-spawned entities.** Investigation
+  found the path was already almost entirely vestigial in production
+  (every seeded constant was already finite; the only code that ever
+  created a null-amount node was two `spec/simulation.test.ts` fixtures,
+  neither of which actually asserted infinite-ness). `findResourceNode()`'s
+  return type narrowed to `amount: number`; the one line that actually
+  implemented "infinite" at runtime —
+  `claimedAmount = node.amount === null ? carryYield : Math.min(carryYield, node.amount)`
+  — is now unconditionally `Math.min(carryYield, node.amount)`, so no claim
+  can ever exceed what's actually left on a node, regardless of whether
+  that node came from Stage 6b's seed or ecology regen. A generalized,
+  idempotent boot-time migration (extending `migrateSugarNodesFinite()`'s
+  existing pattern to every `resource_type`) backfills any legacy
+  null-amount row in a deployed DB to that type's finite default. The
+  schema column itself stays nullable (SQLite can't retroactively add
+  `NOT NULL`) — the invariant is enforced by the migration plus application
+  code, the same established pattern as every other backfill in this
+  codebase.
+- **Queen ruin lifetime (`RUIN_LIFETIME_MS = 600_000`, 10 minutes) closed a
+  real pre-existing gap: `getState()` and `buildSpawnAvoidance()` had no
+  access to `defeated_at` at all.** Both now select `defeated_at` and
+  filter out any colony where `status === 'defeated' &&
+  isRuinExpired(defeatedAt)` before returning — an expired ruin disappears
+  from the live game view and stops blocking a new colony's spawn.
+  `isRuinExpired(defeatedAtIso, nowMs = Date.now())` takes an optional,
+  injectable `nowMs` so tests can assert the exact expiry transition
+  without manipulating the wall clock; every production call site omits it
+  and gets the real clock. `getAllColonies()` (admin) stays completely
+  unfiltered, by design — only a ruin's *visibility in the live game world
+  and its spawn/ecology-blocking effect* expire, never the record itself
+  (same "ruins retain history forever" rule Stage 9 already established for
+  evolution).
+- **Admin ecology visibility is read-only and computed on demand, never
+  stored.** `GET /api/admin/ecology` (behind the existing `requireAdmin`
+  middleware) returns one row per anchor zone (density, target, pending-
+  regen countdown) plus one aggregate row for the background grid (zone
+  count, average density, pending count). `public/admin.html` /
+  `src/client/admin.ts` render it as one more plain `<table>` section,
+  following the page's existing per-section pattern (typed interface,
+  `escapeHtml()`, fetched alongside the other sections in `loadAll()`'s
+  `Promise.all`) — no charts, no new visual idiom.
+- **Performance was measured, not assumed, at both a normal and a stress
+  population.** A throwaway script (not committed) seeded an isolated test
+  DB with ~180 raw entities (within the plan's derived 160-195 normal
+  steady-state range) and separately with 300 (at `MAX_ECOLOGY_ENTITIES`),
+  kept every zone perpetually past its regen deadline so every tick does
+  real scarcity-weighted selection and placement-retry work, and measured
+  `advanceEcology()` over 500 ticks: **~0.153ms/tick average at the normal
+  population (~32,765x headroom)** and **~0.178ms/tick average at the
+  stress population (~28,070x headroom)** under the 5000ms
+  `ECOLOGY_EVAL_INTERVAL_MS` budget. Confirms this is trivial at this
+  game's scale, consistent with Stage 7/9's own sub-millisecond
+  `advanceSimulation()` precedent — revisit only if either population grows
+  by orders of magnitude.
+- **`spec/ecology.test.ts` follows the direct-module-import pattern Stage
+  1b/4 established**, with its own throwaway `DB_PATH` override
+  (`./.data/colony.ecology-test.db`), a seeded `mulberry32` PRNG for the
+  scarcity-weighting statistical test, and `setEcologyRng`/
+  `resetEcologyState` test-only hooks mirroring `resetForTests()`'s
+  convention elsewhere.
+- **Explicitly out of scope, same as the brief:** no queen movement, no
+  buildings, no hatching, no PvP, no breeding/genetics, no new species or
+  resource types, no seasons/weather/territory simulation. The one
+  deliberate reversal from the original non-goals list: the global
+  infinite-node removal above was added mid-design after review found the
+  original ecology-scoped version left a contradiction in place.
+
+### Stage 12 addendum: global population scarcity (rarity x local x global)
+
+Added after the first Stage 12 implementation shipped and a real spider
+extinction was observed in the live shared dev world: `ANCHOR_BASE_SHARE.spider`
+and `BACKGROUND_BASE_SHARE.spider` were both `0` (spiders are seeded
+independently of the anchor/scatter mix — see `buildWorldPopulation()`), and
+`pickSpawnType()`'s old `if (share <= 0) continue` guard meant spiders could
+**never** be selected by ecology regeneration, regardless of how depleted the
+world was. A globally rare species could be hunted to extinction with no path
+back. This addendum fixes that by adding a second, independent factor to
+**WHAT** gets selected — it does not change, duplicate, or add a second
+trigger for **WHEN** regeneration happens, which remains entirely the
+existing per-zone continuous-depletion-plus-randomized-deadline logic in
+`advanceEcology()`.
+
+- **New selection model**: for each of the 5 ecology types,
+  `score_i = rarity_i x localScarcity_i x globalScarcity_i`, normalized into
+  a probability distribution and drawn from with the same seeded
+  `pendingRng()` hook as before. `localScarcity_i` is exactly the old
+  per-zone-tier scarcity multiplier (`1 + SCARCITY_BOOST_FACTOR x
+  max(0, 1 - count/expected)`), computed from `ANCHOR_BASE_SHARE`/
+  `BACKGROUND_BASE_SHARE` exactly as before — those two maps no longer
+  double as a candidate-inclusion gate, only as the local-scarcity baseline.
+  For a (type, tier) pair with no local expectation at all (`share <= 0` —
+  spiders are deliberately never anchor-clustered), `localScarcity` is
+  neutral (`1x`): there's no local baseline for that type to be "scarce"
+  against, so rarity and global scarcity alone decide its odds there. Every
+  type is now always a selection candidate.
+- **Rarity ranks** (`balance.ts`'s `RARITY_BASE_WEIGHT`/`ECOLOGY_TYPE_RARITY`)
+  generalize the existing base-weight idea into one shared, zone-tier-
+  independent global weight per type: Common=1.00 (sugar), Uncommon=0.55
+  (biomass, aphid), Rare=0.25 (protein), Extremely Rare=0.08 (spider).
+- **Global scarcity** (`balance.ts`'s `REFERENCE_WORLD_AREA`,
+  `REFERENCE_DESIRED_POPULATION`, `GLOBAL_SCARCITY_K=4`,
+  `GLOBAL_SCARCITY_MAX_MULTIPLIER=50`; `ecology.ts`'s
+  `computeWorldScale()`/`desiredPopulationFor()`/`globalScarcityMultiplier()`/
+  `computeGlobalPopulation()`) scales desired population by world size so no
+  absolute population target is ever hardcoded:
+  `worldScale = worldArea / REFERENCE_WORLD_AREA`,
+  `desiredPopulation_i = referenceDesiredPopulation_i x worldScale`. The
+  current 3000x3000 `WORLD` is also the reference world for now
+  (`worldScale = 1` today), but the two constants are independent so a
+  future larger world scales proportionally without code changes.
+  `populationRatio_i = currentGlobalPopulation_i / desiredPopulation_i`,
+  `deficiency_i = max(0, 1 - populationRatio_i)`,
+  `globalScarcity_i = min(G_MAX, exp(K x deficiency_i^2))`. At or above the
+  desired population the multiplier is exactly 1 (no bonus for abundance,
+  no penalty either). Verified curve: ratio 1 -> 1x, 0.75 -> ~1.28x,
+  0.5 -> ~2.72x, 0.25 -> ~9.49x, 0.1 -> ~25.5x, extinct (0) -> capped at
+  exactly 50 (uncapped would be e^4 ~= 54.6) — mild underpopulation barely
+  moves spawn odds, severe depletion increasingly overrides normal rarity,
+  and a fully extinct type gets strong, bounded recovery pressure.
+- **Reference desired populations** (`REFERENCE_DESIRED_POPULATION`) are
+  Stage 6b's own original seeded totals, not invented numbers: sugar=36
+  (`SUGAR_PER_ANCHOR x SPAWN_ANCHOR_COUNT + SCATTER_SUGAR_COUNT`), biomass=28,
+  protein=8, aphid=52, spider=10 (`SPIDER_COUNT`) — matching the Stage 12
+  plan's own "~36 sugar + 28 biomass + 8 protein + 52 aphid + 10 spider"
+  figure. This is balancing configuration, not an architectural constant
+  scattered through the code — one record in `balance.ts`.
+- **Desired populations are ecological targets/densities, never hard caps.**
+  A type above its desired population is never deleted or suppressed beyond
+  its multiplier returning to the neutral `1x` floor — overpopulation is
+  never penalized. `MAX_ECOLOGY_ENTITIES = 300` remains the only hard,
+  *technical* safety cap (raw entity count, checked once per tick before any
+  spawn), completely independent of and unaffected by global scarcity: the
+  cap still suppresses every spawn once reached, even for a fully extinct
+  Extremely Rare type under maximum (50x) global pressure. As the world or
+  its capacity grows, `MAX_ECOLOGY_ENTITIES` will need to scale too (likely
+  alongside `REFERENCE_WORLD_AREA`'s `worldScale`), but that is future work —
+  it stays a fixed `300` for this stage.
+- **Apex predator is explicitly future design only — not implemented in
+  Stage 12.** A possible future concept (one persistent living instance per
+  apex species, a fixed lair, alive -> killed -> finite carcass -> expiry ->
+  cooldown -> respawn at its lair; a future, larger world might support
+  multiple apex species) is recorded here purely as a non-goal for this
+  stage, not as a spec to build against.
+- **Live dev-world observation attempted, but the apparent recovery turned
+  out to be a false positive — correcting an earlier, wrong finding.**
+  Before this addendum, the shared dev world (`./.data/colony.db`) held
+  exactly 0 live spiders. After the code changes, read-only inspection
+  showed the spider count at exactly 10. That was initially (and
+  incorrectly) reported as organic, ecology-driven recovery. Closer
+  inspection before finalizing this report disproved it: all 10 rows share
+  one identical `created_at` timestamp, and their `(x, y)` positions are an
+  exact, order-for-order match for `SPIDER_SEED_POSITIONS` — the original
+  Stage 6b/7 scatter seed, not a scarcity-weighted ecology spawn (which
+  would stagger timestamps one zone at a time, 15-60s apart, at essentially
+  arbitrary positions). The real explanation: `src/server/db.ts` has a
+  pre-existing, unconditional, module-level `seedSpidersIfMissing()`
+  migration (line ~218, dating to Stage 7, independent of this addendum)
+  that bulk-inserts the entire original seed list the moment any process
+  imports `db.ts` against a DB with zero spiders. A separate, stale
+  `node --watch` dev process (not the one actually serving port 8080) was
+  still running from an earlier session pointed at the same live DB path;
+  editing `balance.ts`/`ecology.ts` during this work triggered its
+  auto-restart, which re-ran `db.ts`'s module-level seed migration and
+  produced the bulk insert — then that process failed to bind to the
+  already-occupied port and sat idle. This has nothing to do with the new
+  global-scarcity code. Worse, the dev server actually serving port 8080
+  (confirmed via `lsof`) was started hours **before** this addendum's code
+  edits and was not using `--watch`, so it is almost certainly still
+  running the pre-addendum ecology code — meaning the new model has not
+  yet been exercised against the live dev world at all. **No genuine
+  observation of ecology-driven spider recovery has been made.** This
+  needs a deliberate server restart (not performed here, since restarting
+  the process that's actively serving the shared dev world wasn't itself
+  part of the original ask) before that observation can be attempted for
+  real.
+- **12 new deterministic tests added to `spec/ecology.test.ts`** (29 total,
+  up from 17), covering: multiplier=1 at/above desired population; modest
+  increase under mild depletion; much larger increase under severe
+  depletion; capped maximum pressure at zero population; proportional
+  desired-population scaling with world area; an extinct Extremely Rare
+  type's score outweighing a healthy Common type's; a recovered rare type's
+  multiplier falling back to the 1x baseline; `computeGlobalPopulation`'s
+  raw world-wide counts; an oversupplied type never being deleted; the
+  global entity cap still suppressing spawns under maximum scarcity
+  pressure; local scarcity still biasing selection between two equally-rare
+  types; and a fixed RNG override producing fully deterministic, non-flaky
+  selection. All 17 pre-existing Stage 12 tests continue to pass unchanged.
+
+### Stage 12 fix: the legacy spider seeder could undo a real in-game extinction
+
+The false-positive "organic recovery" investigation above surfaced a real
+architectural bug, independent of the new global-scarcity code: `db.ts`'s
+Stage-7-era `seedSpidersIfMissing()` gated itself on a **live** count
+(`SELECT COUNT(*) FROM creatures WHERE species = 'spider'`), re-run
+unconditionally on every process boot. That count can't distinguish "this
+world predates spiders entirely" from "this world's spiders were
+legitimately hunted to extinction by players or Stage 12 ecology" — both
+look identical (zero). So any ordinary server restart that happened to land
+while a world's spider population was at zero would silently bulk-insert
+the entire original `SPIDER_SEED_POSITIONS` list again, undoing real
+gameplay/ecology state. This is exactly the mechanism that produced the
+false "recovery" signal above, just triggered early (by a stale `--watch`
+process) rather than by an intended restart.
+
+**The fix:** replace the live-count gate with a durable, one-time marker.
+`worlds` gained a `creatures_seeded INTEGER NOT NULL DEFAULT 0` column
+(schema default for fresh DBs; `migrateWorldsCreaturesSeeded()` ALTERs it
+onto an existing DB, mirroring `migrateWorkerCaste()`'s guarded-ALTER
+pattern elsewhere in this file). `seedCreaturesIfEmpty()` now does
+everything both old functions did, in one pass, gated on
+`WHERE creatures_seeded = 0`: for each not-yet-seeded world, insert every
+species in `SPECIES_SEED_POSITIONS` (aphid and spider together, exactly as
+before), then mark that world `creatures_seeded = 1` — permanently. Once a
+world is marked, no later boot ever seeds it again, no matter how its
+creature counts fluctuate. `seedSpidersIfMissing()` is deleted entirely;
+its old job (topping up a pre-Stage-7 world that has aphids but no
+spiders) is now just the normal case of a not-yet-seeded world getting
+every species at once.
+
+The one subtlety is classifying **already-existing** worlds the first time
+this migration runs: a world with living creatures right now is obviously
+already seeded (`backfillWorldsCreaturesSeeded()` marks it immediately,
+via `EXISTS (SELECT 1 FROM creatures WHERE world_id = ...)`), but a world
+that happens to have **zero** creatures at that exact moment is genuinely
+ambiguous — it could be a legacy pre-seed world, or a world that was
+already extinct before this fix shipped. Both are left unmarked and get
+one honest pass through `seedCreaturesIfEmpty()`, same as a brand-new
+world — this is the one case where the fix can't distinguish "never
+seeded" from "already extinct" either, but it only ever applies once, at
+the moment this migration first runs on a given DB file, never again on
+any later restart. Every world is unambiguous from that point forward.
+
+This required no change to `resetForTests()` or `resetProductionWorld()`
+— both already wipe the entire `worlds` table and call `seedIfEmpty()`,
+which inserts a fresh row with `creatures_seeded` defaulting to 0, so
+`seedCreaturesIfEmpty()` still seeds a reset/fresh world exactly as
+before. No production data was touched to make this fix; it only changes
+what *future* restarts do.
+
+**Checked for the same conflict elsewhere:** `seedCreaturesIfEmpty()`
+itself used to gate on the entire `creatures` table being empty — in
+principle, if *every* creature (not just spiders) in a world were ever
+driven to zero at once, a restart could have re-seeded everything, the
+same bug in a wider blast radius. The new per-world `creatures_seeded`
+marker closes this too, since the fix isn't per-species — it's "has this
+world's initial population ever been established," checked once, covering
+every current and future entry in `SPECIES_SEED_POSITIONS` uniformly. No
+other `seedXIfMissing()`/`seedXIfEmpty()`-style function in `db.ts` reads a
+live population count as its gate — `seedIfEmpty()` gates on `colonies`
+count, which is a fundamentally different, session-driven concept (a new
+colony is explicitly minted by a player via `createColony()`, never
+something ecology silently depletes), so it carries no analogous risk.
+
+A new test-only export, `runBootSeedSequenceForTests()`, re-runs exactly
+the boot-time seed/migration calls a real restart would (`seedIfEmpty()`,
+`backfillWorldsCreaturesSeeded()`, `seedCreaturesIfEmpty()`) against
+whatever state the DB is already in, without wiping any table — this is
+what let the new regression tests simulate "the server restarts while an
+existing, already-initialized world has zero spiders right now" without
+faking a fresh ESM module import (re-importing an already-loaded module
+path is a cache hit, not a re-run of its top-level code, so simulating a
+restart needs an explicit re-invocation of the boot sequence instead).
+Three new tests were added to `spec/ecology.test.ts` (32 total, up from
+29): an existing world with zero spiders stays at zero across repeated
+simulated restarts; the same holds when *every* creature in a world has
+gone extinct, not just spiders; and a brand-new world still receives its
+full intended population on the very next boot pass, seeded exactly once
+even if the boot sequence runs again immediately after. All three pass
+deterministically against an isolated test DB — no destructive action was
+taken against the shared dev DB to reproduce the extinction scenario
+manually; the invariant is proven mathematically against isolated state
+instead (see below).
+

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { COLONY_SPACING, QUEEN_MAX_HEALTH, SPIDER_CLEAR_RADIUS } from "./balance.ts";
 import { createColony, db, getColonyForSession, getUnclaimedColonyId, saveSession } from "./db.ts";
+import { isRuinExpired } from "./ecology.ts";
 import { logAction } from "./log.ts";
 import { getSpiderPositions, getWorkersForColony, isColonyActive, registerColony, registerWorker } from "./simulation.ts";
 
@@ -25,13 +26,19 @@ export function parseSessionId(cookieHeader: string | undefined): string | undef
 // get SPIDER_CLEAR_RADIUS, reusing the exact same "safe distance from a
 // predator" constant Stage 7's nest-exclusion already uses. See
 // createColony()'s `avoid` param in db.ts.
+// Stage 12: an expired ruin stops avoiding — same isRuinExpired gate
+// state.ts uses for visibility, so a new colony can spawn into space an
+// expired ruin used to occupy the instant it disappears from the game view.
 function buildSpawnAvoidance(): { x: number; y: number; radius: number }[] {
-  const colonyPositions = db.prepare("SELECT queen_x AS x, queen_y AS y FROM colonies").all() as {
+  const colonyRows = db.prepare("SELECT queen_x AS x, queen_y AS y, status, defeated_at AS defeatedAt FROM colonies").all() as {
     x: number;
     y: number;
+    status: "active" | "defeated";
+    defeatedAt: string | null;
   }[];
+  const colonyPositions = colonyRows.filter((c) => c.status === "active" || !isRuinExpired(c.defeatedAt));
   return [
-    ...colonyPositions.map((p) => ({ ...p, radius: COLONY_SPACING })),
+    ...colonyPositions.map((p) => ({ x: p.x, y: p.y, radius: COLONY_SPACING })),
     ...getSpiderPositions().map((p) => ({ ...p, radius: SPIDER_CLEAR_RADIUS })),
   ];
 }

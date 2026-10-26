@@ -148,6 +148,11 @@ let worldBounds = { width: 0, height: 0 };
 // from null to a permanent choice (see applyEvolutionSelection). Neither is
 // ever copied onto a different colony row — that's what keeps Start New
 // Colony's replacement genuinely fresh. See CLAUDE.md's Stage 9 section.
+// Stage 12: defeatedAt is the same durable defeated_at column defeatColony()
+// already set — exposed here so ecology.ts's queen-exclusion check (which
+// reads colonies.values(), not a fresh SQL query) and getAllColonies() can
+// both drive "is this ruin still here" off one single field. Always null for
+// an active colony.
 interface SimColony {
   id: number;
   x: number;
@@ -158,6 +163,7 @@ interface SimColony {
   timeSinceLastDamage: number;
   peakPopulation: number;
   evolution: EvolutionSelections;
+  defeatedAt: string | null;
 }
 
 const colonies = new Map<number, SimColony>();
@@ -178,7 +184,8 @@ export function loadSimulation(): void {
   const colonyRows = db
     .prepare(
       "SELECT id, queen_x AS x, queen_y AS y, status, queen_health AS health, queen_max_health AS maxHealth, " +
-        "peak_population AS peakPopulation, evolution_tier1 AS tier1, evolution_tier2 AS tier2, evolution_tier3 AS tier3 FROM colonies",
+        "peak_population AS peakPopulation, evolution_tier1 AS tier1, evolution_tier2 AS tier2, evolution_tier3 AS tier3, " +
+        "defeated_at AS defeatedAt FROM colonies",
     )
     .all() as {
     id: number;
@@ -191,6 +198,7 @@ export function loadSimulation(): void {
     tier1: EvolutionChoice | null;
     tier2: EvolutionChoice | null;
     tier3: EvolutionChoice | null;
+    defeatedAt: string | null;
   }[];
   for (const row of colonyRows) {
     colonies.set(row.id, {
@@ -203,6 +211,7 @@ export function loadSimulation(): void {
       timeSinceLastDamage: 0,
       peakPopulation: row.peakPopulation ?? 0,
       evolution: { tier1: row.tier1, tier2: row.tier2, tier3: row.tier3 },
+      defeatedAt: row.defeatedAt,
     });
   }
 
@@ -616,15 +625,15 @@ export function getCreaturesForWorld(
 // direct SQL UPDATE per renewable type, run every tick. Each UPDATE commits
 // atomically on its own, just not inside the same transaction as a claim —
 // worst case a crash loses a fraction of one tick's regen, which is fine per
-// the brief (not required to be crash-perfect). The `amount IS NOT NULL`
-// guard is what keeps a genuinely infinite node (amount: null) out of this
-// entirely — it never matches this WHERE clause. See CLAUDE.md.
+// the brief (not required to be crash-perfect). Stage 12: every resource is
+// now finite by construction (see CLAUDE.md's global finite-resource
+// invariant), so no `IS NOT NULL` guard is needed here anymore.
 const regenStatements = new Map(
   Object.keys(RESOURCE_REGEN_RATES).map((type) => [
     type,
     db.prepare(
       "UPDATE resource_nodes SET amount = MIN(max_amount, amount + ?) " +
-        "WHERE resource_type = ? AND amount IS NOT NULL AND max_amount IS NOT NULL AND amount < max_amount",
+        "WHERE resource_type = ? AND amount < max_amount",
     ),
   ]),
 );
@@ -684,6 +693,28 @@ export function registerColony(
     timeSinceLastDamage: 0,
     peakPopulation: startingPopulation,
     evolution: NO_EVOLUTION,
+    defeatedAt: null,
+  });
+}
+
+// Stage 12: registers a creature ecology.ts just spawned outside the
+// simulation (a raw SQL insert into `creatures`). Mirrors registerWorker/
+// registerColony above for the same reason — without this, a freshly
+// ecology-spawned aphid/spider would be invisible to getState()/
+// advanceCreatures() until the next full loadSimulation() (restart).
+export function registerCreature(creature: {
+  id: number;
+  worldId: number;
+  species: string;
+  x: number;
+  y: number;
+  health: number;
+  maxHealth: number;
+}): void {
+  creatures.set(creature.id, {
+    ...creature,
+    command: { type: "idle", remaining: WANDER_PARAMS[creature.species].idleMin },
+    rngState: seedRng(creature.id),
   });
 }
 
@@ -702,6 +733,14 @@ export function getWorkersForColony(
 // since this is purely a collision-avoidance input, not a public API.
 export function getSpiderPositions(): { x: number; y: number }[] {
   return [...creatures.values()].filter((c) => c.species === "spider").map(({ x, y }) => ({ x, y }));
+}
+
+// Stage 12: live worker positions, for ecology.ts's physical-clearance check
+// (a candidate spawn point must not land directly on top of a unit) — purely
+// a collision-avoidance input, not a public API, same shape/purpose as
+// getSpiderPositions above.
+export function getAllWorkerPositions(): { x: number; y: number }[] {
+  return [...workers.values()].map(({ x, y }) => ({ x, y }));
 }
 
 // Multiplayer visibility fix: the shared world has exactly one population of
@@ -910,9 +949,9 @@ function clamp(value: number, min: number, max: number): number {
 // below anything that could matter at this simulation's scale. See CLAUDE.md.
 const ARRIVAL_EPSILON = 1e-6;
 
-function findResourceNode(id: number): { resourceType: string; amount: number | null } | undefined {
+function findResourceNode(id: number): { resourceType: string; amount: number } | undefined {
   return db.prepare("SELECT resource_type AS resourceType, amount FROM resource_nodes WHERE id = ?").get(id) as
-    | { resourceType: string; amount: number | null }
+    | { resourceType: string; amount: number }
     | undefined;
 }
 
@@ -941,7 +980,7 @@ function attemptGatherClaim(worker: SimWorker, resourceId: number): boolean {
   if (!node) return false; // already claimed/depleted by someone else this tick
   const renewable = node.resourceType in RESOURCE_REGEN_RATES;
 
-  if (node.amount !== null && node.amount <= 0) {
+  if (node.amount <= 0) {
     // Renewable: stays present at 0 so it can regenerate (see
     // advanceResourceRegen) — nothing to claim yet, but not deleted.
     // Non-renewable: depletion is permanent, same as before Stage 5.
@@ -962,15 +1001,15 @@ function attemptGatherClaim(worker: SimWorker, resourceId: number): boolean {
   const carryYield = colony
     ? getEvolutionModifiers(colony.evolution, worker.caste).carryYield
     : CASTE_BASE_STATS[worker.caste].carryCapacity;
-  const claimedAmount = node.amount === null ? carryYield : Math.min(carryYield, node.amount);
+  // Stage 12: every resource is finite by construction now, so a claim is
+  // always capped at what's actually on the node — no infinite-gather path.
+  const claimedAmount = Math.min(carryYield, node.amount);
   const tx = db.transaction(() => {
-    if (node.amount !== null) {
-      const remaining = node.amount - claimedAmount;
-      if (remaining <= 0 && !renewable) {
-        db.prepare("DELETE FROM resource_nodes WHERE id = ?").run(resourceId);
-      } else {
-        db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(Math.max(remaining, 0), resourceId);
-      }
+    const remaining = node.amount - claimedAmount;
+    if (remaining <= 0 && !renewable) {
+      db.prepare("DELETE FROM resource_nodes WHERE id = ?").run(resourceId);
+    } else {
+      db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(Math.max(remaining, 0), resourceId);
     }
     db.prepare("UPDATE workers SET carrying_type = ?, carrying_amount = ? WHERE id = ?").run(
       node.resourceType,
@@ -1142,10 +1181,11 @@ export function getAllColonies(): {
   population: number;
   peakPopulation: number;
   evolution: EvolutionSelections;
+  defeatedAt: string | null;
 }[] {
   return [...colonies.values()]
     .sort((a, b) => a.id - b.id)
-    .map(({ id, x, y, health, maxHealth, status, peakPopulation, evolution }) => ({
+    .map(({ id, x, y, health, maxHealth, status, peakPopulation, evolution, defeatedAt }) => ({
       id,
       x,
       y,
@@ -1155,6 +1195,7 @@ export function getAllColonies(): {
       population: getWorkersForColony(id).length,
       peakPopulation,
       evolution,
+      defeatedAt,
     }));
 }
 
@@ -1237,9 +1278,13 @@ export function applyEvolutionSelection(colonyId: number, tier: 1 | 2 | 3, choic
 // immediately, before any worker/resource deletion or logging — exactly-
 // once is enforced by the database, not by caller discipline.
 export function defeatColony(colonyId: number, cause: string, creatureId?: number): void {
+  // Stage 12: generated in JS (not SQL's datetime('now')) so the exact same
+  // ISO string lands in both the durable column and the in-memory SimColony
+  // below — isRuinExpired() (ecology.ts) only ever has to parse one format.
+  const defeatedAt = new Date().toISOString();
   const result = db
-    .prepare("UPDATE colonies SET status = 'defeated', defeat_cause = ?, defeated_at = datetime('now') WHERE id = ? AND status = 'active'")
-    .run(cause, colonyId);
+    .prepare("UPDATE colonies SET status = 'defeated', defeat_cause = ?, defeated_at = ? WHERE id = ? AND status = 'active'")
+    .run(cause, defeatedAt, colonyId);
   if (result.changes === 0) return; // already defeated — no-op
 
   const workerIds = [...workers.values()].filter((w) => w.colonyId === colonyId).map((w) => w.id);
@@ -1266,6 +1311,7 @@ export function defeatColony(colonyId: number, cause: string, creatureId?: numbe
   if (colony) {
     colony.status = "defeated";
     colony.health = 0;
+    colony.defeatedAt = defeatedAt;
   }
 
   dirty = true;

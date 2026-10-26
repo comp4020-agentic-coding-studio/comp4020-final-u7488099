@@ -142,7 +142,9 @@ export const SPIDER_CLEAR_RADIUS = 400;
 // to see its own anchor's cluster without anyone moving first. 280 leaves a
 // 20-unit margin under that radius.
 const ANCHOR_CLUSTER_MIN_RADIUS = 150;
-const ANCHOR_CLUSTER_MAX_RADIUS = 280;
+// Exported for Stage 12: ecology's anchor zone radius (ECOLOGY_ANCHOR_ZONE_RADIUS)
+// is sized to comfortably contain this jitter band.
+export const ANCHOR_CLUSTER_MAX_RADIUS = 280;
 // Scattered (non-cluster) content keeps this far from every anchor, so
 // "background" placement never accidentally drops something on a queen.
 const ANCHOR_CLEAR_RADIUS = 120;
@@ -154,8 +156,8 @@ type GeneratedNode = {
   x: number;
   y: number;
   resourceType: ResourceType;
-  amount: number | null;
-  maxAmount: number | null;
+  amount: number;
+  maxAmount: number;
 };
 
 function buildWorldPopulation(): {
@@ -488,3 +490,126 @@ export const VISION_RADIUS: Record<"queen" | Caste, number> = {
 // above (150 < 180 <= 300 <= 400) — a defeated player sees meaningfully less
 // than an active one, not more.
 export const DEFEATED_COLONY_VISION_RADIUS = 150;
+
+// Stage 12: persistent world ecology. Zones are derived, not stored — see
+// CLAUDE.md's Stage 12 section for the full rationale behind every number
+// here. Anchor zones reuse colonySpiralPosition(i) for i in
+// 0..SPAWN_ANCHOR_COUNT-1 as their centers; everywhere else falls into the
+// background grid.
+export const ECOLOGY_ANCHOR_ZONE_RADIUS = 300;
+export const ECOLOGY_BACKGROUND_CELL_SIZE = 300;
+
+// Deliberately its own setInterval in index.ts, decoupled from
+// SIMULATION.tickHz/broadcastHz — a single O(resourceNodes + creatures) pass
+// every 5s, not a per-tick scan (see Stage 10's documented anti-pattern).
+export const ECOLOGY_EVAL_INTERVAL_MS = 5000;
+
+// Only the 5 ecology-eligible types count; player units (workers/queens)
+// always contribute zero density.
+export const ECOLOGY_DENSITY_WEIGHTS: Record<ResourceType | "aphid" | "spider", number> = {
+  sugar: 1,
+  biomass: 1.5,
+  protein: 2,
+  aphid: 2,
+  spider: 5,
+};
+
+// Matches what one Stage-6b anchor originally held (3 sugar + 2 biomass*1.5 +
+// 4 aphid*2 + ~0.5 avg protein*2 ≈ 15) / the original scatter density
+// (~0.5/cell, rounded up to keep background zones genuinely alive).
+export const ECOLOGY_ANCHOR_TARGET_DENSITY = 15;
+export const ECOLOGY_BACKGROUND_TARGET_DENSITY = 1;
+
+// A zone below target starts a randomized deadline in this range; recovering
+// above target before it elapses cancels it (continuous depletion required).
+export const ECOLOGY_REGEN_DEADLINE_MIN_MS = 15_000;
+export const ECOLOGY_REGEN_DEADLINE_MAX_MS = 60_000;
+
+// Scarcity-weighted spawn type selection: weight = baseShare * (1 +
+// SCARCITY_BOOST_FACTOR * max(0, 1 - currentCount/expectedCount)). 8 (not the
+// originally-floated 3) is what actually makes a zone with zero protein much
+// more likely to spawn protein next to abundant sugar/biomass.
+export const SCARCITY_BOOST_FACTOR = 8;
+
+// Emergency backstop only, counted as raw entities (sugar+biomass+protein
+// source nodes plus aphid+spider creatures) — not the weighted density unit
+// the per-zone targets use. ~1.5-1.9x the 160-195 raw entity "normal, fully
+// provisioned" range derived in the Stage 12 plan.
+export const MAX_ECOLOGY_ENTITIES = 300;
+
+// Both active queens and non-expired ruins exclude ecology spawns within this
+// radius — a visible ruin still occupies its footprint exactly like an active
+// queen does, until the instant it expires (see RUIN_LIFETIME_MS below).
+export const ECOLOGY_QUEEN_EXCLUSION_RADIUS = 250;
+
+// How long a defeated colony's ruin stays visible/spawn-blocking/ecology-
+// excluding before it physically & ecologically expires. Historical DB rows
+// (evolution, defeat cause, admin visibility) are never affected by this —
+// only live-world visibility and spatial exclusion expire.
+export const RUIN_LIFETIME_MS = 600_000;
+
+// Stage 12 addendum: global population scarcity. Motivated by an observed
+// real extinction in the shared dev world — spider's old ANCHOR_BASE_SHARE/
+// BACKGROUND_BASE_SHARE of 0 meant pickSpawnType() unconditionally excluded
+// it from ever being ecology-spawned, so once the seeded population was
+// hunted out it could never recover. The fix adds a second, independent
+// factor to WHAT gets selected (never touching WHEN regeneration happens,
+// which stays entirely local-density-driven): score = rarity x local
+// scarcity x global scarcity. See CLAUDE.md for the full derivation.
+
+// Explicit rarity ranks, generalizing the base-weight idea already used by
+// ANCHOR_BASE_SHARE/BACKGROUND_BASE_SHARE in ecology.ts. Those two maps stay
+// exactly as they are — they drive the LOCAL scarcity term (a zone-tier's
+// expected per-type mix) — rarity is a different, single global weight per
+// type shared by every zone regardless of tier.
+export type EcologyRarity = "common" | "uncommon" | "rare" | "extremelyRare";
+export const RARITY_BASE_WEIGHT: Record<EcologyRarity, number> = {
+  common: 1.0,
+  uncommon: 0.55,
+  rare: 0.25,
+  extremelyRare: 0.08,
+};
+export const ECOLOGY_TYPE_RARITY: Record<"sugar" | "biomass" | "protein" | "aphid" | "spider", EcologyRarity> = {
+  sugar: "common",
+  biomass: "uncommon",
+  aphid: "uncommon",
+  protein: "rare",
+  spider: "extremelyRare",
+};
+
+// World-size-scaled desired populations: worldScale = currentWorldArea /
+// REFERENCE_WORLD_AREA, so desiredPopulation_i = referenceDesiredPopulation_i
+// * worldScale. A future, larger world naturally wants proportionally more
+// of everything without ever hardcoding an absolute population target. The
+// current 3000x3000 WORLD also happens to be the reference world for now
+// (worldScale = 1 today) — the two are allowed to diverge once the real game
+// world grows past this temporary map.
+export const REFERENCE_WORLD_AREA = WORLD.width * WORLD.height;
+
+// Reference desired global population per type at REFERENCE_WORLD_AREA.
+// Deliberately set to Stage 6b's own original seeded totals (the
+// distribution this game was already designed and balanced around), not
+// invented numbers: SUGAR_PER_ANCHOR*SPAWN_ANCHOR_COUNT+SCATTER_SUGAR_COUNT,
+// and so on for each type. These are ecological *targets/densities*, never
+// hard caps — see MAX_ECOLOGY_ENTITIES above, which remains the only hard
+// (technical, not ecological) ceiling.
+export const REFERENCE_DESIRED_POPULATION: Record<"sugar" | "biomass" | "protein" | "aphid" | "spider", number> = {
+  sugar: SUGAR_PER_ANCHOR * SPAWN_ANCHOR_COUNT + SCATTER_SUGAR_COUNT,
+  biomass: BIOMASS_PER_ANCHOR * SPAWN_ANCHOR_COUNT + SCATTER_BIOMASS_COUNT,
+  protein: Math.round(SPAWN_ANCHOR_COUNT / PROTEIN_ANCHOR_STRIDE) + SCATTER_PROTEIN_COUNT,
+  aphid: APHIDS_PER_ANCHOR * SPAWN_ANCHOR_COUNT + SCATTER_APHID_COUNT,
+  spider: SPIDER_COUNT,
+};
+
+// Bounded exponential global-scarcity pressure: globalScarcity_i =
+// min(G_MAX, exp(K * deficiency_i^2)) where deficiency_i = max(0, 1 -
+// currentPopulation_i / desiredPopulation_i). At/above desired population
+// the multiplier is exactly 1; it rises smoothly, but never past G_MAX, as
+// population falls toward zero. K=4 was tuned so ratio=0.75 -> ~1.28x,
+// 0.5 -> ~2.72x, 0.25 -> ~9.49x, 0.1 -> ~25.5x, extinct -> e^4 ~= 54.6,
+// capped at G_MAX=50 — mild underpopulation barely moves spawn odds, severe
+// depletion increasingly overrides normal rarity, and extinction creates
+// strong recovery pressure that collapses back to baseline the instant the
+// population recovers.
+export const GLOBAL_SCARCITY_K = 4;
+export const GLOBAL_SCARCITY_MAX_MULTIPLIER = 50;
