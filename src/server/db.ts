@@ -132,10 +132,11 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
-  -- Stage 6: 'kind' distinguishes a renewable, fixed-location "source"
-  -- (sugar/biomass/protein nodes, unchanged) from a finite dropped "item"
-  -- (a carcass). Defaults to 'source' so every pre-Stage-6 row is correctly
-  -- classified with no backfill needed. See CLAUDE.md.
+  -- Stage 6: 'kind' distinguishes a world-generated/ecology-spawned
+  -- "source" (sugar/biomass/protein nodes) from a dropped "item" (a
+  -- carcass) — both are finite and delete-at-zero as of Stage 12.5, with no
+  -- renewal in place for either. Defaults to 'source' so every pre-Stage-6
+  -- row is correctly classified with no backfill needed. See CLAUDE.md.
   CREATE TABLE IF NOT EXISTS resource_nodes (
     id INTEGER PRIMARY KEY,
     world_id INTEGER NOT NULL REFERENCES worlds(id),
@@ -293,8 +294,9 @@ function migrateResourceNodesFinite(): void {
   }
 }
 
-// Stage 6: distinguishes a renewable "source" from a finite dropped "item"
-// (a carcass). Defaulting to 'source' means every existing row is correctly
+// Stage 6: distinguishes a world-generated/ecology-spawned "source" from a
+// dropped "item" (a carcass) — both finite and delete-at-zero as of Stage
+// 12.5. Defaulting to 'source' means every existing row is correctly
 // classified with no backfill UPDATE needed — only the ALTER itself.
 function migrateResourceNodeKind(): void {
   const columns = db.prepare("PRAGMA table_info(resource_nodes)").all() as { name: string }[];

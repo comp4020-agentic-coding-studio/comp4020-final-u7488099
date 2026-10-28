@@ -27,13 +27,12 @@ const {
   REPRODUCE_COST,
   STARTING_PROTEIN,
   SUGAR_NODE_MAX_AMOUNT,
-  SUGAR_REGEN_RATE,
-  BIOMASS_REGEN_RATE,
   APHID_SEED_POSITIONS,
   SPIDER_SEED_POSITIONS,
   APHID_IDLE_MAX,
   APHID_MAX_HEALTH,
   APHID_PROTEIN_VALUE,
+  SPIDER_PROTEIN_VALUE,
   WORKER_ATTACK_RANGE,
   WORKER_ATTACK_DAMAGE,
   WORKER_ATTACK_COOLDOWN,
@@ -329,7 +328,7 @@ describe("gather: travel + claim", () => {
     expect(resourceAmount("sugar")).toBe(before);
   });
 
-  it("B: arriving at a renewable node claims GATHER_YIELD into carrying without crediting the colony, and decrements its amount", () => {
+  it("B: arriving at a sugar node claims GATHER_YIELD into carrying without crediting the colony, and decrements its amount", () => {
     const [sugarNode] = findNodesByType("sugar");
     const beforeNodeAmount = nodeRow(sugarNode.id)!.amount!;
     const worker = registerTestWorker(9002, sugarNode.x, sugarNode.y);
@@ -341,9 +340,10 @@ describe("gather: travel + claim", () => {
     expect(resourceAmount("sugar")).toBe(before); // not credited yet — only deposit credits the colony
     expect(workerById(worker.id).carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
     expect(sim.getWorkerCommand(worker.id)).toBe("return"); // auto-issued, no client command involved
-    // Stage 5: sugar is now finite + renewable, same as biomass — a claim
-    // depletes it like any finite node (see "Stage 5: renewable resource
-    // regeneration" below for the regeneration half of that behaviour).
+    // Stage 12.5: sugar is finite and never refills in place, same as every
+    // other natural node — a claim depletes it permanently (see "Stage 12.5:
+    // finite resources never refill in place" below for the no-regen half of
+    // that behaviour).
     expect(nodeRow(sugarNode.id)?.amount).toBe(beforeNodeAmount - GATHER_YIELD);
   });
 
@@ -472,7 +472,7 @@ describe("group commands", () => {
     expect(afterB.y).toBe(2000);
   });
 
-  it("J: several workers converging on a renewable node each claim a payload independently, no contention", () => {
+  it("J: several workers converging on a sugar node each claim a payload independently, no contention", () => {
     const [sugarNode] = findNodesByType("sugar");
     const beforeNodeAmount = nodeRow(sugarNode.id)!.amount!;
     const group = [10006, 10007, 10008].map((id) => registerTestWorker(id, sugarNode.x, sugarNode.y));
@@ -488,8 +488,8 @@ describe("group commands", () => {
       expect(workerById(w.id).carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
       expect(sim.getWorkerCommand(w.id)).toBe("return");
     }
-    // Stage 5: each claim independently decrements the shared renewable
-    // node — no contention, same as it would for a finite biomass node.
+    // Stage 12.5: each claim independently decrements the shared finite
+    // node — no contention, same as it would for protein or a carcass.
     expect(nodeRow(sugarNode.id)?.amount).toBe(beforeNodeAmount - 3 * GATHER_YIELD);
   });
 
@@ -645,10 +645,9 @@ describe("Stage 3: loose swarm movement", () => {
     // Exactly one claim can have landed — and even that claim doesn't credit
     // the colony yet, it's carried home first.
     expect(resourceAmount("biomass")).toBe(beforeColony);
-    // Stage 5: biomass is renewable, so the now-empty node persists at 0
-    // instead of being deleted (contrast with protein's delete-on-depletion,
-    // exercised elsewhere).
-    expect(nodeRow(nodeId)?.amount).toBe(0);
+    // Stage 12.5: biomass is finite and never refills in place, so the
+    // now-empty node is deleted immediately — same as protein or a carcass.
+    expect(nodeRow(nodeId)).toBeUndefined();
     const carrying = group.map((w) => workerById(w.id).carrying);
     expect(carrying.filter((c) => c !== null)).toEqual([{ resourceType: "biomass", amount: GATHER_YIELD }]);
     for (const w of group) {
@@ -1129,61 +1128,132 @@ describe("Stage 7: spider AI", () => {
   });
 });
 
-describe("Stage 5: renewable resource regeneration", () => {
-  it("A: a depleted sugar node regenerates over time", () => {
+// Stage 12.5 correction: Stage 12 made every resource node finite at the
+// schema/claim level (no more amount: null), but manual production
+// playtesting exposed that this older Stage 5 per-node regeneration loop
+// (RESOURCE_REGEN_RATES / advanceResourceRegen) was still live underneath
+// it — a sugar or biomass node fully refilled to maxAmount within a couple
+// of seconds of being claimed, so finite depletion was never actually
+// observable in real play. This describe block replaces the old "Stage 5:
+// renewable resource regeneration" block, which asserted exactly that
+// refill-in-place behavior as correct; it now asserts the opposite: no
+// individual node of any resource type ever regenerates in place, and the
+// only way the world replenishes is Stage 12 ecology spawning a brand new
+// node elsewhere. See CLAUDE.md's Stage 12.5 section.
+describe("Stage 12.5: finite resources never refill in place", () => {
+  it("A: claiming from a sugar node decreases its amount, and simply letting time pass afterward never increases it again", () => {
     const [sugarNode] = findNodesByType("sugar");
-    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(10, sugarNode.id);
-
-    sim.advanceSimulation(10);
-
-    expect(fullNodeRow(sugarNode.id)?.amount).toBe(10 + SUGAR_REGEN_RATE * 10);
-  });
-
-  it("B: a depleted biomass node regenerates over time", () => {
-    const [biomassNode] = findNodesByType("biomass");
-    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(100, biomassNode.id);
-
-    sim.advanceSimulation(10);
-
-    expect(fullNodeRow(biomassNode.id)?.amount).toBe(100 + BIOMASS_REGEN_RATE * 10);
-  });
-
-  it("regeneration never exceeds a node's maxAmount, however large the dt", () => {
-    const [sugarNode] = findNodesByType("sugar");
-    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(1, sugarNode.id);
-
-    sim.advanceSimulation(1000); // comfortably enough to overshoot maxAmount if the cap were missing
-
-    expect(fullNodeRow(sugarNode.id)?.amount).toBe(SUGAR_NODE_MAX_AMOUNT);
-  });
-
-  it("C: protein does not regenerate", () => {
-    const [proteinNode] = findNodesByType("protein");
-    const depleted = fullNodeRow(proteinNode.id)!.amount! - 50;
-    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(depleted, proteinNode.id);
-
-    sim.advanceSimulation(1000);
-
-    expect(fullNodeRow(proteinNode.id)?.amount).toBe(depleted);
-  });
-
-  it("D: a renewable node driven to exactly zero persists (not deleted) and later regenerates above zero", () => {
-    const [sugarNode] = findNodesByType("sugar");
-    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(1, sugarNode.id);
+    const before = fullNodeRow(sugarNode.id)!.amount!;
     const worker = registerTestWorker(9200, sugarNode.x, sugarNode.y);
 
     expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
-    // Regen (well below GATHER_YIELD the whole time, so the eventual claim
-    // still drains whatever's accumulated exactly to 0) ticks alongside the
-    // Foraging II gather channel every tick; the claim itself only resolves
-    // once the channel completes.
     advanceThroughGatherChannel();
 
-    expect(fullNodeRow(sugarNode.id)?.amount).toBe(0);
+    const afterClaim = fullNodeRow(sugarNode.id)!.amount!;
+    expect(afterClaim).toBe(before - GATHER_YIELD);
 
-    sim.advanceSimulation(10);
+    sim.advanceSimulation(60); // comfortably longer than the old regen loop needed to fully refill
 
-    expect(fullNodeRow(sugarNode.id)!.amount!).toBeGreaterThan(0);
+    expect(fullNodeRow(sugarNode.id)?.amount).toBe(afterClaim);
+  });
+
+  it("B: claiming from a biomass node decreases its amount, and simply letting time pass afterward never increases it again", () => {
+    const [biomassNode] = findNodesByType("biomass");
+    const before = fullNodeRow(biomassNode.id)!.amount!;
+    const worker = registerTestWorker(9201, biomassNode.x, biomassNode.y);
+
+    expect(sim.issueGatherCommand(worker.id, biomassNode.id, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+
+    const afterClaim = fullNodeRow(biomassNode.id)!.amount!;
+    expect(afterClaim).toBe(before - GATHER_YIELD);
+
+    sim.advanceSimulation(60);
+
+    expect(fullNodeRow(biomassNode.id)?.amount).toBe(afterClaim);
+  });
+
+  it("C: a sugar node driven to exactly zero is deleted immediately, not left in place to regenerate", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(1, sugarNode.id);
+    const worker = registerTestWorker(9202, sugarNode.x, sugarNode.y);
+
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+
+    expect(nodeRow(sugarNode.id)).toBeUndefined();
+
+    sim.advanceSimulation(60); // no regen loop left to bring it back — it simply stays gone
+
+    expect(nodeRow(sugarNode.id)).toBeUndefined();
+  });
+
+  it("D: a biomass node driven to exactly zero is deleted immediately, not left in place to regenerate", () => {
+    const [biomassNode] = findNodesByType("biomass");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(1, biomassNode.id);
+    const worker = registerTestWorker(9203, biomassNode.x, biomassNode.y);
+
+    expect(sim.issueGatherCommand(worker.id, biomassNode.id, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+
+    expect(nodeRow(biomassNode.id)).toBeUndefined();
+
+    sim.advanceSimulation(60);
+
+    expect(nodeRow(biomassNode.id)).toBeUndefined();
+  });
+
+  it("E: a protein node driven to exactly zero continues to delete immediately, same as sugar/biomass now do", () => {
+    const [proteinNode] = findNodesByType("protein");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(1, proteinNode.id);
+    const worker = registerTestWorker(9204, proteinNode.x, proteinNode.y);
+
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+
+    expect(nodeRow(proteinNode.id)).toBeUndefined();
+  });
+
+  it("F: a depleted node's identity is gone forever — a later ecology-style insert at the same spot is a distinct row, not the old node reappearing", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    const { x, y } = sugarNode;
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(1, sugarNode.id);
+    const worker = registerTestWorker(9205, x, y);
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+    expect(nodeRow(sugarNode.id)).toBeUndefined();
+
+    // A brand new node at the exact same coordinates (what ecology spawning
+    // looks like) gets a new id — it is never the old row coming back.
+    const newId = insertNode(x, y, "sugar", SUGAR_NODE_MAX_AMOUNT);
+    expect(newId).not.toBe(sugarNode.id);
+    expect(fullNodeRow(newId)?.amount).toBe(SUGAR_NODE_MAX_AMOUNT);
+  });
+
+  it("G: a node's amount never goes negative even when a claim would otherwise overshoot", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(1, sugarNode.id);
+    const worker = registerTestWorker(9206, sugarNode.x, sugarNode.y);
+
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+
+    // GATHER_YIELD (10) exceeds the 1 unit left — the node must delete, not
+    // persist at a negative amount.
+    expect(nodeRow(sugarNode.id)).toBeUndefined();
+  });
+
+  it("H: contested/final-claim concurrency guarantees are unaffected — exactly one of several simultaneous claimants wins the last unit", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD, sugarNode.id);
+    const group = [9207, 9208, 9209].map((id, i) => registerTestWorker(id, sugarNode.x + i * 5, sugarNode.y));
+
+    for (const w of group) expect(sim.issueGatherCommand(w.id, sugarNode.id, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+
+    const carrying = group.map((w) => workerById(w.id).carrying).filter((c) => c !== null);
+    expect(carrying).toEqual([{ resourceType: "sugar", amount: GATHER_YIELD }]);
+    expect(nodeRow(sugarNode.id)).toBeUndefined();
   });
 });
 
@@ -1414,7 +1484,7 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     const carcass = db.prepare("SELECT id FROM resource_nodes WHERE kind = 'item'").get() as { id: number };
     expect(fullNodeRow(carcass.id)?.amount).toBe(APHID_PROTEIN_VALUE);
 
-    sim.advanceSimulation(1000); // plenty of time — protein is not in RESOURCE_REGEN_RATES
+    sim.advanceSimulation(1000); // plenty of time — no node ever regenerates in place (Stage 12.5)
     expect(fullNodeRow(carcass.id)?.amount).toBe(APHID_PROTEIN_VALUE);
 
     db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD, carcass.id);
@@ -1423,6 +1493,29 @@ describe("Stage 6: hunting, combat, carcasses", () => {
     advanceThroughGatherChannel();
 
     expect(nodeRow(carcass.id)).toBeUndefined(); // deleted once fully claimed, same as any finite node
+  });
+
+  it("J2: a spider carcass is likewise finite, never regenerates, and deletes once fully claimed", () => {
+    const spiderId = insertSpider(2500, 2500);
+    setCreatureHealth(spiderId, WORKER_ATTACK_DAMAGE);
+    const worker = registerTestWorker(13013, 2500, 2500);
+    expect(sim.issueAttackCommand(worker.id, spiderId, colony.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT); // kill lands, carcass created
+
+    const carcass = db
+      .prepare("SELECT id FROM resource_nodes WHERE kind = 'item' AND x = ? AND y = ?")
+      .get(2500, 2500) as { id: number };
+    expect(fullNodeRow(carcass.id)?.amount).toBe(SPIDER_PROTEIN_VALUE);
+
+    sim.advanceSimulation(1000); // plenty of time — no node ever regenerates in place (Stage 12.5)
+    expect(fullNodeRow(carcass.id)?.amount).toBe(SPIDER_PROTEIN_VALUE);
+
+    db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(GATHER_YIELD, carcass.id);
+    const gatherer = registerTestWorker(13014, 2500, 2500);
+    expect(sim.issueGatherCommand(gatherer.id, carcass.id, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+
+    expect(nodeRow(carcass.id)).toBeUndefined();
   });
 
   it("K: harvesting a carcass credits protein only after deposit, exactly like any protein node", () => {

@@ -16,7 +16,6 @@ import {
   QUEEN_DISENGAGE_RANGE,
   QUEEN_REGEN_DELAY,
   QUEEN_REGEN_RATE,
-  RESOURCE_REGEN_RATES,
   SEPARATION_STRENGTH,
   SPIDER_AGGRO_RANGE,
   SPIDER_ATTACK_COOLDOWN,
@@ -620,31 +619,6 @@ export function getCreaturesForWorld(
     .map(({ id, species, x, y, health, maxHealth }) => ({ id, species, x, y, health, maxHealth }));
 }
 
-// Resource nodes have no in-memory cache (every claim already mutates SQLite
-// directly — see attemptGatherClaim), so regen follows that same precedent: a
-// direct SQL UPDATE per renewable type, run every tick. Each UPDATE commits
-// atomically on its own, just not inside the same transaction as a claim —
-// worst case a crash loses a fraction of one tick's regen, which is fine per
-// the brief (not required to be crash-perfect). Stage 12: every resource is
-// now finite by construction (see CLAUDE.md's global finite-resource
-// invariant), so no `IS NOT NULL` guard is needed here anymore.
-const regenStatements = new Map(
-  Object.keys(RESOURCE_REGEN_RATES).map((type) => [
-    type,
-    db.prepare(
-      "UPDATE resource_nodes SET amount = MIN(max_amount, amount + ?) " +
-        "WHERE resource_type = ? AND amount < max_amount",
-    ),
-  ]),
-);
-
-function advanceResourceRegen(dt: number): void {
-  for (const [type, rate] of Object.entries(RESOURCE_REGEN_RATES)) {
-    const info = regenStatements.get(type)!.run(rate * dt, type);
-    if (info.changes > 0) dirty = true;
-  }
-}
-
 // Registers a worker created outside the simulation (reproduce() inserts it
 // straight into SQLite). Without this the sim cache and SQLite would diverge
 // the moment a new worker arrived — getState() would never see it move. A
@@ -978,16 +952,15 @@ function creditColony(colonyId: number, resourceType: string, amount: number): v
 function attemptGatherClaim(worker: SimWorker, resourceId: number): boolean {
   const node = findResourceNode(resourceId);
   if (!node) return false; // already claimed/depleted by someone else this tick
-  const renewable = node.resourceType in RESOURCE_REGEN_RATES;
 
   if (node.amount <= 0) {
-    // Renewable: stays present at 0 so it can regenerate (see
-    // advanceResourceRegen) — nothing to claim yet, but not deleted.
-    // Non-renewable: depletion is permanent, same as before Stage 5.
-    if (!renewable) {
-      db.prepare("DELETE FROM resource_nodes WHERE id = ?").run(resourceId);
-      dirty = true;
-    }
+    // Stage 12.5: every natural node is finite and never refills in place —
+    // a node found at zero (another worker claimed the last of it this tick)
+    // is permanently gone. World-level renewal comes only from ecology
+    // spawning a brand new node elsewhere (see ecology.ts) — never from this
+    // node coming back. See CLAUDE.md's Stage 12.5 correction.
+    db.prepare("DELETE FROM resource_nodes WHERE id = ?").run(resourceId);
+    dirty = true;
     return false;
   }
 
@@ -1006,10 +979,10 @@ function attemptGatherClaim(worker: SimWorker, resourceId: number): boolean {
   const claimedAmount = Math.min(carryYield, node.amount);
   const tx = db.transaction(() => {
     const remaining = node.amount - claimedAmount;
-    if (remaining <= 0 && !renewable) {
+    if (remaining <= 0) {
       db.prepare("DELETE FROM resource_nodes WHERE id = ?").run(resourceId);
     } else {
-      db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(Math.max(remaining, 0), resourceId);
+      db.prepare("UPDATE resource_nodes SET amount = ? WHERE id = ?").run(remaining, resourceId);
     }
     db.prepare("UPDATE workers SET carrying_type = ?, carrying_amount = ? WHERE id = ?").run(
       node.resourceType,
@@ -1060,12 +1033,12 @@ function applyDamage(creature: SimCreature, amount: number): number | null {
 // mid-kill can never leave an orphaned creature row or a missing/duplicate
 // carcass. In-memory cleanup (creatures.delete, attacker idle-sweep) only
 // happens after tx() returns, keeping in-memory state synced to the
-// committed result. Carcass is inserted with kind='item' — protein has no
-// entry in RESOURCE_REGEN_RATES, so attemptGatherClaim's existing
-// non-renewable branch already makes it finite and delete-at-zero with no
-// further code. Loot is looked up per species (CREATURE_PROTEIN_VALUE),
-// generalized in Stage 7 from what used to be a hardcoded APHID_PROTEIN_VALUE.
-// Returns the new carcass's resource-node id. See CLAUDE.md.
+// committed result. Carcass is inserted with kind='item' — every node is
+// finite and delete-at-zero (see attemptGatherClaim), so a carcass needs no
+// special-case code of its own. Loot is looked up per species
+// (CREATURE_PROTEIN_VALUE), generalized in Stage 7 from what used to be a
+// hardcoded APHID_PROTEIN_VALUE. Returns the new carcass's resource-node id.
+// See CLAUDE.md.
 function killCreature(creature: SimCreature): number {
   const proteinValue = CREATURE_PROTEIN_VALUE[creature.species];
   let carcassId!: number;
@@ -1583,7 +1556,6 @@ function resolveArrival(worker: SimWorker, command: WorkerCommand): void {
 // never blocks one that does, and every resulting position is clamped into
 // world bounds so separation can never push a worker out of them.
 export function advanceSimulation(dt: number): void {
-  advanceResourceRegen(dt);
   advanceCreatures(dt);
   advanceQueenRegen(dt);
 

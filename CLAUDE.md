@@ -475,40 +475,44 @@ makes the world visibly continue without input, via exactly two pieces of
 autonomous behaviour: renewable sugar/biomass regeneration, and a first
 neutral, non-interactable creature (the aphid) that wanders on its own.
 
-- **Sugar nodes are now finite + renewable, not genuinely infinite.** Every
-  seeded sugar node used to be `amount: null, maxAmount: null`. "Renewable"
-  is meaningless for a node that never depletes, so Stage 5 changes seeded
+- **Sugar nodes are now finite, not genuinely infinite.** Every seeded sugar
+  node used to be `amount: null, maxAmount: null`. Stage 5 changes seeded
   sugar to `amount: SUGAR_NODE_MAX_AMOUNT, maxAmount: SUGAR_NODE_MAX_AMOUNT`
   and ships `migrateSugarNodesFinite()` in `db.ts` to convert an
-  already-deployed world's sugar rows the same way on next boot. True
-  infinite nodes (`amount: null`) are still fully supported — Stage 4's
-  deposit-range tests still insert their own explicit `amount: null` sugar
-  node and are untouched by anything in this stage, which is the proof that
-  infinite nodes keep behaving exactly as before.
-- **Renewability has exactly one source of truth: `RESOURCE_REGEN_RATES` in
-  `balance.ts`.** A resource type's presence as a key there drives both the
+  already-deployed world's sugar rows the same way on next boot.
+  **Superseded by Stage 12.5A (see below): this stage originally also made
+  sugar/biomass "renewable" via an in-place per-node regeneration loop
+  (`advanceResourceRegen`/`RESOURCE_REGEN_RATES`). That mechanism has since
+  been removed entirely — every individual natural resource node is now
+  permanently finite and never regenerates in place, full stop. The
+  paragraphs below describing `RESOURCE_REGEN_RATES`-driven renewability are
+  historical only and no longer describe current behaviour.**
+- ~~Renewability has exactly one source of truth: `RESOURCE_REGEN_RATES` in
+  `balance.ts`. A resource type's presence as a key there drives both the
   regen tick (`advanceResourceRegen`) and `attemptGatherClaim`'s
   no-delete-at-zero branch. Sugar and biomass are renewable; protein has no
   entry, so it's unaffected and keeps its original delete-on-depletion
-  behaviour unchanged.
-- **A renewable node can reach `amount === 0` without its row being
-  deleted — only non-renewable types are deleted on depletion.**
+  behaviour unchanged.~~
+- ~~A renewable node can reach `amount === 0` without its row being
+  deleted — only non-renewable types are deleted on depletion.
   `attemptGatherClaim` floors a renewable node's amount at 0 and leaves the
   row in place; a non-renewable node (protein) is still `DELETE`d the
-  moment its amount hits zero, exactly as before Stage 5.
-- **Regen is a direct SQL `UPDATE` per tick, with no in-memory cache for
-  resource nodes — same as every claim before this stage.** Resource nodes
+  moment its amount hits zero, exactly as before Stage 5.~~
+- ~~Regen is a direct SQL `UPDATE` per tick, with no in-memory cache for
+  resource nodes — same as every claim before this stage. Resource nodes
   have never lived in a `Map`; `advanceResourceRegen` keeps that precedent
   rather than introducing a second kind of node state. It's not wrapped in
   the same transaction as a claim, so a crash mid-tick can lose at most one
   tick's worth of regen on one node — acceptable per the brief, since regen
-  doesn't need to be crash-perfect.
-- **Renewable resources regenerate only while the simulation is actively
-  ticking — there is no offline/elapsed-time catch-up on boot.** A server
-  that's down for an hour does not credit an hour of regen on `loadSimulation()`;
-  regen only ever advances inside `advanceSimulation(dt)`, called from the
-  live 10Hz tick. This is a deliberate exclusion per the brief, not an
-  oversight — don't add boot-time catch-up without revisiting this.
+  doesn't need to be crash-perfect.~~
+- ~~Renewable resources regenerate only while the simulation is actively
+  ticking — there is no offline/elapsed-time catch-up on boot. A server
+  that's down for an hour does not credit an hour of regen on
+  `loadSimulation()`; regen only ever advances inside `advanceSimulation(dt)`,
+  called from the live 10Hz tick.~~
+  (All four struck-through points above were true of Stage 5 as originally
+  shipped and are kept here, crossed out, for historical accuracy — see
+  Stage 12.5A for why and how this was removed.)
 - **Creatures follow the worker pattern, not the resource-node pattern.**
   Aphid positions change continuously at 10Hz exactly like worker
   positions, so they get their own in-memory `creatures` Map in
@@ -2160,3 +2164,61 @@ taken against the shared dev DB to reproduce the extinction scenario
 manually; the invariant is proven mathematically against isolated state
 instead (see below).
 
+### Stage 12.5A fix: removing the Stage 5 in-place regeneration loop that Stage 12 left running
+
+Stage 12's finite-resource work (above) correctly made every *newly
+created* node's `amount` genuinely finite and removed the `amount: null`
+infinite path — but it never touched Stage 5's older, separate renewable-
+regeneration mechanism, because that mechanism didn't operate on node
+*creation*, it operated on node *claims* and a standing 10Hz tick. The two
+systems coexisted silently: a sugar or biomass node could reach `amount <=
+0` without ever being deleted, then climb back up on its own while nobody
+was gathering it, purely because `attemptGatherClaim()`'s renewable branch
+and the separate `advanceResourceRegen()` tick were both still present and
+both still wired into the live simulation loop. This was only discovered
+through manual production-style playtesting against the real dev server —
+not by code review, and not by the existing automated test suite, because
+the Stage 5-era tests were written to assert exactly this behaviour as
+correct, so they passed throughout.
+
+**The corrected, now-permanent invariant: every individual natural resource
+node is finite and never regenerates or refills in place.** This applies
+uniformly to sugar, biomass, and protein source nodes, and to aphid/spider
+carcasses — there is no longer a renewable/non-renewable distinction
+anywhere in the gather-claim path. World-level resource renewal is now
+**exclusively** Stage 12's ecology layer spawning genuinely new rows via
+`advanceEcology()`; an old, depleted node is gone for good, and anything
+that later appears in its place is a different row with a different id,
+not the same node refilling.
+
+- **Removed entirely, not deprecated:** `advanceResourceRegen()` and its
+  10Hz-loop call site in `simulation.ts`; `RESOURCE_REGEN_RATES` and the
+  Sugar/Biomass per-node regeneration-rate constants in `balance.ts`;
+  `attemptGatherClaim()`'s renewable-type no-delete-at-zero special case.
+  Every gatherable node — regardless of type — now follows the exact same
+  rule Stage 6's carcasses and Stage 12's finite-protein nodes already
+  followed: claim is capped at whatever's actually left, and the row is
+  `DELETE`d unconditionally the instant `amount <= 0`.
+- **`spec/simulation.test.ts`'s old "Stage 5: renewable resource
+  regeneration" test block was removed, not weakened** — it existed
+  specifically to assert the now-incorrect behaviour (a renewable node
+  floors at 0 and survives). In its place, deterministic tests assert the
+  corrected invariant directly: sugar/biomass amount decreases on claim;
+  sugar/biomass reaching zero deletes the node exactly like protein and
+  carcasses already did; a partially-depleted sugar/biomass node does not
+  increase merely because simulation time advances with no gather activity;
+  a depleted node never reappears with the same id; amount can never go
+  negative; existing contested/final-claim concurrency guarantees are
+  unchanged. `spec/ecology.test.ts` separately asserts the Stage 12 side of
+  the same invariant: ecology may create a brand-new node in a depleted
+  zone, but this is always a new row, never the old node refilling.
+- **Verified live, not just in unit tests.** Against the real running dev
+  server (not an isolated test DB — the point was to reproduce the actual
+  playtesting path that first surfaced the bug), a sugar node and a biomass
+  node were each gathered down from their starting amount in observable
+  decrements, left idle for several seconds with zero amount recovery, then
+  gathered to exactly zero — at which point each node was confirmed deleted
+  from three independent places: the live SQLite DB file (direct read-only
+  query), the authoritative in-memory server state, and `/api/state`'s
+  client-visible payload. See `PROCESS.md` for the full narrative and the
+  exact evidence captured.

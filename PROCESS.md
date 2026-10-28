@@ -202,6 +202,108 @@ restarts, and that a genuinely new world is still seeded exactly once. See
 `CLAUDE.md`'s "Stage 12 fix: the legacy spider seeder could undo a real
 in-game extinction" section for the full design and the fix's limits.
 
+## Stage 12.5A: removing the Stage 5 regeneration loop Stage 12 left running
+
+**Stage 12 successfully made resource amounts finite at the schema/claim
+level, but manual production-style playtesting exposed that the older
+Stage 5 per-node regeneration loop was still active.** Stage 12's own
+finite-resource work (above) closed the `amount: null` infinite-gather
+path and made every newly-created node genuinely finite — that part was
+correct and remains correct. What it did not touch, because it never
+needed to create a node to prove its own invariant, was Stage 5's
+separate, older machinery: `advanceResourceRegen()`'s standing 10Hz-tick
+`UPDATE` and `attemptGatherClaim()`'s renewable-type no-delete-at-zero
+branch, both still fully wired into the live simulation loop and both
+still keyed off `RESOURCE_REGEN_RATES`. A sugar or biomass node could
+still be gathered down to zero, sit there without being deleted, and then
+climb back up on its own with nobody touching it — in-place refill, not
+ecology-driven replacement. This was a real contradiction with the
+project's own intended design (world-level renewal is supposed to come
+exclusively from Stage 12's ecology spawning *new* rows, never from an old
+row refilling itself), and it had been shipping, unnoticed, since Stage 5
+— Stage 12's finite-resource investigation looked only at node *creation*
+and missed that claims still had a second, older amount-recovery path
+behind them.
+
+**Why the existing automated test suite didn't catch this:** it wasn't a
+coverage gap so much as an inverted assertion. The Stage 5-era test block
+in `spec/simulation.test.ts` ("Stage 5: renewable resource regeneration")
+existed specifically to assert the old, now-undesired behavior — that a
+renewable node floors at 0 and survives, and that it regenerates over
+simulated time. Those tests passed continuously through Stage 12 because
+Stage 12 never removed the mechanism they were testing; they were
+correctly testing code that had quietly become a bug. Nothing short of
+actually playing the live game end-to-end (gather a node to zero, wait,
+watch it come back) was going to surface this — which is exactly how it
+was found.
+
+**The fix removed refill-in-place entirely rather than patching around
+it**, per the explicit corrected invariant: every individual natural
+resource node (sugar, biomass, protein source nodes; aphid/spider
+carcasses) is finite and never regenerates or refills in place, full
+stop. In `simulation.ts`: `advanceResourceRegen()` and its 10Hz-loop call
+site were deleted outright; `attemptGatherClaim()`'s renewable special
+case was removed so every node type now follows the exact same
+unconditional "claim capped at what's left, delete at `amount <= 0`" path
+protein and carcasses already used. In `balance.ts`:
+`RESOURCE_REGEN_RATES` and the Sugar/Biomass regeneration-rate constants
+were removed, since nothing legitimate still referenced them. The old
+Stage 5 test block was deleted rather than weakened, and replaced with
+deterministic coverage of the corrected invariant: sugar/biomass amount
+decreases on claim; each deletes its node at zero exactly like protein and
+carcasses; a partially-depleted node does not recover amount merely
+because simulation time advances with nothing gathering it; a depleted
+node never reappears with the same id; amount can never go negative;
+existing contested/final-claim concurrency guarantees are unchanged. A
+companion assertion in `spec/ecology.test.ts` confirms the Stage 12 side
+holds too: ecology can create a brand-new node in a depleted zone, but
+that is always a distinct row, never the old node coming back.
+
+**Verification deliberately went beyond the unit-test suite, matching how
+the bug itself was found.** After `pnpm check` passed (targeted
+simulation/ecology tests first, then the full suite, then typecheck), the
+fix was verified against the real running local dev server — not an
+isolated test DB — reproducing the exact gameplay path that surfaced the
+bug in the first place. For both a sugar node and a biomass node: the
+node's amount was observed decreasing across real gathers, left idle for
+several seconds with zero recovery, driven down to exactly zero across
+further gathers, and then confirmed deleted from three independent
+sources — a direct read-only query against the live SQLite file, the
+authoritative in-memory server state, and `/api/state`'s own client-facing
+payload. No row manually edited to force any of this. Sugar depleted and
+deleted cleanly on the first attempt; the first biomass attempt was
+interrupted midway by a real, legitimate spider kill against the test
+colony's workers (an actual live-world hazard, not a test artifact), which
+was recovered from using the game's own sanctioned Abandon Colony → Start
+New Colony flow (no admin tool, no direct DB write, no production system
+touched) — the resulting new colony then completed a full, clean,
+uninterrupted biomass depletion run with no further issues. As with every
+other addendum to this stage, no production system was touched, no
+deploy was made, and no world reset of any kind was performed to produce
+or verify this fix — all verification ran against the local dev
+environment only.
+
+**A separate, pre-existing flaky test surfaced and was fixed during this
+round's verification, unrelated to the regeneration-loop bug itself.**
+Running `spec/ecology.test.ts` repeatedly (required to prove the fix
+above was genuinely green, not a one-off pass) turned up an intermittent
+failure in "depletion deadline + recovery > spawns exactly one entity
+once the deadline elapses." Reverting to the pre-Stage-12.5A code and
+re-running confirmed this had nothing to do with the regeneration-loop
+removal — it reproduced identically on the original, unmodified code.
+Root cause: every anchor zone's radius overlaps its nearest neighbors
+(anchors sit closer together than `2 × ECOLOGY_ANCHOR_ZONE_RADIUS`), so a
+test that empties the entire world leaves every anchor pending at the
+same tick; a spawn placed in a neighboring anchor's zone can land inside
+the overlap lens and get double-counted by the test's own
+radius-scoped counter, an isolation bug in the test's setup rather than
+in `advanceEcology`. Fixed by stocking every other anchor to its target
+density before asserting on the one zone under test, so it is the only
+zone ever pending — not by loosening the assertion. Confirmed with 20
+consecutive full-suite runs, zero failures, after the fix (versus a
+visible failure roughly 1 run in 10 before it, on both the old and new
+code).
+
 ## Stage 11: accounts, entry flow, guest persistence, reset & admin
 
 Every stage through Crit 10/Stage 10 had exactly one identity concept: a

@@ -16,29 +16,16 @@ export const STARTING_PROTEIN = REPRODUCE_COST;
 export const RESOURCE_TYPES = ["sugar", "protein", "biomass"] as const;
 export type ResourceType = (typeof RESOURCE_TYPES)[number];
 
-// Stage 5: sugar nodes are finite + renewable (see CLAUDE.md for why that
-// changed from genuinely infinite). Biomass/protein amounts are likewise
-// named constants (not inlined per-node) so Stage 6b's generated node list
-// and any future rebalancing share one source of truth per resource type.
+// Stage 12.5: every natural node (sugar, biomass, protein, and carcasses) is
+// finite and deletes permanently at zero — none of them ever regenerates in
+// place. These are named constants (not inlined per-node) so Stage 6b's
+// generated node list and any future rebalancing share one source of truth
+// per resource type. World-level renewal comes only from Stage 12 ecology
+// spawning a brand new node elsewhere (see ecology.ts) — see CLAUDE.md's
+// Stage 12.5 correction for why the old Stage 5 per-node regen was removed.
 export const SUGAR_NODE_MAX_AMOUNT = 100;
 export const BIOMASS_NODE_MAX_AMOUNT = 500;
 export const PROTEIN_NODE_AMOUNT = 200;
-
-// Units regenerated per second at a node below its maxAmount. Rates are
-// arbitrary — balancing isn't a priority this stage — chosen only so
-// regeneration is comfortably observable in both direct-import tests (which
-// pass arbitrary dt) and a manual playtest.
-export const SUGAR_REGEN_RATE = 4;
-export const BIOMASS_REGEN_RATE = 3;
-
-// Single source of truth for "is this resource type renewable": presence as
-// a key here drives both the regen tick and attemptGatherClaim's no-delete-
-// at-zero behavior in simulation.ts. Protein has no entry — it never
-// regenerates and keeps the original delete-on-depletion behavior.
-export const RESOURCE_REGEN_RATES: Partial<Record<ResourceType, number>> = {
-  sugar: SUGAR_REGEN_RATE,
-  biomass: BIOMASS_REGEN_RATE,
-};
 
 // Shared by computeGroupDestinations (simulation.ts), createColony (db.ts),
 // and Stage 6b's world-population generator below — one golden-angle spiral

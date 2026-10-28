@@ -261,13 +261,21 @@ describe("depletion deadline + recovery", () => {
   it("spawns exactly one entity once the deadline elapses while still below target, and resets the deadline", () => {
     clearAllEcologyEntities();
     const key = `anchor:${freeAnchorIndex}`;
+    // Every anchor's zone radius overlaps its nearest neighbors (anchors are
+    // spaced far closer than 2 * ECOLOGY_ANCHOR_ZONE_RADIUS), so an entirely
+    // empty world leaves every anchor below target and pending at the same
+    // t0 — a spawn placed in a *neighboring* anchor's zone can still land
+    // inside the overlap lens and be double-counted by rawCountNear, an
+    // isolation bug in this test rather than in advanceEcology. Stock every
+    // other anchor at/above its target first so freeAnchor is the only
+    // zone ever pending, making "exactly one" a true per-zone isolation.
+    for (let i = 0; i < SPAWN_ANCHOR_COUNT; i++) {
+      if (i === freeAnchorIndex) continue;
+      const center = colonySpiralPosition(i);
+      for (let j = 0; j < 20; j++) insertResourceNode(center.x + j, center.y, "sugar", 100);
+    }
     const t0 = 2_000_000;
     ecology.advanceEcology(t0);
-    // Scoped to freeAnchor's own radius rather than the whole world: an
-    // empty world leaves every zone below target and pending at the same
-    // t0, so other zones legitimately spawn in the same tick once their
-    // own deadlines elapse too. The "exactly one" invariant is per-zone,
-    // not global.
     const before = rawCountNear(freeAnchor.x, freeAnchor.y, ECOLOGY_ANCHOR_ZONE_RADIUS);
 
     const t1 = t0 + ECOLOGY_REGEN_DEADLINE_MAX_MS + 1;
@@ -594,6 +602,65 @@ describe("global finite-resource invariant", () => {
     expect(worker.carrying?.amount ?? 0).toBeLessThanOrEqual(3);
     expect(worker.carrying?.amount ?? 0).toBeGreaterThan(0);
     expect(worker.carrying!.amount).not.toBe(GATHER_YIELD > 3 ? GATHER_YIELD : worker.carrying!.amount);
+  });
+
+  it("Stage 12.5: a depleted node never refills in place — world renewal only ever comes from ecology spawning a brand new row", () => {
+    // The hard invariant this test protects: individual finite node ->
+    // depletion -> deletion -> no refill-in-place. World-level renewal is
+    // Stage 12 ecology's job alone (a brand new row, a new id), never the
+    // old row coming back to life. See CLAUDE.md's Stage 12.5 correction.
+    clearAllEcologyEntities();
+    const nodeId = insertResourceNode(freeAnchor.x, freeAnchor.y, "sugar", 5);
+    // A permanent decoy row, far from freeAnchor so it never contributes to
+    // this zone's density, inserted *after* nodeId so it always holds a
+    // higher id. Without it, depleting nodeId down to deletion would leave
+    // resource_nodes completely empty — and SQLite reuses rowids for
+    // non-AUTOINCREMENT tables, so ecology's very next spawn would coincidentally
+    // land back on id 1, indistinguishable from "the same row came back" even
+    // though it's a genuinely new entity. Keeping a never-deleted higher-id row
+    // around guarantees any later spawn gets a fresh, higher id instead. See
+    // CLAUDE.md's Stage 6b SQLite-rowid-reuse caveat.
+    insertResourceNode(ANCHOR0.x + 10000, ANCHOR0.y + 10000, "sugar", 9999);
+    const workerId = 999010;
+    sim.registerWorker({
+      id: workerId,
+      colonyId: colony.id,
+      x: freeAnchor.x,
+      y: freeAnchor.y,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
+    });
+    expect(sim.issueGatherCommand(workerId, nodeId, colony.id)).toBeNull();
+    for (let i = 0; i < 20; i++) sim.advanceSimulation(1 / 10);
+
+    // The node is fully depleted and gone — not sitting at 0.
+    const stillThere = db.prepare("SELECT id FROM resource_nodes WHERE id = ?").get(nodeId);
+    expect(stillThere).toBeUndefined();
+
+    // Let ecology run for a long while, well past the zone's regen deadline.
+    // It is free to spawn brand-new sugar in this now-depleted zone, but it
+    // must never resurrect the old row's identity.
+    const t0 = 7_000_000;
+    ecology.advanceEcology(t0);
+    const t1 = t0 + ECOLOGY_REGEN_DEADLINE_MAX_MS + 1;
+    ecology.advanceEcology(t1);
+
+    const oldRowAgain = db.prepare("SELECT id FROM resource_nodes WHERE id = ?").get(nodeId);
+    expect(oldRowAgain).toBeUndefined();
+
+    const anySugarNearby = db
+      .prepare(
+        `SELECT id, amount FROM resource_nodes WHERE world_id = ? AND resource_type = 'sugar' AND ABS(x - ?) < ${ECOLOGY_ANCHOR_ZONE_RADIUS} AND ABS(y - ?) < ${ECOLOGY_ANCHOR_ZONE_RADIUS}`,
+      )
+      .all(world.id, freeAnchor.x, freeAnchor.y) as { id: number; amount: number }[];
+    // If ecology did spawn new sugar here, every such row has a distinct id
+    // from the depleted one and a full, non-decremented amount — proof it's
+    // a genuinely new entity, not the old one refilled.
+    for (const row of anySugarNearby) {
+      expect(row.id).not.toBe(nodeId);
+      expect(row.amount).toBeGreaterThan(0);
+    }
   });
 });
 
