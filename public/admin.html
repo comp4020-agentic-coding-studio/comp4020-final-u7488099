@@ -298,7 +298,35 @@
       <section id="ecology-section">
         <h2>Ecology</h2>
         <p>
-          Read-only snapshot of Stage 12's zone density/regen state, computed on demand — nothing here is stored.
+          Anchor zones are the 10 rich circular regions shown on the admin map. Background zones are the 300&times;300
+          grid cells covering the rest of the world.
+        </p>
+
+        <form id="ecology-settings-form">
+          <label for="ecology-anchor-base-target">Anchor zone target density</label>
+          <input id="ecology-anchor-base-target" type="number" step="any" min="0.01" required />
+
+          <label for="ecology-background-base-target">Background zone target density</label>
+          <input id="ecology-background-base-target" type="number" step="any" min="0.01" required />
+
+          <label for="ecology-regen-min">Minimum regeneration delay (seconds)</label>
+          <input id="ecology-regen-min" type="number" step="any" min="1" required />
+
+          <label for="ecology-regen-max">Maximum regeneration delay (seconds)</label>
+          <input id="ecology-regen-max" type="number" step="any" min="1" required />
+
+          <span></span>
+          <button id="ecology-settings-save" type="submit">Save</button>
+        </form>
+        <p id="ecology-settings-status"></p>
+        <p>
+          These four values control future ecology ticks only — saving never resets or reseeds the world, and never
+          touches existing resource nodes, creatures, or colonies.
+        </p>
+
+        <p>
+          Live snapshot of Stage 12's zone density/regen state, computed on demand — nothing in the table below is
+          stored.
         </p>
         <table>
           <thead>
@@ -312,29 +340,6 @@
           <tbody id="ecology-anchors-body"></tbody>
         </table>
         <p id="ecology-background-summary"></p>
-
-        <h3>Ecology settings</h3>
-        <p>
-          These four values control future ecology ticks only — saving never resets or reseeds the world, and never
-          touches existing resource nodes, creatures, or colonies.
-        </p>
-        <form id="ecology-settings-form">
-          <label for="ecology-anchor-base-target">Anchor base density target</label>
-          <input id="ecology-anchor-base-target" type="number" step="0.1" min="0.01" required />
-
-          <label for="ecology-background-base-target">Background base density target</label>
-          <input id="ecology-background-base-target" type="number" step="0.1" min="0.01" required />
-
-          <label for="ecology-regen-min">Minimum regen delay (ms)</label>
-          <input id="ecology-regen-min" type="number" step="100" min="1000" required />
-
-          <label for="ecology-regen-max">Maximum regen delay (ms)</label>
-          <input id="ecology-regen-max" type="number" step="100" min="1000" required />
-
-          <span></span>
-          <button id="ecology-settings-save" type="submit">Save</button>
-        </form>
-        <p id="ecology-settings-status"></p>
       </section>
 
       <section id="danger-zone">

@@ -497,6 +497,12 @@ async function refreshMonitor(): Promise<void> {
 }
 
 // --- Stage 12.5B: ecology settings ------------------------------------------
+//
+// The two delay fields are stored/transmitted in milliseconds (the server's
+// representation, unchanged), but displayed/edited in seconds — the only
+// conversion boundary is here, at form fill / form submit.
+
+const MS_PER_SECOND = 1000;
 
 const ecologySettingsForm = document.getElementById("ecology-settings-form") as HTMLFormElement;
 const ecologyAnchorBaseTargetInput = document.getElementById("ecology-anchor-base-target") as HTMLInputElement;
@@ -508,8 +514,8 @@ const ecologySettingsStatusEl = document.getElementById("ecology-settings-status
 function fillEcologySettingsForm(config: AdminEcologyConfig): void {
   ecologyAnchorBaseTargetInput.value = String(config.anchorBaseTarget);
   ecologyBackgroundBaseTargetInput.value = String(config.backgroundBaseTarget);
-  ecologyRegenMinInput.value = String(config.regenDelayMinMs);
-  ecologyRegenMaxInput.value = String(config.regenDelayMaxMs);
+  ecologyRegenMinInput.value = String(config.regenDelayMinMs / MS_PER_SECOND);
+  ecologyRegenMaxInput.value = String(config.regenDelayMaxMs / MS_PER_SECOND);
   ecologySettingsStatusEl.textContent = `Last saved: ${config.updatedAt}`;
 }
 
@@ -528,8 +534,8 @@ ecologySettingsForm.addEventListener("submit", (e) => {
     const body = {
       anchorBaseTarget: Number(ecologyAnchorBaseTargetInput.value),
       backgroundBaseTarget: Number(ecologyBackgroundBaseTargetInput.value),
-      regenDelayMinMs: Number(ecologyRegenMinInput.value),
-      regenDelayMaxMs: Number(ecologyRegenMaxInput.value),
+      regenDelayMinMs: Math.round(Number(ecologyRegenMinInput.value) * MS_PER_SECOND),
+      regenDelayMaxMs: Math.round(Number(ecologyRegenMaxInput.value) * MS_PER_SECOND),
     };
     const res = await fetch("/api/admin/ecology-config", {
       method: "PUT",

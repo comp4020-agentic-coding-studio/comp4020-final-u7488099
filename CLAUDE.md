@@ -2338,3 +2338,21 @@ formula, does **not** add any new gameplay mechanic, and is **not** Stage
   rewritten), `src/server/index.ts` (3 new admin routes), `public/admin.html`
   + `src/client/admin.ts` (map + settings panel), new
   `spec/ecology-config.test.ts`, extended `spec/admin.test.ts`.
+- **Post-deploy UI fix: the settings form lives inside `#ecology-section`
+  itself, not a separate section** — "Ecology" is the single place to both
+  monitor and tune. Labels were renamed to "Anchor/Background zone target
+  density" and "Minimum/Maximum regeneration delay" for clarity, with a
+  one-line explanation of what an anchor zone vs. a background zone is.
+  **The two delay fields display/edit in seconds; `src/client/admin.ts`
+  converts to/from milliseconds only at `fillEcologySettingsForm`/the
+  submit handler** — `PUT /api/admin/ecology-config` and the
+  `ecology_config` table are unchanged and still speak milliseconds.
+  **The target-density inputs' original `step="0.1"` (combined with
+  `min="0.01"`) was the root cause of the "can't type 30, only 29.91 or
+  30.01" bug**: native number-input stepper validation only accepts
+  `min + n×step`, and floating-point drift in that arithmetic made even
+  those land off-integer. Fixed by setting `step="any"` on every one of
+  these four inputs, which disables native step-mismatch validation
+  entirely while the server's `validateEcologyConfigInput` remains the
+  real bound check — `step="any"` only affects what the browser lets you
+  type/submit, never what the server accepts.
