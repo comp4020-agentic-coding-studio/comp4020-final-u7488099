@@ -753,6 +753,26 @@ export function getWorkersExcludingColony(
     }));
 }
 
+// Stage 12.5B: every worker across every colony, tagged by colonyId — the
+// admin world-monitor's opt-in Units layer. No existing accessor returns
+// "all workers regardless of colony" (getWorkersForColony is scoped to one
+// colony, getWorkersExcludingColony deliberately omits one, getAllWorkerPositions
+// strips everything but x/y for ecology's collision check) so this is a new,
+// narrow, read-only addition — never referenced by any gameplay command path.
+export function getAllWorkersWithColony(): {
+  id: number;
+  colonyId: number;
+  x: number;
+  y: number;
+  caste: Caste;
+  health: number;
+  maxHealth: number;
+}[] {
+  return [...workers.values()]
+    .sort((a, b) => a.id - b.id)
+    .map(({ id, colonyId, x, y, caste, health, maxHealth }) => ({ id, colonyId, x, y, caste, health, maxHealth }));
+}
+
 export function getWorkerCommand(workerId: number): "idle" | "move" | "gather" | "return" | "attack" {
   const worker = workers.get(workerId);
   if (!worker) throw new Error(`no such worker: ${workerId}`);

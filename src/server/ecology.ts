@@ -4,14 +4,10 @@ import {
   BIOMASS_PER_ANCHOR,
   colonySpiralPosition,
   COLONY_PLACEMENT_MARGIN,
-  ECOLOGY_ANCHOR_TARGET_DENSITY,
   ECOLOGY_ANCHOR_ZONE_RADIUS,
   ECOLOGY_BACKGROUND_CELL_SIZE,
-  ECOLOGY_BACKGROUND_TARGET_DENSITY,
   ECOLOGY_DENSITY_WEIGHTS,
   ECOLOGY_QUEEN_EXCLUSION_RADIUS,
-  ECOLOGY_REGEN_DEADLINE_MAX_MS,
-  ECOLOGY_REGEN_DEADLINE_MIN_MS,
   ECOLOGY_TYPE_RARITY,
   GLOBAL_SCARCITY_K,
   GLOBAL_SCARCITY_MAX_MULTIPLIER,
@@ -33,9 +29,10 @@ import {
   WORLD,
 } from "./balance.ts";
 import { db } from "./db.ts";
+import { getEcologyConfig } from "./ecologyConfig.ts";
 import { getAllColonies, getAllWorkerPositions, getCreaturesForWorld, getSpiderPositions, registerCreature } from "./simulation.ts";
 
-type EcologyType = "sugar" | "biomass" | "protein" | "aphid" | "spider";
+export type EcologyType = "sugar" | "biomass" | "protein" | "aphid" | "spider";
 const ECOLOGY_TYPES: EcologyType[] = ["sugar", "biomass", "protein", "aphid", "spider"];
 
 type ZoneKey = `anchor:${number}` | `bg:${number}:${number}`;
@@ -80,6 +77,18 @@ const FINITE_AMOUNT: Record<"sugar" | "biomass" | "protein", number> = {
   protein: PROTEIN_NODE_AMOUNT,
 };
 
+// Static anchor geometry (index/x/y/radius) for the admin world-monitor
+// snapshot — cheap to compute every call (just reads the already-built
+// ANCHOR_CENTERS array), no SQLite involved.
+export function anchorGeometry(): { index: number; x: number; y: number; radius: number }[] {
+  return ANCHOR_CENTERS.map((center, index) => ({
+    index,
+    x: center.x,
+    y: center.y,
+    radius: ECOLOGY_ANCHOR_ZONE_RADIUS,
+  }));
+}
+
 // Pure: classifies a point as its nearest anchor zone (if within radius) or
 // its background grid cell — nearest-anchor-wins when a point falls inside
 // more than one anchor's radius (anchors are far enough apart in practice
@@ -111,7 +120,7 @@ function zoneDefinition(key: ZoneKey): Zone {
       y: center.y,
       radius: ECOLOGY_ANCHOR_ZONE_RADIUS,
       tier: "anchor",
-      baseTarget: ECOLOGY_ANCHOR_TARGET_DENSITY,
+      baseTarget: getEcologyConfig().anchorBaseTarget,
     };
   }
   const [, cxStr, cyStr] = key.split(":");
@@ -123,7 +132,7 @@ function zoneDefinition(key: ZoneKey): Zone {
     y: (cellY + 0.5) * ECOLOGY_BACKGROUND_CELL_SIZE,
     radius: ECOLOGY_BACKGROUND_CELL_SIZE / 2,
     tier: "background",
-    baseTarget: ECOLOGY_BACKGROUND_TARGET_DENSITY,
+    baseTarget: getEcologyConfig().backgroundBaseTarget,
   };
 }
 
@@ -141,7 +150,7 @@ export function isRuinExpired(defeatedAtIso: string | null, nowMs: number = Date
   return nowMs - parsedMs > RUIN_LIFETIME_MS;
 }
 
-function activeExclusionCircles(nowMs: number): { x: number; y: number; radius: number }[] {
+export function activeExclusionCircles(nowMs: number): { x: number; y: number; radius: number }[] {
   return getAllColonies()
     .filter((c) => c.status === "active" || !isRuinExpired(colonyDefeatedAt(c.id), nowMs))
     .map((c) => ({ x: c.x, y: c.y, radius: ECOLOGY_QUEEN_EXCLUSION_RADIUS }));
@@ -170,12 +179,16 @@ function circleOverlapFraction(zone: Zone, exclusion: { x: number; y: number; ra
   return Math.min(1, area / (Math.PI * r1sq));
 }
 
-function effectiveTarget(zone: Zone, exclusions: { x: number; y: number; radius: number }[]): number {
+function maxExclusionOverlap(zone: Zone, exclusions: { x: number; y: number; radius: number }[]): number {
   let maxOverlap = 0;
   for (const exclusion of exclusions) {
     maxOverlap = Math.max(maxOverlap, circleOverlapFraction(zone, exclusion));
   }
-  return zone.baseTarget * (1 - maxOverlap);
+  return maxOverlap;
+}
+
+function effectiveTarget(zone: Zone, exclusions: { x: number; y: number; radius: number }[]): number {
+  return zone.baseTarget * (1 - maxExclusionOverlap(zone, exclusions));
 }
 
 interface ZoneDensity {
@@ -329,7 +342,8 @@ export function setEcologyRng(fn: (() => number) | null): void {
 }
 
 function randomDeadlineMs(): number {
-  return ECOLOGY_REGEN_DEADLINE_MIN_MS + pendingRng() * (ECOLOGY_REGEN_DEADLINE_MAX_MS - ECOLOGY_REGEN_DEADLINE_MIN_MS);
+  const config = getEcologyConfig();
+  return config.regenDelayMinMs + pendingRng() * (config.regenDelayMaxMs - config.regenDelayMinMs);
 }
 
 function countRawEcologyEntities(worldId: number): number {
@@ -420,6 +434,14 @@ export interface EcologyZoneSnapshot {
   density: number;
   target: number;
   pendingMsRemaining: number | null;
+  // Stage 12.5B additions — spatial geometry + breakdown for the admin map's
+  // inspection panel. Additive only; the five fields above are unchanged.
+  x: number;
+  y: number;
+  radius: number;
+  baseTarget: number;
+  counts: Record<EcologyType, number>;
+  exclusionCoverage: number;
 }
 
 // The ~5s tick: measure density per zone, update the pending-deadline map,
@@ -498,7 +520,8 @@ export function getEcologySnapshot(nowMs: number = Date.now()): { anchors: Ecolo
     const key: ZoneKey = `anchor:${i}`;
     const entry = densities.get(key);
     const zone = zoneDefinition(key);
-    const target = effectiveTarget(zone, exclusions);
+    const maxOverlap = maxExclusionOverlap(zone, exclusions);
+    const target = zone.baseTarget * (1 - maxOverlap);
     const deadline = pendingDeadlines.get(key);
     anchors.push({
       key,
@@ -506,6 +529,12 @@ export function getEcologySnapshot(nowMs: number = Date.now()): { anchors: Ecolo
       density: entry?.weighted ?? 0,
       target,
       pendingMsRemaining: deadline === undefined ? null : Math.max(0, deadline - nowMs),
+      x: zone.x,
+      y: zone.y,
+      radius: zone.radius,
+      baseTarget: zone.baseTarget,
+      counts: entry?.counts ?? { sugar: 0, biomass: 0, protein: 0, aphid: 0, spider: 0 },
+      exclusionCoverage: maxOverlap,
     });
   }
 

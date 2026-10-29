@@ -222,7 +222,25 @@ db.exec(`
     active_colony_id INTEGER REFERENCES colonies(id),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  -- Stage 12.5B: a single durable row of admin-tunable ecology knobs.
+  -- CHECK (id = 1) enforces the singleton the same way this codebase already
+  -- relies on "SELECT ... FROM worlds LIMIT 1" elsewhere; defaults mirror
+  -- balance.ts's ECOLOGY_ANCHOR_TARGET_DENSITY / _BACKGROUND_TARGET_DENSITY /
+  -- _REGEN_DEADLINE_MIN_MS / _MAX_MS exactly, so a brand-new row changes
+  -- nothing about ecology behaviour until an admin edits it. See
+  -- ecologyConfig.ts.
+  CREATE TABLE IF NOT EXISTS ecology_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    anchor_base_target REAL NOT NULL DEFAULT 15,
+    background_base_target REAL NOT NULL DEFAULT 1,
+    regen_delay_min_ms INTEGER NOT NULL DEFAULT 15000,
+    regen_delay_max_ms INTEGER NOT NULL DEFAULT 60000,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
+
+db.exec("INSERT OR IGNORE INTO ecology_config (id) VALUES (1)");
 
 seedIfEmpty();
 backfillWorldsCreaturesSeeded();

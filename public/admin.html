@@ -114,6 +114,97 @@
       #unauthorized {
         font-size: 1.1rem;
       }
+      #map-section .map-layout {
+        display: flex;
+        gap: 1rem;
+        flex-wrap: wrap;
+        align-items: flex-start;
+      }
+      #map-canvas-wrap {
+        flex: 1 1 480px;
+        min-width: 320px;
+        position: relative;
+        border: 1px solid #ccc;
+        border-radius: 8px;
+        background: #0d1b0f;
+        aspect-ratio: 1 / 1;
+        max-width: 640px;
+      }
+      #map-canvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+        cursor: grab;
+        border-radius: 8px;
+      }
+      #map-canvas:active {
+        cursor: grabbing;
+      }
+      #map-controls {
+        flex: 0 0 240px;
+        min-width: 220px;
+        font-size: 0.85rem;
+      }
+      #map-controls fieldset {
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        margin-bottom: 0.75rem;
+      }
+      #map-controls label {
+        display: block;
+        margin: 0.25rem 0;
+      }
+      #map-view-buttons button {
+        background: #37474f;
+        color: white;
+        margin: 0.25rem 0.5rem 0.25rem 0;
+      }
+      #map-view-buttons button:hover {
+        background: #263238;
+      }
+      #zone-inspector {
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 0.6rem 0.8rem;
+        font-size: 0.85rem;
+        background: #fafafa;
+      }
+      #zone-inspector dl {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 0.15rem 0.6rem;
+        margin: 0.4rem 0 0 0;
+      }
+      #zone-inspector dt {
+        color: #555;
+      }
+      #zone-inspector dd {
+        margin: 0;
+        font-weight: 600;
+      }
+      #ecology-settings-form {
+        display: grid;
+        grid-template-columns: auto auto;
+        gap: 0.4rem 0.8rem;
+        align-items: center;
+        max-width: 420px;
+        font-size: 0.9rem;
+      }
+      #ecology-settings-form input {
+        width: 8rem;
+        padding: 0.25rem 0.4rem;
+      }
+      #ecology-settings-save {
+        background: #2e7d32;
+        color: white;
+      }
+      #ecology-settings-save:hover {
+        background: #1b5e20;
+      }
+      #ecology-settings-status {
+        font-size: 0.85rem;
+        color: #555;
+      }
     </style>
   </head>
   <body>
@@ -130,6 +221,39 @@
       <section id="stats-section">
         <h2>World stats</h2>
         <div id="stats-grid"></div>
+      </section>
+
+      <section id="map-section">
+        <h2>World map (monitoring only)</h2>
+        <p>
+          A read-only, admin-only view of the live world. Panning/zooming only change what you see here — nothing on
+          this map can issue a gameplay command.
+        </p>
+        <div class="map-layout">
+          <div id="map-canvas-wrap">
+            <canvas id="map-canvas"></canvas>
+          </div>
+          <div id="map-controls">
+            <div id="map-view-buttons">
+              <button id="map-fit-world" type="button">Fit World</button>
+              <button id="map-reset-view" type="button">Reset View</button>
+            </div>
+            <fieldset>
+              <legend>Layers</legend>
+              <label><input type="checkbox" id="layer-ecology" checked /> Ecology zones</label>
+              <label><input type="checkbox" id="layer-resources" checked /> Resources</label>
+              <label><input type="checkbox" id="layer-creatures" checked /> Creatures</label>
+              <label><input type="checkbox" id="layer-colonies" checked /> Colonies / queens</label>
+              <label><input type="checkbox" id="layer-exclusions" checked /> Exclusion areas</label>
+              <label><input type="checkbox" id="layer-ruins" checked /> Ruins</label>
+              <label><input type="checkbox" id="layer-units" /> Units (off by default)</label>
+            </fieldset>
+            <div id="zone-inspector">
+              <strong>No zone selected</strong>
+              <p style="margin: 0.3rem 0 0 0; color: #666">Click an anchor zone on the map, or a row in the Ecology table below.</p>
+            </div>
+          </div>
+        </div>
       </section>
 
       <section id="accounts-section">
@@ -188,6 +312,29 @@
           <tbody id="ecology-anchors-body"></tbody>
         </table>
         <p id="ecology-background-summary"></p>
+
+        <h3>Ecology settings</h3>
+        <p>
+          These four values control future ecology ticks only — saving never resets or reseeds the world, and never
+          touches existing resource nodes, creatures, or colonies.
+        </p>
+        <form id="ecology-settings-form">
+          <label for="ecology-anchor-base-target">Anchor base density target</label>
+          <input id="ecology-anchor-base-target" type="number" step="0.1" min="0.01" required />
+
+          <label for="ecology-background-base-target">Background base density target</label>
+          <input id="ecology-background-base-target" type="number" step="0.1" min="0.01" required />
+
+          <label for="ecology-regen-min">Minimum regen delay (ms)</label>
+          <input id="ecology-regen-min" type="number" step="100" min="1000" required />
+
+          <label for="ecology-regen-max">Maximum regen delay (ms)</label>
+          <input id="ecology-regen-max" type="number" step="100" min="1000" required />
+
+          <span></span>
+          <button id="ecology-settings-save" type="submit">Save</button>
+        </form>
+        <p id="ecology-settings-status"></p>
       </section>
 
       <section id="danger-zone">

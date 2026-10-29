@@ -4,8 +4,9 @@ import { WebSocket, WebSocketServer } from "ws";
 import { abandon, reproduce, selectEvolution } from "./actions.ts";
 import { login, logout, peekIdentity, register, resetProgress, resolveIdentity } from "./auth.ts";
 import { ECOLOGY_EVAL_INTERVAL_MS, SIMULATION } from "./balance.ts";
-import { getAllAccounts, getColonyForSession, resetProductionWorld } from "./db.ts";
-import { advanceEcology, getEcologySnapshot } from "./ecology.ts";
+import { db, getAllAccounts, getColonyForSession, resetProductionWorld } from "./db.ts";
+import { activeExclusionCircles, advanceEcology, anchorGeometry, getEcologySnapshot } from "./ecology.ts";
+import { getEcologyConfig, setEcologyConfig, validateEcologyConfigInput } from "./ecologyConfig.ts";
 import { getLog, logAction } from "./log.ts";
 import { resolveOrCreateColony, SESSION_COOKIE, startNewColony } from "./sessions.ts";
 import {
@@ -15,6 +16,8 @@ import {
   consumeDirty,
   defeatColony,
   getAllColonies,
+  getAllWorkersWithColony,
+  getCreaturesForWorld,
   issueAttackCommand,
   issueGatherCommand,
   issueMoveCommand,
@@ -259,6 +262,85 @@ app.get("/api/admin/log", requireAdmin, (_req, res) => {
 // visibility into per-zone density/target/pending-regen state.
 app.get("/api/admin/ecology", requireAdmin, (_req, res) => {
   res.json(getEcologySnapshot());
+});
+
+// Stage 12.5B: the admin map's single data source. Deliberately not a
+// reuse/extension of GET /api/state — that route is per-colony (resources,
+// evolution, reproduce costs), while this one is world-scoped and
+// read-only. Cost is O(resourceNodes + creatures + colonies), one query
+// each, same shape as getState's own queries — no per-zone SQLite round
+// trip and no per-frame recomputation (the admin client polls this on a
+// ~1.5s timer, not per animation frame). Units (workers) are the one
+// potentially large, growing dataset, so they're only included when the
+// client explicitly asks via ?units=1 — satisfies "Units should default
+// OFF for performance" at the network layer, not just the render layer.
+app.get("/api/admin/world-monitor", requireAdmin, (req, res) => {
+  const world = db.prepare("SELECT id, width, height FROM worlds LIMIT 1").get() as
+    | { id: number; width: number; height: number }
+    | undefined;
+  if (!world) {
+    res.status(404).json({ error: "no world seeded" });
+    return;
+  }
+  const resourceNodes = db
+    .prepare("SELECT id, x, y, resource_type AS resourceType, kind FROM resource_nodes WHERE world_id = ? ORDER BY id")
+    .all(world.id) as { id: number; x: number; y: number; resourceType: string; kind: "source" | "item" }[];
+  const payload: Record<string, unknown> = {
+    world: { width: world.width, height: world.height },
+    anchors: anchorGeometry(),
+    resourceNodes,
+    creatures: getCreaturesForWorld(world.id),
+    colonies: getAllColonies(),
+    exclusions: activeExclusionCircles(Date.now()),
+  };
+  if (req.query.units === "1") {
+    payload.workers = getAllWorkersWithColony();
+  }
+  res.json(payload);
+});
+
+app.get("/api/admin/ecology-config", requireAdmin, (_req, res) => {
+  res.json(getEcologyConfig());
+});
+
+// Stage 12.5B: the only write path for the four persisted ecology knobs
+// (see ecologyConfig.ts for exactly which four, and CLAUDE.md for why no
+// others are exposed here). Validated and rejected atomically — never a
+// partial write — and logged with a human-readable before/after detail
+// object, same colonyId=0 "world-scoped action" convention admin_reset_world
+// already established. Saving this config never touches worlds/colonies/
+// resource_nodes/creatures — it only changes what future ecology ticks
+// target, never resets or reseeds anything that already exists.
+app.put("/api/admin/ecology-config", requireAdmin, (req, res) => {
+  const body = (req.body ?? {}) as Partial<Record<"anchorBaseTarget" | "backgroundBaseTarget" | "regenDelayMinMs" | "regenDelayMaxMs", unknown>>;
+  const error = validateEcologyConfigInput(body);
+  if (error) {
+    res.status(400).json({ error });
+    return;
+  }
+  const input = {
+    anchorBaseTarget: body.anchorBaseTarget as number,
+    backgroundBaseTarget: body.backgroundBaseTarget as number,
+    regenDelayMinMs: body.regenDelayMinMs as number,
+    regenDelayMaxMs: body.regenDelayMaxMs as number,
+  };
+  const before = getEcologyConfig();
+  const after = setEcologyConfig(input);
+  logAction(
+    0,
+    "admin_update_ecology_config",
+    {
+      from: {
+        anchorBaseTarget: before.anchorBaseTarget,
+        backgroundBaseTarget: before.backgroundBaseTarget,
+        regenDelayMinMs: before.regenDelayMinMs,
+        regenDelayMaxMs: before.regenDelayMaxMs,
+      },
+      to: input,
+    },
+    req.accountId ?? undefined,
+  );
+  res.json(after);
 });
 
 // Reuses the exact same idempotent defeatColony() pipeline every other

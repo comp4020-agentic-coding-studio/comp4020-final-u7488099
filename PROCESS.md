@@ -1264,6 +1264,40 @@ to defend out loud, not one an agent made for me. I picked concurrent
 mutation semantics because it was the one I could verify rather than just
 assert.
 
+## Stage 12.5B: why an admin map, not just better numbers
+
+Stage 12.5A fixed finite-resource depletion; what it exposed was that the
+only admin-facing view into Stage 12's ecology director was a flat table of
+ten `anchor:N` rows — density, target, pending-regen, nothing spatial. When
+several anchors read an effective target of exactly `0.0`, that table alone
+couldn't answer whether it was a real bug or an expected consequence of
+where things happened to be standing in the world; answering that required
+reading `ecology.ts` directly, which isn't something every admin session
+should need to do. The fix wasn't to change the formula — it was read in
+full, and the zero-target rows turned out to be the correct, intended
+behavior of `effectiveTarget()`'s circle-overlap exclusion math: whichever
+of the first ten colonies ever founded happens to sit on (or within) its
+own anchor's circle, its exclusion ring fully contains that anchor and
+drives the target to zero by design, not by defect. A table of numbers
+can't make that visible; a map with exclusion circles drawn on it can, at a
+glance. So Stage 12.5B's actual deliverable was spatial legibility of a
+system that already existed, plus a durable way to tune its four most
+meaningful constants (anchor/background density targets, regen delay
+bounds) without a code change and redeploy for every balance experiment.
+
+Two things were deliberately kept narrow. First, the map is read-only by
+construction, not by convention — `src/client/admin.ts` has no import of
+any gameplay-mutation route, verified both by hand and by a test that
+esbuild-bundles the file and great-circle-greps the output for those route
+strings, so a future accidental wiring-up would fail CI rather than ship
+quietly. Second, only the four values the spec named are exposed through
+the new settings panel; `MAX_ECOLOGY_ENTITIES`, the rarity/scarcity
+coefficients, desired species populations, entity weights, and spawn retry
+limits stay code-only constants in `balance.ts`. The map is a window into
+the simulation's state, not a second control surface for its deeper
+balance — that distinction mattered enough to hold even though technically
+nothing stopped exposing the rest.
+
 ## What's left unverified
 
 The client's DOM rendering is manually reasoned through and checked against

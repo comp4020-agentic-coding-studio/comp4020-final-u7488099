@@ -2222,3 +2222,119 @@ not the same node refilling.
   query), the authoritative in-memory server state, and `/api/state`'s
   client-visible payload. See `PROCESS.md` for the full narrative and the
   exact evidence captured.
+
+## Stage 12.5B: ecology admin console (monitoring map + persistent tuning knobs)
+
+Stage 12.5A's finite-resource fix (above) made individual node depletion
+correct, but the only admin visibility into Stage 12's ecology director
+remained `GET /api/admin/ecology`'s flat table of `anchor:0`..`anchor:9`
+numbers — no spatial context, and no way to distinguish "mathematically
+fine" from "a real bug" without reading source. Stage 12.5B adds a
+read-only, admin-only interactive world map and a small set of durable,
+admin-editable ecology tuning knobs. It does **not** touch the ecology
+formula, does **not** add any new gameplay mechanic, and is **not** Stage
+13 — purely observability and tuning for what Stage 12 already does.
+
+- **The admin map is monitoring-only — it has no gameplay-mutation code
+  path at all, by construction, not by a runtime check.** `src/client/admin.ts`
+  never imports or references any gameplay-command endpoint
+  (`/api/command/*`, `/api/reproduce`, `/api/evolve`, `/api/start-new-colony`,
+  `/api/abandon`); the only fetches in that module are to `/api/admin/*` and
+  `/api/session`. This is enforced by a dedicated test in `spec/admin.test.ts`
+  that esbuild-bundles `src/client/admin.ts` exactly as `build:client` does
+  and asserts none of those route strings appear anywhere in the output —
+  catching a future accidental import, not just a hand-reviewed one. The
+  map's camera (`{x,y,zoom}`, `worldToScreen`/`screenToWorld`, drag-to-pan,
+  wheel-zoom-to-cursor, Fit World/Reset View) is freshly written and scoped
+  to `admin.ts` — deliberately **not** a refactor or import of `main.ts`'s
+  gameplay camera, which is pan-only and wired to move/gather/attack click
+  handlers that must never be reachable from `/admin`.
+- **New read-only snapshot endpoint, `GET /api/admin/world-monitor`**,
+  purpose-built for the map: world bounds, static anchor geometry (10
+  `{index,x,y,radius}` entries, computed once from `colonySpiralPosition` —
+  no SQLite round trip), resource nodes, creatures, colonies (reusing
+  `getAllColonies()`, already unfiltered), and active exclusion circles
+  (`activeExclusionCircles()`, newly exported from `ecology.ts` — same
+  function `advanceEcology()` already calls each tick, not duplicated
+  logic). Units (workers) are included only behind `?units=1`, so a client
+  with the Units layer off (its default state) never pays the cost of
+  `getAllWorkersWithColony()` — the "Units default OFF for performance"
+  requirement is enforced at the network layer, not just the render layer.
+- **`GET /api/admin/ecology`'s `EcologyZoneSnapshot` gained six fields,
+  additively — `x`, `y`, `radius`, `baseTarget`, `counts`, and
+  `exclusionCoverage`** (the exact `maxOverlap` value `effectiveTarget()`
+  already computed internally, now surfaced rather than re-derived) —
+  alongside the original Stage 12 `key`/`tier`/`density`/`target`/
+  `pendingMsRemaining` fields, which are unchanged. This lets the admin
+  map's zone-inspection panel render from a single snapshot call with no
+  second round trip.
+- **Persistent ecology configuration lives in a new singleton table,
+  `ecology_config`** (`CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE`,
+  same pattern as the existing `worlds` table) — exactly four admin-tunable
+  values: `anchor_base_target`, `background_base_target`,
+  `regen_delay_min_ms`, `regen_delay_max_ms`. Defaults match Stage 12's own
+  `ECOLOGY_ANCHOR_TARGET_DENSITY`/`ECOLOGY_BACKGROUND_TARGET_DENSITY`/
+  `ECOLOGY_REGEN_DEADLINE_MIN_MS`/`_MAX_MS` constants exactly, so a brand-new
+  row changes nothing about ecology behavior until an admin explicitly
+  edits it. `src/server/ecologyConfig.ts` caches the config in memory
+  (`getEcologyConfig()`), refreshing only on an explicit admin write — so
+  neither the 5s `advanceEcology()` tick nor a ~1.5s admin poll pays a
+  SQLite read for four numbers that almost never change.
+  `zoneDefinition()`/`randomDeadlineMs()` in `ecology.ts` read from this
+  accessor instead of the raw `balance.ts` constants; `balance.ts`'s
+  constants remain as documented defaults, not deleted.
+- **`GET`/`PUT /api/admin/ecology-config`** are the only read/write surface
+  for those four values. `PUT` validates atomically before writing (all
+  four finite numbers; `anchorBaseTarget`/`backgroundBaseTarget > 0`;
+  both delays `>= 1000`ms; `regenDelayMinMs <= regenDelayMaxMs`) — a
+  rejected update never partially writes — then updates the row, refreshes
+  the cache, logs a human-readable `admin_update_ecology_config` action
+  (colonyId `0`, the same "world-scoped action" convention
+  `admin_reset_world` already uses), and responds with the
+  server-authoritative saved row. **Saving this config never resets,
+  reseeds, or touches any existing world/colony/resource-node/creature
+  row** — it only changes what *future* ecology ticks target.
+- **Deliberately narrow in scope: `MAX_ECOLOGY_ENTITIES`, rarity
+  coefficients, global scarcity `K`/`G_MAX`, desired species populations,
+  entity weights, and spawn retry limits all remain code-only constants in
+  `balance.ts` by design** — not exposed through this or any other admin
+  UI. Only the four values the spec called out are durable/admin-editable;
+  everything else that shapes ecology balance still requires a code change
+  and redeploy.
+- **All three new/changed routes sit behind the existing `requireAdmin`
+  middleware** — zero new auth code. `req.role` is resolved server-side
+  from the session's account row on every request; client-submitted admin
+  identity is never trusted anywhere in this feature.
+- **Realtime updates are polling, not a new WebSocket channel.** The admin
+  page's `setInterval(() => void refreshMonitor(), 1500)` is fully
+  independent of `/ws` and `connectionSessionIds` — zero risk to the
+  gameplay WebSocket architecture.
+- **Zero-target-anchor investigation verdict: not a bug.** Reading
+  `src/server/ecology.ts` confirmed `effectiveTarget()` takes the
+  **maximum** exclusion-overlap fraction across all active/non-expired
+  ruins — never a sum, so there is no double-counting/stacking defect.
+  `circleOverlapFraction()` is a correct circle-circle lens-intersection
+  area formula, capped at `1.0`. The `0.0` readings on some anchors are a
+  legitimate emergent consequence of `colonySpiralPosition(index)` being
+  the single function used both to place the 10 ecology anchor centers and
+  to place new colonies' queens (`pickSpawnPosition`, starting at
+  `index = COUNT(*) FROM colonies`): whichever "founding" colony (one of
+  the first 10 ever created) is still active or within its
+  `RUIN_LIFETIME_MS` ruin window sits at distance 0 from its own anchor,
+  which short-circuits `circleOverlapFraction` to full containment
+  (`1.0`) via the `d <= |r1-r2|` branch, driving `effectiveTarget` to
+  exactly `0.0`. This is a documented approximation (a fully-nested
+  exclusion circle is treated as 100% suppression even though the true
+  area ratio for a 250-inside-300 circle pair is only `~69%`), not a bug —
+  and is consistent with Stage 12's own original design rationale that a
+  zone mostly inside a thriving colony's exclusion ring should expect less
+  of itself. **The ecology formula was read, extended with new output
+  fields, and left otherwise unchanged** — the admin map's exclusion-circle
+  layer is specifically designed to make this mechanism visually obvious at
+  a glance (a queen sitting on or near an anchor's center visibly engulfs
+  it).
+- **Files**: `src/server/db.ts` (new `ecology_config` table), new
+  `src/server/ecologyConfig.ts`, `src/server/ecology.ts` (extended, not
+  rewritten), `src/server/index.ts` (3 new admin routes), `public/admin.html`
+  + `src/client/admin.ts` (map + settings panel), new
+  `spec/ecology-config.test.ts`, extended `spec/admin.test.ts`.
