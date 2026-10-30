@@ -205,6 +205,10 @@
         font-size: 0.85rem;
         color: #555;
       }
+      .anchor-base-target-input {
+        width: 6rem;
+        padding: 0.2rem 0.35rem;
+      }
     </style>
   </head>
   <body>
@@ -303,9 +307,6 @@
         </p>
 
         <form id="ecology-settings-form">
-          <label for="ecology-anchor-base-target">Anchor zone target density</label>
-          <input id="ecology-anchor-base-target" type="number" step="any" min="0.01" required />
-
           <label for="ecology-background-base-target">Background zone target density</label>
           <input id="ecology-background-base-target" type="number" step="any" min="0.01" required />
 
@@ -320,20 +321,22 @@
         </form>
         <p id="ecology-settings-status"></p>
         <p>
-          These four values control future ecology ticks only — saving never resets or reseeds the world, and never
-          touches existing resource nodes, creatures, or colonies.
+          Each anchor's base target is edited directly in its table row below, and is saved by the same Save button
+          above — one explicit save covers the whole table plus the background/delay settings. Saving never resets
+          or reseeds the world, and never touches existing resource nodes, creatures, or colonies.
         </p>
 
         <p>
-          Live snapshot of Stage 12's zone density/regen state, computed on demand — nothing in the table below is
-          stored.
+          Live snapshot of Stage 12's zone density/regen state, computed on demand — only the Base target column is
+          stored; everything else in the table below is derived fresh on every load.
         </p>
         <table>
           <thead>
             <tr>
               <th>Zone</th>
               <th>Density</th>
-              <th>Target</th>
+              <th>Effective target</th>
+              <th>Base target</th>
               <th>Pending regen</th>
             </tr>
           </thead>

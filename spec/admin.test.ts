@@ -265,25 +265,28 @@ it.skipIf(!ADMIN_USERNAME || !ADMIN_PASSWORD)(
     const admin = await adminSession();
 
     const before = await (await admin("/api/admin/ecology-config")).json();
-    expect(Object.keys(before).sort()).toEqual(["anchorBaseTarget", "backgroundBaseTarget", "regenDelayMaxMs", "regenDelayMinMs", "updatedAt"]);
+    expect(Object.keys(before).sort()).toEqual(["anchorBaseTargets", "backgroundBaseTarget", "regenDelayMaxMs", "regenDelayMinMs", "updatedAt"]);
+    expect(Array.isArray(before.anchorBaseTargets)).toBe(true);
+    expect(before.anchorBaseTargets.length).toBe(10);
 
     // Invalid: min > max. Must be rejected, and must not alter the stored config.
     const invalidRes = await admin("/api/admin/ecology-config", {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ anchorBaseTarget: 10, backgroundBaseTarget: 1, regenDelayMinMs: 9000, regenDelayMaxMs: 1000 }),
+      body: JSON.stringify({ anchorBaseTargets: before.anchorBaseTargets, backgroundBaseTarget: 1, regenDelayMinMs: 9000, regenDelayMaxMs: 1000 }),
     });
     expect(invalidRes.status).toBe(400);
     const invalidBody = await invalidRes.json();
     expect(typeof invalidBody.error).toBe("string");
     const afterInvalid = await (await admin("/api/admin/ecology-config")).json();
-    expect(afterInvalid.anchorBaseTarget).toBe(before.anchorBaseTarget);
+    expect(afterInvalid.anchorBaseTargets).toEqual(before.anchorBaseTargets);
     expect(afterInvalid.regenDelayMinMs).toBe(before.regenDelayMinMs);
 
     // Valid: round-trips and is immediately reflected in a subsequent GET —
     // restored to the original values afterward so this test doesn't leak
     // config state into any other test in the shared dev DB.
-    const validInput = { anchorBaseTarget: 12.5, backgroundBaseTarget: 1.5, regenDelayMinMs: 16000, regenDelayMaxMs: 61000 };
+    const validAnchorBaseTargets = before.anchorBaseTargets.map((_: number, i: number) => 10 + i);
+    const validInput = { anchorBaseTargets: validAnchorBaseTargets, backgroundBaseTarget: 1.5, regenDelayMinMs: 16000, regenDelayMaxMs: 61000 };
     const validRes = await admin("/api/admin/ecology-config", {
       method: "PUT",
       headers: { "content-type": "application/json" },
@@ -291,20 +294,20 @@ it.skipIf(!ADMIN_USERNAME || !ADMIN_PASSWORD)(
     });
     expect(validRes.status).toBe(200);
     const saved = await validRes.json();
-    expect(saved.anchorBaseTarget).toBe(validInput.anchorBaseTarget);
+    expect(saved.anchorBaseTargets).toEqual(validInput.anchorBaseTargets);
     expect(saved.backgroundBaseTarget).toBe(validInput.backgroundBaseTarget);
     expect(saved.regenDelayMinMs).toBe(validInput.regenDelayMinMs);
     expect(saved.regenDelayMaxMs).toBe(validInput.regenDelayMaxMs);
     expect(typeof saved.updatedAt).toBe("string");
 
     const afterValid = await (await admin("/api/admin/ecology-config")).json();
-    expect(afterValid.anchorBaseTarget).toBe(validInput.anchorBaseTarget);
+    expect(afterValid.anchorBaseTargets).toEqual(validInput.anchorBaseTargets);
 
     const restoreRes = await admin("/api/admin/ecology-config", {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        anchorBaseTarget: before.anchorBaseTarget,
+        anchorBaseTargets: before.anchorBaseTargets,
         backgroundBaseTarget: before.backgroundBaseTarget,
         regenDelayMinMs: before.regenDelayMinMs,
         regenDelayMaxMs: before.regenDelayMaxMs,
@@ -321,10 +324,11 @@ it.skipIf(!ADMIN_USERNAME || !ADMIN_PASSWORD)(
     const before = await (await admin("/api/admin/ecology-config")).json();
     const statsBefore = await (await admin("/api/admin/stats")).json();
 
+    const touchedAnchorBaseTargets = before.anchorBaseTargets.map((v: number) => v + 1);
     await admin("/api/admin/ecology-config", {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ anchorBaseTarget: 16, backgroundBaseTarget: 1.1, regenDelayMinMs: 15500, regenDelayMaxMs: 60500 }),
+      body: JSON.stringify({ anchorBaseTargets: touchedAnchorBaseTargets, backgroundBaseTarget: 1.1, regenDelayMinMs: 15500, regenDelayMaxMs: 60500 }),
     });
 
     // A save legitimately appends one action_log row (the human-readable
@@ -340,7 +344,7 @@ it.skipIf(!ADMIN_USERNAME || !ADMIN_PASSWORD)(
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        anchorBaseTarget: before.anchorBaseTarget,
+        anchorBaseTargets: before.anchorBaseTargets,
         backgroundBaseTarget: before.backgroundBaseTarget,
         regenDelayMinMs: before.regenDelayMinMs,
         regenDelayMaxMs: before.regenDelayMaxMs,

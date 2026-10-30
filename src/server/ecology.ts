@@ -29,7 +29,7 @@ import {
   WORLD,
 } from "./balance.ts";
 import { db } from "./db.ts";
-import { getEcologyConfig } from "./ecologyConfig.ts";
+import { getAnchorBaseTarget, getEcologyConfig } from "./ecologyConfig.ts";
 import { getAllColonies, getAllWorkerPositions, getCreaturesForWorld, getSpiderPositions, registerCreature } from "./simulation.ts";
 
 export type EcologyType = "sugar" | "biomass" | "protein" | "aphid" | "spider";
@@ -120,7 +120,7 @@ function zoneDefinition(key: ZoneKey): Zone {
       y: center.y,
       radius: ECOLOGY_ANCHOR_ZONE_RADIUS,
       tier: "anchor",
-      baseTarget: getEcologyConfig().anchorBaseTarget,
+      baseTarget: getAnchorBaseTarget(index),
     };
   }
   const [, cxStr, cyStr] = key.split(":");

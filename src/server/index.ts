@@ -303,23 +303,26 @@ app.get("/api/admin/ecology-config", requireAdmin, (_req, res) => {
   res.json(getEcologyConfig());
 });
 
-// Stage 12.5B: the only write path for the four persisted ecology knobs
-// (see ecologyConfig.ts for exactly which four, and CLAUDE.md for why no
-// others are exposed here). Validated and rejected atomically — never a
+// Stage 12.5B: the only write path for the persisted ecology knobs (ten
+// independent per-anchor base targets plus background/regen min/max — see
+// ecologyConfig.ts for exactly which, and CLAUDE.md for why no others are
+// exposed here). Validated and rejected atomically — never a
 // partial write — and logged with a human-readable before/after detail
 // object, same colonyId=0 "world-scoped action" convention admin_reset_world
 // already established. Saving this config never touches worlds/colonies/
 // resource_nodes/creatures — it only changes what future ecology ticks
 // target, never resets or reseeds anything that already exists.
 app.put("/api/admin/ecology-config", requireAdmin, (req, res) => {
-  const body = (req.body ?? {}) as Partial<Record<"anchorBaseTarget" | "backgroundBaseTarget" | "regenDelayMinMs" | "regenDelayMaxMs", unknown>>;
+  const body = (req.body ?? {}) as Partial<
+    Record<"anchorBaseTargets" | "backgroundBaseTarget" | "regenDelayMinMs" | "regenDelayMaxMs", unknown>
+  >;
   const error = validateEcologyConfigInput(body);
   if (error) {
     res.status(400).json({ error });
     return;
   }
   const input = {
-    anchorBaseTarget: body.anchorBaseTarget as number,
+    anchorBaseTargets: body.anchorBaseTargets as number[],
     backgroundBaseTarget: body.backgroundBaseTarget as number,
     regenDelayMinMs: body.regenDelayMinMs as number,
     regenDelayMaxMs: body.regenDelayMaxMs as number,
@@ -331,7 +334,7 @@ app.put("/api/admin/ecology-config", requireAdmin, (req, res) => {
     "admin_update_ecology_config",
     {
       from: {
-        anchorBaseTarget: before.anchorBaseTarget,
+        anchorBaseTargets: before.anchorBaseTargets,
         backgroundBaseTarget: before.backgroundBaseTarget,
         regenDelayMinMs: before.regenDelayMinMs,
         regenDelayMaxMs: before.regenDelayMaxMs,

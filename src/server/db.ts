@@ -10,6 +10,7 @@ import {
   QUEEN_MAX_HEALTH,
   RESOURCE_NODES,
   RESOURCE_TYPES,
+  SPAWN_ANCHOR_COUNT,
   SPECIES_MAX_HEALTH,
   SPIDER_SEED_POSITIONS,
   STARTING_PROTEIN,
@@ -238,6 +239,23 @@ db.exec(`
     regen_delay_max_ms INTEGER NOT NULL DEFAULT 60000,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  -- Stage 12.5B follow-up: each of the SPAWN_ANCHOR_COUNT anchors gets its
+  -- own independently configurable base target, replacing the single shared
+  -- ecology_config.anchor_base_target for anchor ecology (that column is
+  -- left in place, unread by anchor ecology from here on, purely so an old
+  -- row shape never needs an ALTER/DROP). One row per anchor index — a
+  -- per-anchor table rather than ten hardcoded columns, since the anchor
+  -- count is itself a balance.ts constant, not a fixed schema fact.
+  -- seedEcologyAnchorConfig() below seeds all rows the first time this table
+  -- is empty, copying the then-current ecology_config.anchor_base_target so
+  -- a deploy of this change never rebalances a live world. See
+  -- ecologyConfig.ts.
+  CREATE TABLE IF NOT EXISTS ecology_anchor_config (
+    anchor_index INTEGER PRIMARY KEY,
+    base_target REAL NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
 
 db.exec("INSERT OR IGNORE INTO ecology_config (id) VALUES (1)");
@@ -249,7 +267,30 @@ backfillCreatureHealth();
 backfillWorkerHealth();
 backfillColonyLifecycle();
 backfillColonyEvolution();
+seedEcologyAnchorConfig();
 bootstrapAdminAccount();
+
+// Stage 12.5B follow-up: production-safe migration. Only acts the very
+// first time ecology_anchor_config is empty (a brand-new table on an
+// existing, already-deployed DB, or a fresh DB entirely) — seeds all
+// SPAWN_ANCHOR_COUNT rows from the single value already configured in
+// ecology_config.anchor_base_target, so an admin's prior global setting
+// (or the Stage 12 default) becomes every anchor's starting independent
+// value with zero immediate change in behaviour. Never touches worlds,
+// colonies, workers, resource_nodes, or creatures.
+function seedEcologyAnchorConfig(): void {
+  const { count } = db.prepare("SELECT COUNT(*) AS count FROM ecology_anchor_config").get() as { count: number };
+  if (count > 0) return;
+  const row = db.prepare("SELECT anchor_base_target AS anchorBaseTarget FROM ecology_config WHERE id = 1").get() as
+    | { anchorBaseTarget: number }
+    | undefined;
+  const baseTarget = row?.anchorBaseTarget ?? 15;
+  const insert = db.prepare("INSERT INTO ecology_anchor_config (anchor_index, base_target) VALUES (?, ?)");
+  const insertAll = db.transaction(() => {
+    for (let i = 0; i < SPAWN_ANCHOR_COUNT; i++) insert.run(i, baseTarget);
+  });
+  insertAll();
+}
 
 // Pre-Stage-1 deployments have a `colonies` table from the Crit 8/9 schema:
 // integer grid coordinates, a flat `protein` column, no `world_id`. That

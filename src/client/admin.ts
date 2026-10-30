@@ -71,7 +71,7 @@ interface AdminEcologySnapshot {
 }
 
 interface AdminEcologyConfig {
-  anchorBaseTarget: number;
+  anchorBaseTargets: number[];
   backgroundBaseTarget: number;
   regenDelayMinMs: number;
   regenDelayMaxMs: number;
@@ -505,18 +505,25 @@ async function refreshMonitor(): Promise<void> {
 const MS_PER_SECOND = 1000;
 
 const ecologySettingsForm = document.getElementById("ecology-settings-form") as HTMLFormElement;
-const ecologyAnchorBaseTargetInput = document.getElementById("ecology-anchor-base-target") as HTMLInputElement;
 const ecologyBackgroundBaseTargetInput = document.getElementById("ecology-background-base-target") as HTMLInputElement;
 const ecologyRegenMinInput = document.getElementById("ecology-regen-min") as HTMLInputElement;
 const ecologyRegenMaxInput = document.getElementById("ecology-regen-max") as HTMLInputElement;
 const ecologySettingsStatusEl = document.getElementById("ecology-settings-status") as HTMLParagraphElement;
 
+// Fills the remaining settings-form fields and every per-anchor table input
+// (table inputs are keyed by index, same map renderEcology populates) — the
+// single source of truth refilled on both initial load and after a
+// successful save, per the "server is authoritative" discipline.
 function fillEcologySettingsForm(config: AdminEcologyConfig): void {
-  ecologyAnchorBaseTargetInput.value = String(config.anchorBaseTarget);
   ecologyBackgroundBaseTargetInput.value = String(config.backgroundBaseTarget);
   ecologyRegenMinInput.value = String(config.regenDelayMinMs / MS_PER_SECOND);
   ecologyRegenMaxInput.value = String(config.regenDelayMaxMs / MS_PER_SECOND);
   ecologySettingsStatusEl.textContent = `Last saved: ${config.updatedAt}`;
+  dirtyAnchorIndices.clear();
+  config.anchorBaseTargets.forEach((value, index) => {
+    const input = anchorBaseTargetInputs.get(index);
+    if (input) input.value = String(value);
+  });
 }
 
 async function loadEcologyConfig(): Promise<void> {
@@ -525,14 +532,20 @@ async function loadEcologyConfig(): Promise<void> {
   fillEcologySettingsForm(await res.json());
 }
 
-// Explicit Save action only — no per-keystroke writes, per spec. Server is
-// authoritative: on success the form is refilled from the server's own echo
-// of the saved row, never from the values the form already had.
+// Explicit Save action only — no per-keystroke writes, per spec. Covers
+// both the three remaining form fields and all per-anchor base-target
+// inputs in the table as one atomic PUT. Server is authoritative: on
+// success every field (form + table) is refilled from the server's own
+// echo of the saved row, never from the values already in the inputs.
 ecologySettingsForm.addEventListener("submit", (e) => {
   e.preventDefault();
   void (async () => {
+    const anchorBaseTargets: number[] = [];
+    for (let i = 0; i < anchorBaseTargetInputs.size; i++) {
+      anchorBaseTargets.push(Number(anchorBaseTargetInputs.get(i)?.value ?? NaN));
+    }
     const body = {
-      anchorBaseTarget: Number(ecologyAnchorBaseTargetInput.value),
+      anchorBaseTargets,
       backgroundBaseTarget: Number(ecologyBackgroundBaseTargetInput.value),
       regenDelayMinMs: Math.round(Number(ecologyRegenMinInput.value) * MS_PER_SECOND),
       regenDelayMaxMs: Math.round(Number(ecologyRegenMaxInput.value) * MS_PER_SECOND),
@@ -608,22 +621,56 @@ function renderLog(entries: AdminLogEntry[]): void {
     .join("");
 }
 
-function renderEcology(snapshot: AdminEcologySnapshot): void {
-  ecologyAnchorsBodyEl.innerHTML = snapshot.anchors
-    .map((a) => {
-      const pending = a.pendingMsRemaining === null ? "—" : `${Math.ceil(a.pendingMsRemaining / 1000)}s`;
-      return `<tr data-zone-key="${escapeHtml(a.key)}" style="cursor:pointer">
-        <td>${escapeHtml(a.key)}</td>
-        <td>${a.density.toFixed(1)}</td>
-        <td>${a.target.toFixed(1)}</td>
-        <td>${pending}</td>
-      </tr>`;
-    })
-    .join("");
+// Base target inputs live inside a table that re-renders on every ~1.5s
+// monitor poll (renderEcology is called from refreshMonitor) — rebuilding
+// the whole tbody via innerHTML every poll would wipe out an in-progress
+// edit and steal focus mid-keystroke. So rows/inputs are created once per
+// anchor index and updated in place afterward, and an input's value is only
+// overwritten from the server snapshot when the admin isn't actively
+// editing it (not focused, and not "dirty" since the last load/save).
+const anchorBaseTargetInputs = new Map<number, HTMLInputElement>();
+const dirtyAnchorIndices = new Set<number>();
 
-  ecologyAnchorsBodyEl.querySelectorAll<HTMLTableRowElement>("tr[data-zone-key]").forEach((row) => {
-    row.addEventListener("click", () => selectAnchor(row.dataset.zoneKey as string));
-  });
+function renderEcology(snapshot: AdminEcologySnapshot): void {
+  for (const a of snapshot.anchors) {
+    const index = anchorIndexFromKey(a.key);
+    if (index === null) continue;
+    const pending = a.pendingMsRemaining === null ? "—" : `${Math.ceil(a.pendingMsRemaining / 1000)}s`;
+
+    let row = ecologyAnchorsBodyEl.querySelector<HTMLTableRowElement>(`tr[data-zone-key="${a.key}"]`);
+    if (!row) {
+      row = document.createElement("tr");
+      row.dataset.zoneKey = a.key;
+      row.innerHTML = `
+        <td class="zone-key-cell" style="cursor:pointer">${escapeHtml(a.key)}</td>
+        <td class="density-cell" style="cursor:pointer"></td>
+        <td class="target-cell" style="cursor:pointer"></td>
+        <td class="base-target-cell"></td>
+        <td class="pending-cell" style="cursor:pointer"></td>
+      `;
+      for (const cls of ["zone-key-cell", "density-cell", "target-cell", "pending-cell"]) {
+        row.querySelector(`.${cls}`)!.addEventListener("click", () => selectAnchor(a.key));
+      }
+      const input = document.createElement("input");
+      input.type = "number";
+      input.step = "any";
+      input.min = "0.01";
+      input.className = "anchor-base-target-input";
+      input.addEventListener("input", () => dirtyAnchorIndices.add(index));
+      row.querySelector(".base-target-cell")!.appendChild(input);
+      anchorBaseTargetInputs.set(index, input);
+      ecologyAnchorsBodyEl.appendChild(row);
+    }
+
+    row.querySelector(".density-cell")!.textContent = a.density.toFixed(1);
+    row.querySelector(".target-cell")!.textContent = a.target.toFixed(1);
+    row.querySelector(".pending-cell")!.textContent = pending;
+
+    const input = anchorBaseTargetInputs.get(index)!;
+    if (document.activeElement !== input && !dirtyAnchorIndices.has(index)) {
+      input.value = String(a.baseTarget);
+    }
+  }
 
   const bg = snapshot.background;
   ecologyBackgroundSummaryEl.textContent =
