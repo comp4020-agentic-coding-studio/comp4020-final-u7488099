@@ -5,7 +5,7 @@ import { abandon, reproduce, selectEvolution } from "./actions.ts";
 import { login, logout, peekIdentity, register, resetProgress, resolveIdentity } from "./auth.ts";
 import { ECOLOGY_EVAL_INTERVAL_MS, SIMULATION } from "./balance.ts";
 import { db, getAllAccounts, getColonyForSession, resetProductionWorld } from "./db.ts";
-import { activeExclusionCircles, advanceEcology, anchorGeometry, getEcologySnapshot } from "./ecology.ts";
+import { activeExclusionCircles, advanceEcology, anchorGeometry, getEcologySnapshot, resetEcologyState } from "./ecology.ts";
 import { getEcologyConfig, setEcologyConfig, validateEcologyConfigInput } from "./ecologyConfig.ts";
 import { getLog, logAction } from "./log.ts";
 import { resolveOrCreateColony, SESSION_COOKIE, startNewColony } from "./sessions.ts";
@@ -21,6 +21,7 @@ import {
   issueAttackCommand,
   issueGatherCommand,
   issueMoveCommand,
+  loadSimulation,
 } from "./simulation.ts";
 import { getState } from "./state.ts";
 
@@ -393,6 +394,15 @@ app.post("/api/admin/reset-world", requireAdmin, (req, res) => {
     return;
   }
   const result = resetProductionWorld();
+  // resetProductionWorld() only rewrites the DB; loadSimulation() is
+  // otherwise called once, at server startup (see scripts/reset-world.ts's
+  // own warning about this for the CLI path). Without re-running it here,
+  // the in-memory colonies/workers/creatures Maps keep serving the
+  // pre-reset world — stale colonies that look "active" to every in-memory
+  // read path (getAllColonies(), the admin defeat route's existence check,
+  // defeatColony()'s own guard) even though their DB rows are long gone.
+  loadSimulation();
+  resetEcologyState();
   logAction(0, "admin_reset_world", result, req.accountId ?? undefined);
   for (const client of wss.clients) {
     client.close();

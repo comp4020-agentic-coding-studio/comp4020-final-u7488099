@@ -367,6 +367,78 @@ describe("admin reset-world against an isolated test database (Stage 11 step 7)"
     // And the re-authenticated admin can reach admin routes again.
     const statsRes = await reauth("/api/admin/stats");
     expect(statsRes.status).toBe(200);
+
+    // In-memory simulation state must agree with the DB after reset: every
+    // in-memory-backed read path (getAllColonies(), which both
+    // /api/admin/colonies and the admin defeat route's existence check rely
+    // on) must report exactly what the DB now contains — the fresh seeded
+    // colony plus reauth's own freshly-minted guest colony — not any of the
+    // pre-reset colonies that were deleted from the DB. Without
+    // loadSimulation() re-running inside the reset route, this list would
+    // keep showing every colony that ever existed on the live process.
+    const coloniesRes = await reauth("/api/admin/colonies");
+    expect(coloniesRes.status).toBe(200);
+    const colonies = await coloniesRes.json();
+    const dbColonyIds = inspectDb((db) => (db.prepare("SELECT id FROM colonies ORDER BY id").all() as { id: number }[]).map((r) => r.id));
+    expect(colonies.map((c: any) => c.id)).toEqual(dbColonyIds);
+    expect(colonies.every((c: any) => c.status === "active")).toBe(true);
+  });
+
+  it("after a reset, an admin can defeat many newly-created colonies sequentially with no stale-state failures", async () => {
+    const admin = await adminSession();
+    const resetRes = await postJson(admin, "/api/admin/reset-world", { confirm: "RESET WORLD" });
+    expect(resetRes.status).toBe(200);
+
+    // Re-authenticate; the reset wiped every session, including the admin's own.
+    const admin2 = createSession();
+    await admin2("/api/state");
+    const relogin = await postJson(admin2, "/api/auth/login", { username: ADMIN_USERNAME, password: ADMIN_PASSWORD });
+    expect(relogin.status).toBe(200);
+
+    // Mint several brand-new post-reset colonies (6+, per the required
+    // verification), on top of whatever the fresh seed itself produced.
+    const freshColonyIds: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      const guest = createSession();
+      const state = await (await guest("/api/state")).json();
+      freshColonyIds.push(state.colony.id);
+    }
+
+    const toDefeat: number[] = (await (await admin2("/api/admin/colonies")).json()).map((c: any) => c.id);
+    expect(toDefeat.length).toBeGreaterThanOrEqual(6);
+
+    // Defeat every currently-listed colony, one after another, through the
+    // real admin HTTP path — exactly like an operator clicking down the
+    // list. Every single one must succeed and actually reach "defeated" in
+    // the DB; none may be silently ignored because of stale in-memory state
+    // left over from the reset.
+    for (const id of toDefeat) {
+      const res = await postJson(admin2, `/api/admin/colonies/${id}/defeat`, {});
+      expect(res.status, `defeat of colony ${id}`).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({ ok: true });
+    }
+
+    const dbRows = inspectDb(
+      (db) => db.prepare(`SELECT id, status FROM colonies WHERE id IN (${toDefeat.map(() => "?").join(",")})`).all(...toDefeat) as {
+        id: number;
+        status: string;
+      }[],
+    );
+    expect(dbRows.length).toBe(toDefeat.length);
+    for (const row of dbRows) {
+      expect(row.status, `colony ${row.id} should be defeated`).toBe("defeated");
+    }
+
+    const finalList = await (await admin2("/api/admin/colonies")).json();
+    const stillActive = finalList.filter((c: any) => toDefeat.includes(c.id) && c.status !== "defeated");
+    expect(stillActive).toEqual([]);
+
+    // A subsequent session still gets a genuine, newly-provisioned colony —
+    // not a resurrected, already-defeated one.
+    const freshSession = createSession();
+    const freshState = await (await freshSession("/api/state")).json();
+    expect(freshState.colony.status).toBe("active");
   });
 
   it("repeated resets are idempotent: no duplicate or corrupt seed state accumulates", async () => {
