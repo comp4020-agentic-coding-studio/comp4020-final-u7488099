@@ -21,6 +21,7 @@ import {
   issueAttackCommand,
   issueGatherCommand,
   issueMoveCommand,
+  issueQueenMoveCommand,
   loadSimulation,
 } from "./simulation.ts";
 import { getState } from "./state.ts";
@@ -536,6 +537,27 @@ app.post("/api/command/move", (req, res) => {
     const destination = destinations.get(workerId)!;
     return issueMoveCommand(workerId, destination.x, destination.y, colonyId);
   });
+});
+
+// Stage 13A: a single-colony action, not a batch command — there is exactly
+// one queen per colony. req.colonyId is resolved server-side from the
+// session cookie (see declare global above), so a foreign queen can never be
+// commanded: there is no way for the client to name a different colony.
+app.post("/api/command/queen-move", (req, res) => {
+  const { x, y } = req.body ?? {};
+  if (typeof x !== "number" || typeof y !== "number") {
+    res.status(400).json({ error: "x and y are required" });
+    return;
+  }
+  const error = issueQueenMoveCommand(req.colonyId, x, y);
+  if (error) {
+    res.status(400).json({ error });
+    return;
+  }
+  logAction(req.colonyId, "queen_move", { x, y });
+  const state = { ...getState(req.colonyId), identity: requestIdentity(req) };
+  broadcastState();
+  res.json(state);
 });
 
 // Preferred, and now only, gather entry point: issues a gather command that

@@ -194,6 +194,10 @@ const DRAG_THRESHOLD = 4; // screen px of movement before a mousedown counts as 
 
 let state: ColonyState | null = null;
 let selectedWorkerIds = new Set<number>();
+// Stage 13A: mutually exclusive with selectedWorkerIds — selecting the queen
+// clears worker selection and vice versa. Mixed queen+worker selection is
+// out of scope for 13A.
+let queenSelected = false;
 let cameraInitialised = false;
 const camera = { x: 0, y: 0 };
 
@@ -477,6 +481,7 @@ function draw(): void {
   } else {
     circle(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS, "#ffd54d", "#b8860b");
     drawHealthBar(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS, state.colony.queenHealth, state.colony.queenMaxHealth);
+    if (queenSelected) drawSelectionRing(state.colony.queenX, state.colony.queenY, QUEEN_RADIUS + 4);
   }
   for (const worker of state.workers) {
     const r = CASTE_RADIUS[worker.caste];
@@ -728,6 +733,7 @@ function renderLifecycle(): void {
   // load, but without a page reload.
   if (lastSeenColonyId !== null && lastSeenColonyId !== state.colony.id) {
     selectedWorkerIds = new Set();
+    queenSelected = false;
     cameraInitialised = false;
   }
   lastSeenColonyId = state.colony.id;
@@ -876,6 +882,7 @@ function selectWorkersInBox(a: [number, number], b: [number, number]): void {
   const maxY = Math.max(a[1], b[1]);
   const hits = state.workers.filter((w) => w.x >= minX && w.x <= maxX && w.y >= minY && w.y <= maxY);
   selectedWorkerIds = new Set(hits.map((w) => w.id));
+  queenSelected = false;
   if (selectedWorkerIds.size > 0) {
     const counts: Record<Caste, number> = { worker: 0, soldier: 0, scout: 0 };
     for (const w of hits) counts[w.caste]++;
@@ -888,8 +895,14 @@ function selectWorkersInBox(a: [number, number], b: [number, number]): void {
   }
 }
 
-function hitTest(wx: number, wy: number): { kind: "worker" | "creature" | "node"; id: number } | null {
+function hitTest(wx: number, wy: number): { kind: "queen" | "worker" | "creature" | "node"; id: number } | null {
   if (!state) return null;
+  // Stage 13A: own queen only — foreign queens are drawn (see state.colonies
+  // render loop above) but deliberately never checked here, so they stay
+  // non-selectable with no extra code.
+  if (state.colony.status !== "defeated" && Math.hypot(state.colony.queenX - wx, state.colony.queenY - wy) <= QUEEN_RADIUS) {
+    return { kind: "queen", id: state.colony.id };
+  }
   for (const worker of state.workers) {
     if (Math.hypot(worker.x - wx, worker.y - wy) <= CASTE_RADIUS[worker.caste]) return { kind: "worker", id: worker.id };
   }
@@ -919,15 +932,26 @@ function onCanvasClick(sx: number, sy: number): void {
   const hit = hitTest(wx, wy);
 
   if (!hit) {
-    if (selectedWorkerIds.size > 0) onMoveClick(wx, wy);
+    if (queenSelected) onQueenMoveClick(wx, wy);
+    else if (selectedWorkerIds.size > 0) onMoveClick(wx, wy);
     return;
   }
 
+  if (hit.kind === "queen") {
+    // Stage 13A: queen selection is mutually exclusive with worker
+    // selection, and never falls through to gather/attack — the only click
+    // outcome while she's selected is onQueenMoveClick above.
+    selectedWorkerIds = new Set();
+    queenSelected = true;
+    statusEl.textContent = "Queen selected — click empty ground to move her (she travels very slowly).";
+    return;
+  }
   if (hit.kind === "worker") {
     // A plain click always replaces the selection with just this worker —
     // no shift-add, no toggle-off. Drag-select (selectWorkersInBox) is the
     // only way to select more than one.
     selectedWorkerIds = new Set([hit.id]);
+    queenSelected = false;
     const worker = state?.workers.find((w) => w.id === hit.id);
     const carryingSuffix = worker?.carrying ? ` (carrying ${worker.carrying.amount} ${worker.carrying.resourceType})` : "";
     statusEl.textContent = `Worker #${hit.id} selected${carryingSuffix} — click a resource node to gather, or empty ground to move.`;
@@ -956,6 +980,24 @@ async function onMoveClick(wx: number, wy: number): Promise<void> {
     return;
   }
   statusEl.textContent = describeBatchOutcome(workerIds.length, body.errors, "moving");
+  setState(body);
+}
+
+// Stage 13A: queen-only move command — no workerIds, single colony action.
+// Queen selection never clears on command, same as worker selection, so she
+// can be issued several moves in a row.
+async function onQueenMoveClick(wx: number, wy: number): Promise<void> {
+  const res = await fetch("/api/command/queen-move", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ x: wx, y: wy }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    statusEl.textContent = body.error ?? "move failed";
+    return;
+  }
+  statusEl.textContent = "Queen moving (she travels very slowly)...";
   setState(body);
 }
 
@@ -1091,6 +1133,7 @@ abandonConfirm.addEventListener("click", async () => {
     return;
   }
   selectedWorkerIds = new Set();
+  queenSelected = false;
   statusEl.textContent = "Colony abandoned.";
   setState(body);
 });
@@ -1122,6 +1165,7 @@ for (const caste of CASTES) {
       return;
     }
     selectedWorkerIds = new Set();
+    queenSelected = false;
     statusEl.textContent = `A new ${CASTE_DISPLAY_NAMES[caste].toLowerCase()} hatched!`;
     setState(body);
   });
@@ -1319,6 +1363,7 @@ resetProgressButton.addEventListener("click", async () => {
   }
   accountOverlay.hidden = true;
   selectedWorkerIds = new Set();
+  queenSelected = false;
   statusEl.textContent = "Your progress has been reset. A new colony has begun.";
   setState(body);
 });

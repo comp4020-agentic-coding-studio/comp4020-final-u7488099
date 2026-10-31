@@ -184,8 +184,13 @@ export function getState(colonyId: number): ColonyState {
     world: { width: world.width, height: world.height },
     colony: {
       id: colonyRow.id,
-      queenX: colonyRow.queenX,
-      queenY: colonyRow.queenY,
+      // Stage 13A: like queenHealth/status below, these must track the live
+      // snapshot, not this stale raw-SQL row — colonyRow.queen_x/queen_y are
+      // only checkpointed periodically (see simulation.ts's
+      // advanceQueenMovement/checkpointSimulation), so a moving queen would
+      // otherwise appear frozen/snap back to her own owner.
+      queenX: snapshot?.x ?? colonyRow.queenX,
+      queenY: snapshot?.y ?? colonyRow.queenY,
       resources,
       queenHealth: snapshot?.health ?? 0,
       queenMaxHealth: snapshot?.maxHealth ?? 0,

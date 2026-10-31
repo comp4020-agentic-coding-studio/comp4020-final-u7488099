@@ -266,6 +266,9 @@ export const DEPOSIT_RANGE = 30;
 
 export const WORKER_SPEED = 150; // world units per second
 
+// Stage 13A: queen is deliberately much slower than any worker.
+export const QUEEN_SPEED = WORKER_SPEED / 10;
+
 // Stage 3: loose swarm spacing. MIN_SEPARATION is deliberately exactly
 // 2 * WORKER_RADIUS ("circles just touching") — the natural threshold for
 // "don't visually overlap", and also what keeps separation from firing at

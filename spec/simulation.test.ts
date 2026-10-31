@@ -51,6 +51,7 @@ const {
   QUEEN_REGEN_RATE,
   QUEEN_AGGRO_RANGE,
   QUEEN_DISENGAGE_RANGE,
+  QUEEN_SPEED,
   EVOLUTION_TIER_1_POPULATION,
   EVOLUTION_TIER_2_POPULATION,
   EVOLUTION_TIER_3_POPULATION,
@@ -146,6 +147,14 @@ function queenPosition(): { x: number; y: number } {
     x: number;
     y: number;
   };
+}
+
+// Stage 13A: unlike queenPosition() above (checkpoint-only, raw SQL), this
+// reads the live in-memory position — the one that actually moves tick by
+// tick, before any checkpointSimulation() flush.
+function liveQueenPosition(): { x: number; y: number } {
+  const snapshot = sim.getColonySnapshot(colony.id)!;
+  return { x: snapshot.x, y: snapshot.y };
 }
 
 function insertNode(x: number, y: number, resourceType: string, amount: number): number {
@@ -286,6 +295,83 @@ describe("world bounds / invalid movement", () => {
     const [, , worker] = sim.getWorkersForColony(colony.id);
     expect(sim.issueMoveCommand(worker.id, -10, 100, colony.id)).toBe("coordinates out of bounds");
     expect(sim.issueMoveCommand(worker.id, world.width + 10, 100, colony.id)).toBe("coordinates out of bounds");
+  });
+});
+
+// Stage 13A: queen movement reuses the same gradual-travel/arrival/bounds
+// architecture as worker movement above, just via issueQueenMoveCommand /
+// QUEEN_SPEED and a colony-scoped (not worker-scoped) target.
+describe("queen movement", () => {
+  it("moves the queen toward its target by QUEEN_SPEED * dt, without teleporting", () => {
+    const start = liveQueenPosition();
+    const target = { x: start.x + 1000, y: start.y };
+
+    expect(sim.issueQueenMoveCommand(colony.id, target.x, target.y)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    const after = liveQueenPosition();
+    expect(after.x).toBeCloseTo(start.x + QUEEN_SPEED * TICK_DT, 6);
+    expect(after.x).toBeGreaterThan(start.x);
+    expect(after.x).toBeLessThan(target.x);
+    expect(after.y).toBe(start.y);
+  });
+
+  it("moves the queen much slower than a worker (QUEEN_SPEED is well under WORKER_SPEED)", () => {
+    expect(QUEEN_SPEED).toBeGreaterThan(0);
+    expect(QUEEN_SPEED).toBeLessThan(WORKER_SPEED / 5);
+  });
+
+  it("reaches the destination exactly and stops, without overshooting", () => {
+    const start = liveQueenPosition();
+    const target = { x: start.x + 10, y: start.y };
+
+    expect(sim.issueQueenMoveCommand(colony.id, target.x, target.y)).toBeNull();
+    // 10 units at QUEEN_SPEED=15/s needs ~0.67s; advance well past that.
+    for (let i = 0; i < 20; i++) sim.advanceSimulation(TICK_DT);
+
+    const after = liveQueenPosition();
+    expect(after.x).toBe(target.x);
+    expect(after.y).toBe(target.y);
+
+    // Further ticks after arrival must not move the queen any further.
+    sim.advanceSimulation(TICK_DT);
+    expect(liveQueenPosition()).toEqual(after);
+  });
+
+  it("rejects non-finite coordinates", () => {
+    expect(sim.issueQueenMoveCommand(colony.id, Number.NaN, 100)).toBe("invalid coordinates");
+    expect(sim.issueQueenMoveCommand(colony.id, 100, Number.POSITIVE_INFINITY)).toBe("invalid coordinates");
+  });
+
+  it("rejects coordinates outside the world bounds", () => {
+    expect(sim.issueQueenMoveCommand(colony.id, -10, 100)).toBe("coordinates out of bounds");
+    expect(sim.issueQueenMoveCommand(colony.id, world.width + 10, 100)).toBe("coordinates out of bounds");
+  });
+
+  it("rejects a move command for a defeated colony", () => {
+    sim.defeatColony(colony.id, "abandoned");
+    expect(sim.issueQueenMoveCommand(colony.id, 100, 100)).toBe("colony defeated");
+  });
+
+  it("checkpoints the queen's position, and drops the in-flight move target on reload", () => {
+    const start = liveQueenPosition();
+    const target = { x: start.x + 1000, y: start.y };
+
+    expect(sim.issueQueenMoveCommand(colony.id, target.x, target.y)).toBeNull();
+    sim.advanceSimulation(TICK_DT); // mid-flight, not arrived
+    const midFlight = liveQueenPosition();
+
+    sim.checkpointSimulation();
+    sim.loadSimulation(); // simulates a process restart reading the checkpoint back
+
+    const restored = liveQueenPosition();
+    expect(restored.x).toBeCloseTo(midFlight.x, 6);
+    expect(restored.y).toBeCloseTo(midFlight.y, 6);
+
+    // In-flight moveTarget is ephemeral, like a worker's command — it must
+    // not resume after reload.
+    sim.advanceSimulation(TICK_DT);
+    expect(liveQueenPosition()).toEqual(restored);
   });
 });
 

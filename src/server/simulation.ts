@@ -16,6 +16,7 @@ import {
   QUEEN_DISENGAGE_RANGE,
   QUEEN_REGEN_DELAY,
   QUEEN_REGEN_RATE,
+  QUEEN_SPEED,
   SEPARATION_STRENGTH,
   SPIDER_AGGRO_RANGE,
   SPIDER_ATTACK_COOLDOWN,
@@ -163,6 +164,9 @@ interface SimColony {
   peakPopulation: number;
   evolution: EvolutionSelections;
   defeatedAt: string | null;
+  // Stage 13A: in-memory queen move target, deliberately never persisted —
+  // same ephemeral treatment as a worker's `command` (see loadSimulation).
+  moveTarget: { x: number; y: number } | null;
 }
 
 const colonies = new Map<number, SimColony>();
@@ -211,6 +215,7 @@ export function loadSimulation(): void {
       peakPopulation: row.peakPopulation ?? 0,
       evolution: { tier1: row.tier1, tier2: row.tier2, tier3: row.tier3 },
       defeatedAt: row.defeatedAt,
+      moveTarget: null,
     });
   }
 
@@ -668,6 +673,7 @@ export function registerColony(
     peakPopulation: startingPopulation,
     evolution: NO_EVOLUTION,
     defeatedAt: null,
+    moveTarget: null,
   });
 }
 
@@ -829,6 +835,22 @@ export function issueMoveCommand(
   if (!Number.isFinite(x) || !Number.isFinite(y)) return "invalid coordinates";
   if (x < 0 || x > worldBounds.width || y < 0 || y > worldBounds.height) return "coordinates out of bounds";
   worker.command = { type: "move", targetX: x, targetY: y };
+  return null;
+}
+
+export type QueenMoveCommandError = "invalid coordinates" | "coordinates out of bounds" | "colony defeated";
+
+// Stage 13A: colonyId is already session-resolved authority upstream (see
+// index.ts's req.colonyId), so unlike issueMoveCommand there is no
+// worker-ownership lookup to do here — just bounds/activity checks before
+// setting the queen's in-memory move target. moveTarget is deliberately
+// never persisted (see SimColony.moveTarget), same ephemeral treatment as a
+// worker's `command`.
+export function issueQueenMoveCommand(colonyId: number, x: number, y: number): QueenMoveCommandError | null {
+  if (!isColonyActive(colonyId)) return "colony defeated";
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return "invalid coordinates";
+  if (x < 0 || x > worldBounds.width || y < 0 || y > worldBounds.height) return "coordinates out of bounds";
+  colonies.get(colonyId)!.moveTarget = { x, y };
   return null;
 }
 
@@ -1346,6 +1368,33 @@ function advanceQueenRegen(dt: number): void {
   }
 }
 
+// Stage 13A: queen movement toward her (ephemeral, in-memory) moveTarget.
+// Same step/clamp/arrival pattern worker movement uses, just at QUEEN_SPEED.
+function advanceQueenMovement(dt: number): void {
+  for (const colony of colonies.values()) {
+    if (colony.status !== "active" || !colony.moveTarget) continue;
+    const { x: targetX, y: targetY } = colony.moveTarget;
+    const dx = targetX - colony.x;
+    const dy = targetY - colony.y;
+    const dist = Math.hypot(dx, dy);
+
+    if (dist <= ARRIVAL_EPSILON) {
+      colony.x = targetX;
+      colony.y = targetY;
+      colony.moveTarget = null;
+      dirty = true;
+      continue;
+    }
+
+    const step = Math.min(QUEEN_SPEED * dt, dist);
+    colony.x = clamp(colony.x + (dx / dist) * step, 0, worldBounds.width);
+    colony.y = clamp(colony.y + (dy / dist) * step, 0, worldBounds.height);
+    dirty = true;
+
+    if (step >= dist - ARRIVAL_EPSILON) colony.moveTarget = null;
+  }
+}
+
 // Stage 6: chase + attack resolution. Unlike move/gather/return, "in range"
 // here is a continuous check, never a one-shot arrival — the target keeps
 // moving and the attack never "completes" — so this gets its own branch
@@ -1578,6 +1627,7 @@ function resolveArrival(worker: SimWorker, command: WorkerCommand): void {
 export function advanceSimulation(dt: number): void {
   advanceCreatures(dt);
   advanceQueenRegen(dt);
+  advanceQueenMovement(dt);
 
   const grid = buildSpatialGrid();
 
@@ -1709,12 +1759,14 @@ export function checkpointSimulation(): void {
   // every tick (see advanceQueenRegen) — it rides along in this existing
   // periodic flush instead, same batched-write treatment position already
   // gets. Combat damage (applyDamageToQueen) stays its own synchronous
-  // write, unaffected by this.
-  const updateColonyHealth = db.prepare("UPDATE colonies SET queen_health = ? WHERE id = ?");
+  // write, unaffected by this. Stage 13A: queen position joins the same
+  // flush for the same reason worker/creature position does — moveTarget
+  // itself is deliberately excluded (ephemeral, like a worker's `command`).
+  const updateColony = db.prepare("UPDATE colonies SET queen_x = ?, queen_y = ?, queen_health = ? WHERE id = ?");
   const tx = db.transaction((workerList: SimWorker[], creatureList: SimCreature[], colonyList: SimColony[]) => {
     for (const w of workerList) update.run(w.x, w.y, w.id);
     for (const c of creatureList) updateCreature.run(c.x, c.y, c.id);
-    for (const col of colonyList) updateColonyHealth.run(col.health, col.id);
+    for (const col of colonyList) updateColony.run(col.x, col.y, col.health, col.id);
   });
   tx([...workers.values()], [...creatures.values()], [...colonies.values()].filter((c) => c.status === "active"));
 }
