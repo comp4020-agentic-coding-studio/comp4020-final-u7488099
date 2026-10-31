@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { COLONY_SPACING, QUEEN_MAX_HEALTH, SPIDER_CLEAR_RADIUS } from "./balance.ts";
-import { createColony, db, getColonyForSession, getUnclaimedColonyId, saveSession } from "./db.ts";
+import { createColony, db, getColonyForSession, getUnclaimedColonyId, saveSession, setAccountColony } from "./db.ts";
 import { isRuinExpired } from "./ecology.ts";
 import { logAction } from "./log.ts";
 import { getSpiderPositions, getWorkersForColony, isColonyActive, registerColony, registerWorker } from "./simulation.ts";
@@ -152,17 +152,35 @@ export function resolveOrCreateColony(cookieHeader: string | undefined): { sessi
 // valid session plus a defeated current colony — NOT resource balance, per
 // §14 — so even a zero-worker, zero-protein session can always recover.
 //
-// saveSession is an upsert (see db.ts): this re-points the same session's
-// single row to the new colony id. The session's identity (its `sid`
-// cookie) never changes; only which colony it currently controls does. The
-// old, defeated colony row is left exactly as-is — it's already a visible,
-// non-controllable ruin the instant this returns (per §15's "no history
-// table needed").
-export function startNewColony(sessionId: string, currentColonyId: number): { ok: true; colonyId: number } | { ok: false; error: string } {
+// Stage 11 fix: an authenticated caller's authoritative colony is
+// accounts.active_colony_id, never sessions.colony_id (see
+// getColonyForSession()) — so for accountId != null this must record
+// ownership via setAccountColony(), exactly like resetProgress() (auth.ts)
+// already does, instead of claimColonyForSession()'s saveSession() call,
+// which an authenticated identity's colony resolution never reads back.
+// Writing only sessions.colony_id here previously left
+// accounts.active_colony_id pointed at the just-defeated colony, so the
+// very next request after a successful "Start New Colony" would resolve
+// straight back to the old, dead colony — the new one was never dead, the
+// account just never adopted it.
+//
+// For a guest (accountId == null), saveSession is still an upsert (see
+// db.ts): this re-points the same session's single row to the new colony
+// id. The session's identity (its `sid` cookie) never changes; only which
+// colony it currently controls does. The old, defeated colony row is left
+// exactly as-is — it's already a visible, non-controllable ruin the instant
+// this returns (per §15's "no history table needed").
+export function startNewColony(
+  sessionId: string,
+  accountId: number | null,
+  currentColonyId: number,
+): { ok: true; colonyId: number } | { ok: false; error: string } {
   if (isColonyActive(currentColonyId)) return { ok: false, error: "colony still active" };
 
-  const { colonyId } = claimColonyForSession(sessionId);
-  logAction(colonyId, "colony_started", { previousColonyId: currentColonyId });
+  const { colonyId } = claimFreshColony();
+  if (accountId != null) setAccountColony(accountId, colonyId);
+  else saveSession(sessionId, colonyId);
+  logAction(colonyId, "colony_started", { previousColonyId: currentColonyId }, accountId ?? undefined);
 
   return { ok: true, colonyId };
 }

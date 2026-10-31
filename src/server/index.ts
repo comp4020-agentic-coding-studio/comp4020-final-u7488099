@@ -449,7 +449,7 @@ app.post("/api/abandon", (req, res) => {
 // colony_started. The new colony id is never accepted from the request
 // body; it's whatever startNewColony() mints/claims server-side.
 app.post("/api/start-new-colony", (req, res) => {
-  const result = startNewColony(req.sessionId, req.colonyId);
+  const result = startNewColony(req.sessionId, req.accountId, req.colonyId);
   if (!result.ok) {
     res.status(400).json(result);
     return;
