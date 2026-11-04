@@ -65,6 +65,11 @@ const {
   BROOD_II_COST_MULTIPLIER,
   BROOD_III_COST_MULTIPLIER,
   GATHER_DURATION,
+  GUARD_MAX_HEALTH,
+  GUARD_ATTACK_DAMAGE,
+  GUARD_PROTECT_RADIUS,
+  GUARD_FOLLOW_RADIUS,
+  GUARD_FOLLOW_REPATH_EPSILON,
 } = await import("../src/server/balance.ts");
 const { getEvolutionModifiers, tierThreshold, traitDisplayName, NO_EVOLUTION } = await import(
   "../src/server/evolution.ts"
@@ -932,7 +937,10 @@ describe("Stage 7: worker health", () => {
     }
 
     sim.loadSimulation();
-    for (const w of sim.getWorkersForColony(minted.colonyId)) {
+    // Stage 13B: getWorkersForColony also returns the minted colony's guard
+    // (its own, higher GUARD_MAX_HEALTH) — excluded here since this test is
+    // specifically about the normal starting workers' health.
+    for (const w of sim.getWorkersForColony(minted.colonyId).filter((w) => w.caste !== "guard")) {
       expect(w.health).toBe(WORKER_MAX_HEALTH);
       expect(w.maxHealth).toBe(WORKER_MAX_HEALTH);
     }
@@ -2185,8 +2193,12 @@ describe("Stage 8: colony defeat", () => {
 });
 
 describe("Stage 9: peak population", () => {
+  // Stage 13B: every seeded/minted colony also gets exactly one guard, a row
+  // in the same `workers` table — so the seeded starting population (and
+  // every count derived from it below) is STARTING_WORKERS + 1, not
+  // STARTING_WORKERS alone.
   it("A: a freshly seeded colony's peak population starts at its own starting worker count", () => {
-    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS);
+    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 1);
   });
 
   it("B: reproducing increases peak population by one", () => {
@@ -2195,15 +2207,15 @@ describe("Stage 9: peak population", () => {
       colony.id,
     );
     expect(actions.reproduce(colony.id, "worker")).toEqual({ ok: true });
-    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 1);
+    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 2);
   });
 
   it("C: losing workers never lowers peak population — it only ever moves upward", () => {
     const [worker] = sim.getWorkersForColony(colony.id);
     setWorkerHealth(worker.id, 1);
     sim.applyDamageToWorker(worker.id, 999, 777);
-    expect(sim.getWorkersForColony(colony.id)).toHaveLength(STARTING_WORKERS - 1);
-    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS);
+    expect(sim.getWorkersForColony(colony.id)).toHaveLength(STARTING_WORKERS);
+    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 1);
   });
 
   it("D: peak population survives a restart (reload from SQLite)", () => {
@@ -2213,7 +2225,7 @@ describe("Stage 9: peak population", () => {
     );
     expect(actions.reproduce(colony.id, "worker")).toEqual({ ok: true });
     sim.loadSimulation();
-    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 1);
+    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 2);
   });
 
   it("E: peak population is frozen once a colony is defeated", () => {
@@ -2222,11 +2234,11 @@ describe("Stage 9: peak population", () => {
       colony.id,
     );
     expect(actions.reproduce(colony.id, "worker")).toEqual({ ok: true });
-    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 1);
+    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 2);
 
     sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
     expect(sim.getColonySnapshot(colony.id)?.status).toBe("defeated");
-    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 1);
+    expect(sim.getColonySnapshot(colony.id)?.peakPopulation).toBe(STARTING_WORKERS + 2);
   });
 
   it("F: a replacement colony starts with its own fresh peak population, not inherited from anywhere else", async () => {
@@ -2497,5 +2509,185 @@ describe("Stage 9: evolution selection", () => {
     expect(sim.getColonyEvolution(fresh.colonyId)).toEqual(NO_EVOLUTION);
     // The old, now-defeated colony's selections remain on the ruin, untouched.
     expect(sim.getColonyEvolution(colony.id)).toEqual({ tier1: "foraging", tier2: "survival", tier3: "brood" });
+  });
+});
+
+describe("Stage 13B: guard caste", () => {
+  function theGuard() {
+    const found = sim.getWorkersForColony(colony.id).find((w) => w.caste === "guard");
+    if (!found) throw new Error("seeded colony has no guard");
+    return found;
+  }
+
+  it("the seeded colony has exactly one guard", () => {
+    const guards = sim.getWorkersForColony(colony.id).filter((w) => w.caste === "guard");
+    expect(guards).toHaveLength(1);
+    expect(guards[0].caste).toBe("guard");
+  });
+
+  it("createColony() mints exactly one guard for a brand-new colony, distinct from its normal starting workers", async () => {
+    const { createColony } = await import("../src/server/db.ts");
+    const fresh = createColony();
+    expect(fresh.guard.caste).toBe("guard");
+    expect(fresh.workers.every((w) => w.caste !== "guard")).toBe(true);
+    expect(fresh.workers).toHaveLength(STARTING_WORKERS);
+  });
+
+  it("rejects a move command targeting a guard with 'wrong caste', even with a hand-crafted request", () => {
+    const guard = theGuard();
+    expect(sim.issueMoveCommand(guard.id, guard.x + 10, guard.y, colony.id)).toBe("wrong caste");
+    expect(sim.getWorkerCommand(guard.id)).toBe("idle");
+  });
+
+  it("rejects a gather command targeting a guard with 'wrong caste' — a guard can never gather", () => {
+    const guard = theGuard();
+    const nodeId = insertNode(guard.x, guard.y, "sugar", 100);
+    expect(sim.issueGatherCommand(guard.id, nodeId, colony.id)).toBe("wrong caste");
+    expect(sim.getWorkerCommand(guard.id)).toBe("idle");
+  });
+
+  it("rejects an attack command targeting a guard with 'wrong caste' — combat decisions are server-AI-only", () => {
+    const guard = theGuard();
+    const spiderId = insertSpider(guard.x + 1000, guard.y + 1000);
+    sim.loadSimulation();
+    expect(sim.issueAttackCommand(guard.id, spiderId, colony.id)).toBe("wrong caste");
+    expect(sim.getWorkerCommand(guard.id)).toBe("idle");
+  });
+
+  it("cannot be reproduced through the normal caste reproduction action", () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'protein'").run(
+      REPRODUCE_COST,
+      colony.id,
+    );
+    expect(actions.reproduce(colony.id, "guard")).toEqual({ ok: false, error: "invalid caste" });
+  });
+
+  it("follows the queen's current position after she moves, settling near a fixed offset from her", () => {
+    // A short hop (well under QUEEN_SPEED * a few seconds) so the queen
+    // actually arrives and stops within the tick budget below — otherwise
+    // the guard is still chasing a continuously-advancing follow point and
+    // the GUARD_FOLLOW_REPATH_EPSILON tolerance alone wouldn't settle it.
+    const target = { x: queenPosition().x + 30, y: queenPosition().y };
+    expect(sim.issueQueenMoveCommand(colony.id, target.x, target.y)).toBeNull();
+
+    for (let i = 0; i < 200; i++) sim.advanceSimulation(TICK_DT);
+
+    const queen = liveQueenPosition();
+    expect(queen.x).toBe(target.x); // queen has arrived and stopped
+    const guard = theGuard();
+    // advanceGuardFollow only re-paths once drift exceeds GUARD_FOLLOW_REPATH_EPSILON,
+    // so the guaranteed settling tolerance is that epsilon, not an arbitrary smaller number.
+    expect(Math.hypot(guard.x - queen.x, guard.y - (queen.y - GUARD_FOLLOW_RADIUS))).toBeLessThan(
+      GUARD_FOLLOW_REPATH_EPSILON + 1,
+    );
+  });
+
+  it("engages a spider that enters the queen's protection radius", () => {
+    const queen = queenPosition();
+    const spiderId = insertSpider(queen.x, queen.y - GUARD_PROTECT_RADIUS + 10);
+    sim.loadSimulation();
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getWorkerCommand(theGuard().id)).toBe("attack");
+  });
+
+  it("does not engage a spider that stays outside the protection radius and isn't chasing anything of this colony", () => {
+    const queen = queenPosition();
+    const spiderId = insertSpider(queen.x, queen.y - GUARD_PROTECT_RADIUS - 200);
+    sim.loadSimulation();
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getWorkerCommand(theGuard().id)).not.toBe("attack");
+  });
+
+  it("damages and kills a spider it has engaged, using the normal combat rules", () => {
+    // Spawned right on top of the guard's own starting position (not just
+    // somewhere inside GUARD_PROTECT_RADIUS) so it's already within
+    // WORKER_ATTACK_RANGE the instant the guard engages — otherwise a
+    // wandering spider can keep drifting just out of range indefinitely,
+    // the same geometry concern the existing Stage 6 combat tests avoid.
+    const guardStart = theGuard();
+    const spiderId = insertSpider(guardStart.x, guardStart.y, 1);
+    sim.loadSimulation();
+
+    for (let i = 0; i < 50; i++) {
+      sim.advanceSimulation(TICK_DT);
+      if (sim.getCreaturesForWorld(world.id).every((c) => c.id !== spiderId)) break;
+    }
+
+    expect(sim.getCreaturesForWorld(world.id).some((c) => c.id === spiderId)).toBe(false);
+  });
+
+  it("returns toward the queen after its threat dies", () => {
+    const guardStart = theGuard();
+    const spiderId = insertSpider(guardStart.x, guardStart.y, 1);
+    sim.loadSimulation();
+
+    for (let i = 0; i < 50; i++) {
+      sim.advanceSimulation(TICK_DT);
+      if (sim.getCreaturesForWorld(world.id).every((c) => c.id !== spiderId)) break;
+    }
+    expect(sim.getCreaturesForWorld(world.id).some((c) => c.id === spiderId)).toBe(false);
+
+    for (let i = 0; i < 200; i++) sim.advanceSimulation(TICK_DT);
+
+    const after = liveQueenPosition();
+    const guard = theGuard();
+    expect(Math.hypot(guard.x - after.x, guard.y - (after.y - GUARD_FOLLOW_RADIUS))).toBeLessThan(
+      GUARD_FOLLOW_REPATH_EPSILON + 1,
+    );
+  });
+
+  it("can take damage and die, and does not respawn afterward", () => {
+    const guard = theGuard();
+    sim.applyDamageToWorker(guard.id, GUARD_MAX_HEALTH, 777);
+
+    expect(sim.getWorkersForColony(colony.id).some((w) => w.id === guard.id)).toBe(false);
+
+    for (let i = 0; i < 20; i++) sim.advanceSimulation(TICK_DT);
+    expect(sim.getWorkersForColony(colony.id).filter((w) => w.caste === "guard")).toHaveLength(0);
+  });
+
+  it("persists caste, position, and health across a checkpoint/reload round-trip", () => {
+    const guard = theGuard();
+    sim.applyDamageToWorker(guard.id, 20, 777);
+    const damaged = sim.getWorkersForColony(colony.id).find((w) => w.id === guard.id)!;
+
+    sim.checkpointSimulation();
+    sim.loadSimulation();
+
+    const restored = sim.getWorkersForColony(colony.id).find((w) => w.id === guard.id)!;
+    expect(restored.caste).toBe("guard");
+    expect(restored.x).toBe(damaged.x);
+    expect(restored.y).toBe(damaged.y);
+    expect(restored.health).toBe(damaged.health);
+  });
+
+  it("is a vision source with a low vision radius (distinct from, and lower than, a worker's)", async () => {
+    const { VISION_RADIUS } = await import("../src/server/balance.ts");
+    expect(VISION_RADIUS.guard).toBeGreaterThan(0);
+    expect(VISION_RADIUS.guard).toBeLessThan(VISION_RADIUS.worker);
+  });
+
+  it("does not prevent colony defeat when the queen dies, even while alive and well", () => {
+    expect(sim.getWorkersForColony(colony.id).some((w) => w.caste === "guard")).toBe(true);
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+    expect(sim.getColonySnapshot(colony.id)?.status).toBe("defeated");
+  });
+
+  it("has higher max health and attack damage than a worker, per the 'high HP, high damage' brief", () => {
+    expect(GUARD_MAX_HEALTH).toBeGreaterThan(WORKER_MAX_HEALTH);
+    expect(GUARD_ATTACK_DAMAGE).toBeGreaterThan(WORKER_ATTACK_DAMAGE);
+  });
+
+  it("scales through getEvolutionModifiers the same generic, caste-keyed way every other caste already does", () => {
+    const base = getEvolutionModifiers(NO_EVOLUTION, "guard");
+    expect(base.maxHealth).toBe(GUARD_MAX_HEALTH);
+    expect(base.attackDamage).toBe(GUARD_ATTACK_DAMAGE);
+
+    const survivalII = getEvolutionModifiers({ tier1: null, tier2: "survival", tier3: null }, "guard");
+    expect(survivalII.attackDamage).toBeGreaterThan(base.attackDamage);
   });
 });

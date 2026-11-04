@@ -85,7 +85,12 @@ it("seeds a large continuous world with one colony, 3 workers near the queen, an
     expect(state.colony.resources[type]).toBe(type === "protein" ? STARTING_PROTEIN : 0);
   }
 
-  expect(state.workers).toHaveLength(3);
+  // Stage 13B: the colony also has exactly one guard, a worker-table row
+  // alongside the 3 normal starting workers.
+  const normalWorkers = state.workers.filter((w: any) => w.caste !== "guard");
+  expect(normalWorkers).toHaveLength(3);
+  const guards = state.workers.filter((w: any) => w.caste === "guard");
+  expect(guards).toHaveLength(1);
   for (const worker of state.workers) {
     expect(Math.hypot(worker.x - state.colony.queenX, worker.y - state.colony.queenY)).toBeLessThanOrEqual(100);
   }
@@ -294,11 +299,18 @@ it(
     // would need to be pre-Stage-9.
     let before = await getState();
     const idleDeadline = Date.now() + 30000;
-    while (before.workers.filter((w: any) => !w.carrying).length < 2 && Date.now() < idleDeadline) {
+    // Stage 13B: the guard also has carrying === null (it never gathers), so
+    // it must be excluded here — otherwise it can be picked as a candidate
+    // and the subsequent gather command issued to it is rejected server-side
+    // ("wrong caste"), leaving it stuck with carrying: null forever.
+    while (
+      before.workers.filter((w: any) => !w.carrying && w.caste !== "guard").length < 2 &&
+      Date.now() < idleDeadline
+    ) {
       await new Promise((r) => setTimeout(r, 200));
       before = await getState();
     }
-    const [busyCandidate, freeWorker] = before.workers.filter((w: any) => !w.carrying);
+    const [busyCandidate, freeWorker] = before.workers.filter((w: any) => !w.carrying && w.caste !== "guard");
     const sugarNode = closestNode(before, busyCandidate, "sugar");
 
     // freeWorker looked idle (not carrying) in the snapshot above, but it may
@@ -660,8 +672,11 @@ it(
     expect(after.colony.defeatCause).toBeNull();
     expect(after.colony.queenHealth).toBe(after.colony.queenMaxHealth);
 
-    // Standard Stage 6b starting state — immediately playable.
-    expect(after.workers).toHaveLength(3);
+    // Standard Stage 6b starting state — immediately playable. Stage 13B:
+    // the new colony also gets exactly one guard alongside the 3 normal
+    // starting workers.
+    expect(after.workers.filter((w: any) => w.caste !== "guard")).toHaveLength(3);
+    expect(after.workers.filter((w: any) => w.caste === "guard")).toHaveLength(1);
     expect(after.colony.resources.protein).toBe(STARTING_PROTEIN);
     expect(after.colony.resources.sugar).toBe(0);
     expect(after.colony.resources.biomass).toBe(0);
@@ -684,8 +699,10 @@ it(
     expect(refetched.colony.id).toBe(after.colony.id);
 
     // Immediately playable: a move command on the new colony's own worker
-    // succeeds.
-    const worker = after.workers[0];
+    // succeeds. Stage 13B: explicitly exclude the guard — it would reject
+    // this move command structurally ("wrong caste"), which isn't what this
+    // assertion is testing.
+    const worker = after.workers.find((w: any) => w.caste !== "guard");
     const moveRes = await request("/api/command/move", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -725,9 +742,16 @@ it(
     // which otherwise makes this test's travel time (and its 30s-per-worker
     // deadline) depend on spider-population layout rather than the thing
     // it's meant to test.
+    // Stage 13B: the colony's guard is autonomous, un-commandable, and
+    // actively defends against nearby spiders, so this walk-a-worker-onto-a-
+    // spider technique can never kill it (and must never be attempted on it
+    // — the move command would be rejected with "wrong caste" anyway). Only
+    // the normal starting workers (plus the one reproduced above) are driven
+    // to their deaths here; the guard is expected to still be alive and well
+    // once this loop finishes.
     let state = await (await stuckRequest("/api/state")).json();
-    while (state.workers.length > 0) {
-      const worker = state.workers[0];
+    while (state.workers.some((w: any) => w.caste !== "guard")) {
+      const worker = state.workers.find((w: any) => w.caste !== "guard");
       const spiders = state.creatures.filter((c: any) => c.species === "spider");
       expect(spiders.length, "seed should always include at least one spider").toBeGreaterThan(0);
       const spider = spiders.reduce((best: any, c: any) =>
@@ -744,7 +768,7 @@ it(
         state = await (await stuckRequest("/api/state")).json();
       }
     }
-    expect(state.workers).toHaveLength(0);
+    expect(state.workers.filter((w: any) => w.caste !== "guard")).toHaveLength(0);
     expect(state.colony.resources.protein).toBeLessThan(REPRODUCE_COST);
     expect(state.colony.status).toBe("active"); // the queen herself is untouched
 
@@ -767,11 +791,11 @@ it(
     expect(restartRes.status).toBe(200);
     const restarted = await restartRes.json();
     expect(restarted.colony.status).toBe("active");
-    expect(restarted.workers).toHaveLength(3);
+    expect(restarted.workers.filter((w: any) => w.caste !== "guard")).toHaveLength(3);
     expect(restarted.colony.resources.protein).toBe(STARTING_PROTEIN);
 
     // And it's genuinely playable again.
-    const worker = restarted.workers[0];
+    const worker = restarted.workers.find((w: any) => w.caste !== "guard");
     const moveRes = await stuckRequest("/api/command/move", {
       method: "POST",
       headers: { "content-type": "application/json" },

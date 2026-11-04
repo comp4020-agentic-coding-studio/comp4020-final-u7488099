@@ -11,6 +11,10 @@ import {
   GATHER_RANGE,
   GOLDEN_ANGLE,
   GROUP_DESTINATION_SPACING,
+  GUARD_DISENGAGE_RANGE,
+  GUARD_FOLLOW_RADIUS,
+  GUARD_FOLLOW_REPATH_EPSILON,
+  GUARD_PROTECT_RADIUS,
   MIN_SEPARATION,
   QUEEN_AGGRO_RANGE,
   QUEEN_DISENGAGE_RANGE,
@@ -83,6 +87,7 @@ export type MoveCommandError =
   | "invalid coordinates"
   | "coordinates out of bounds"
   | "worker is busy returning resources"
+  | "wrong caste"
   | "colony defeated";
 export type GatherCommandError =
   | "no such worker"
@@ -94,6 +99,7 @@ export type AttackCommandError =
   | "no such worker"
   | "no such creature"
   | "worker is busy returning resources"
+  | "wrong caste"
   | "colony defeated";
 
 // Stage 5: a neutral creature (first species: aphid). Stage 6 makes it
@@ -831,6 +837,12 @@ export function issueMoveCommand(
   if (!isColonyActive(ownerColonyId)) return "colony defeated";
   const worker = workers.get(workerId);
   if (!worker || worker.colonyId !== ownerColonyId) return "no such worker";
+  // Stage 13B: a guard is autonomous-only (see advanceGuards) — rejected here
+  // structurally, same caste-check idiom issueGatherCommand's soldier
+  // rejection already established, so a hand-crafted request supplying a
+  // guard's own worker id can never move it, regardless of what the client
+  // does or doesn't expose.
+  if (worker.caste === "guard") return "wrong caste";
   if (worker.carrying) return "worker is busy returning resources";
   if (!Number.isFinite(x) || !Number.isFinite(y)) return "invalid coordinates";
   if (x < 0 || x > worldBounds.width || y < 0 || y > worldBounds.height) return "coordinates out of bounds";
@@ -878,7 +890,9 @@ export function issueGatherCommand(
   // Stage 10: Soldier is structurally barred from gathering/carrying — a
   // combat specialist, not a laborer. Checked before the DB hit, cheapest
   // rejection first.
-  if (worker.caste === "soldier") return "wrong caste";
+  // Stage 13B: Guard is autonomous-only and has no carry capacity — barred
+  // the same way, same reasoning.
+  if (worker.caste === "soldier" || worker.caste === "guard") return "wrong caste";
   // Stage 9: a worker already gathering this exact node — whether still
   // travelling or mid-channel — is a no-op, not a redirect. Without this, a
   // redundant re-send (a client poll loop, or a player clicking the same
@@ -911,6 +925,9 @@ export function issueAttackCommand(
   if (!isColonyActive(ownerColonyId)) return "colony defeated";
   const worker = workers.get(workerId);
   if (!worker || worker.colonyId !== ownerColonyId) return "no such worker";
+  // Stage 13B: a guard's attack command comes only from advanceGuards, never
+  // a player-issued one — rejected structurally like move/gather above.
+  if (worker.caste === "guard") return "wrong caste";
   if (worker.carrying) return "worker is busy returning resources";
   const creature = creatures.get(creatureId);
   if (!creature) return "no such creature";
@@ -1395,6 +1412,116 @@ function advanceQueenMovement(dt: number): void {
   }
 }
 
+// Stage 13B: species a guard will engage. A plain array (not yet worth a
+// balance.ts constant) so adding a second hostile species later — per the
+// task's own "don't make this hard to extend" requirement — is a one-line
+// change here, not a restructuring.
+const GUARD_HOSTILE_SPECIES = new Set<string>(["spider"]);
+
+// True if `creature` is currently attacking (or chasing) something that
+// belongs to `colonyId` — i.e. it's a threat regardless of how far it
+// currently is from the queen. Checked alongside the simple proximity
+// radius in findGuardThreat so a spider already mid-chase of one of this
+// colony's workers (not yet within GUARD_PROTECT_RADIUS of the queen) still
+// counts as a threat, per the brief's "attacking/targeting its queen OR
+// enters a protection radius" wording.
+function isChasingColony(creature: SimCreature, colonyId: number): boolean {
+  if (creature.command.type === "chase-queen") return creature.command.targetColonyId === colonyId;
+  if (creature.command.type === "chase") {
+    const target = workers.get(creature.command.targetWorkerId);
+    return target !== undefined && target.colonyId === colonyId;
+  }
+  return false;
+}
+
+// Bounded, single linear pass over the world's (typically small) creature
+// population — same order of magnitude as advanceSpider's own per-spider
+// nearest-worker scan, not a new all-pairs cost. Nearest-by-distance with
+// ascending-id tiebreak, same deterministic tie-break idiom advanceSpider
+// uses for its own target selection.
+function findGuardThreat(guard: SimWorker, colony: SimColony): SimCreature | null {
+  let nearest: SimCreature | null = null;
+  let nearestDist = Infinity;
+  for (const creature of creatures.values()) {
+    if (!GUARD_HOSTILE_SPECIES.has(creature.species)) continue;
+    const distFromQueen = Math.hypot(creature.x - colony.x, creature.y - colony.y);
+    if (distFromQueen > GUARD_PROTECT_RADIUS && !isChasingColony(creature, colony.id)) continue;
+    const dist = Math.hypot(creature.x - guard.x, creature.y - guard.y);
+    if (dist < nearestDist || (dist === nearestDist && nearest !== null && creature.id < nearest.id)) {
+      nearest = creature;
+      nearestDist = dist;
+    }
+  }
+  return nearest;
+}
+
+// Stage 13B: a guard's "stand near the queen" point — a fixed offset north
+// of her exact position, not exactly on top of her (same reasoning
+// spawnGuard in db.ts uses for the guard's initial position). Re-issuing a
+// "move" command every single tick the queen drifts at all would make a
+// stationary queen's guard jitter between "idle" and "move" every frame
+// (floating point noise alone would do it); GUARD_FOLLOW_REPATH_EPSILON
+// tolerates small drift before committing to a new move target, same
+// "don't reissue on every tick" discipline issueGatherCommand's redundant-
+// resend guard already established for a different command type.
+function advanceGuardFollow(guard: SimWorker, colony: SimColony): void {
+  const followX = clamp(colony.x, 0, worldBounds.width);
+  const followY = clamp(colony.y - GUARD_FOLLOW_RADIUS, 0, worldBounds.height);
+
+  if (guard.command.type === "move") {
+    const driftFromTarget = Math.hypot(guard.command.targetX - followX, guard.command.targetY - followY);
+    if (driftFromTarget <= GUARD_FOLLOW_REPATH_EPSILON) return;
+  } else if (guard.command.type === "idle") {
+    const driftFromFollowPoint = Math.hypot(guard.x - followX, guard.y - followY);
+    if (driftFromFollowPoint <= GUARD_FOLLOW_REPATH_EPSILON) return;
+  }
+
+  guard.command = { type: "move", targetX: followX, targetY: followY };
+}
+
+// Stage 13B: the guard caste's entire autonomous brain, modeled directly on
+// advanceSpider's shape (live target re-read every tick, disengage-range
+// abandonment, deterministic nearest-threat selection) — three priorities,
+// checked in order, every tick: (1) keep fighting an already-engaged threat
+// or disengage from one that died/fled, (2) otherwise look for a new threat
+// near the queen, (3) otherwise follow the queen. Deliberately only ever
+// produces "idle"/"move"/"attack" commands — the exact same WorkerCommand
+// variants a player-controlled worker already uses — so the generic
+// per-worker loop below (movement resolution, handleAttackCommand) executes
+// a guard's decision with zero new execution code. Called once per tick,
+// after advanceQueenMovement so a guard reacts to the queen's already-
+// updated position this same tick, and before the per-worker loop so that
+// loop picks up whatever command this function just decided on, same tick.
+function advanceGuards(dt: number): void {
+  for (const guard of workers.values()) {
+    if (guard.caste !== "guard") continue;
+    const colony = colonies.get(guard.colonyId);
+    // A defeated colony's workers (guard included) are deleted synchronously
+    // by defeatColony() before this loop ever sees them (advanceCreatures,
+    // which can kill the queen, runs earlier in advanceSimulation) — this
+    // check is defensive, not load-bearing.
+    if (!colony || colony.status !== "active") continue;
+
+    if (guard.command.type === "attack") {
+      const target = creatures.get(guard.command.creatureId);
+      const stillEngaged =
+        target !== undefined &&
+        Math.hypot(target.x - guard.x, target.y - guard.y) <= GUARD_DISENGAGE_RANGE &&
+        Math.hypot(target.x - colony.x, target.y - colony.y) <= GUARD_DISENGAGE_RANGE;
+      if (!stillEngaged) guard.command = { type: "idle" };
+    }
+
+    if (guard.command.type !== "attack") {
+      const threat = findGuardThreat(guard, colony);
+      if (threat) {
+        guard.command = { type: "attack", creatureId: threat.id, cooldownRemaining: 0 };
+      } else {
+        advanceGuardFollow(guard, colony);
+      }
+    }
+  }
+}
+
 // Stage 6: chase + attack resolution. Unlike move/gather/return, "in range"
 // here is a continuous check, never a one-shot arrival — the target keeps
 // moving and the attack never "completes" — so this gets its own branch
@@ -1628,6 +1755,7 @@ export function advanceSimulation(dt: number): void {
   advanceCreatures(dt);
   advanceQueenRegen(dt);
   advanceQueenMovement(dt);
+  advanceGuards(dt);
 
   const grid = buildSpatialGrid();
 

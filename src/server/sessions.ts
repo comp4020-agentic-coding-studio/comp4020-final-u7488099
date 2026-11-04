@@ -44,8 +44,14 @@ function buildSpawnAvoidance(): { x: number; y: number; radius: number }[] {
 }
 
 function mintColony(): number {
-  const { colonyId, queenX, queenY, workers } = createColony(buildSpawnAvoidance());
-  registerColony(colonyId, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, workers.length);
+  const { colonyId, queenX, queenY, workers, guard } = createColony(buildSpawnAvoidance());
+  // +1 accounts for the guard, which createColony() returns separately from
+  // `workers` (see its own return type) rather than merged into that array —
+  // peakPopulation must count it from the start, matching the
+  // peak_population value createColony() already persisted to the DB
+  // (STARTING_WORKERS + 1), or the in-memory cache would diverge from the
+  // checkpointed value until the next full loadSimulation() restart.
+  registerColony(colonyId, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, workers.length + 1);
   for (const worker of workers)
     registerWorker({
       id: worker.id,
@@ -56,6 +62,15 @@ function mintColony(): number {
       maxHealth: worker.maxHealth,
       caste: worker.caste,
     });
+  registerWorker({
+    id: guard.id,
+    colonyId,
+    x: guard.x,
+    y: guard.y,
+    health: guard.health,
+    maxHealth: guard.maxHealth,
+    caste: guard.caste,
+  });
   return colonyId;
 }
 

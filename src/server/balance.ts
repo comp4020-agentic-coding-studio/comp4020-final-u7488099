@@ -369,6 +369,46 @@ export const SPIDER_ATTACK_RANGE = 30;
 export const SPIDER_ATTACK_DAMAGE = 10;
 export const SPIDER_ATTACK_COOLDOWN = 1;
 
+// Stage 13B: the guard caste — a high-HP, high-damage, moderate-speed, low-
+// vision unit that autonomously protects its queen. No carry capacity and
+// effectively-infinite reproduceCost (see CASTE_BASE_STATS below) back its
+// structural inability to gather or be reproduced, same pattern soldier's
+// carryCapacity:0 already established. Values are placeholders chosen
+// relative to the existing three castes, not a tuning pass: tankier than
+// soldier (60 HP) so it can plausibly outlast a spider (10 dmg/1s) in a
+// prolonged fight, higher damage than soldier (20) so it kills a spider
+// faster than a soldier would, speed between soldier (120) and worker (150)
+// since it needs to keep pace with a moving queen (QUEEN_SPEED 15) without
+// being a scout-grade chaser.
+export const GUARD_MAX_HEALTH = 150;
+export const GUARD_ATTACK_DAMAGE = 25;
+export const GUARD_SPEED = 130;
+// Reuses WORKER_ATTACK_RANGE/COOLDOWN's exact melee scale rather than
+// inventing independent values — guard combat reuses handleAttackCommand,
+// which already reads range/cooldown generically off these two constants
+// being equal across castes; kept separate so either can move independently
+// if guard combat ever needs its own tuning.
+export const GUARD_ATTACK_RANGE = WORKER_ATTACK_RANGE;
+export const GUARD_ATTACK_COOLDOWN = WORKER_ATTACK_COOLDOWN;
+
+// A guard notices a hostile creature within GUARD_PROTECT_RADIUS of its
+// queen (same order of magnitude as QUEEN_AGGRO_RANGE, since both describe
+// "close enough to the queen to matter") and gives up a chase once its
+// target is beyond GUARD_DISENGAGE_RANGE from the guard — same
+// aggro/disengage gap reasoning as SPIDER_AGGRO_RANGE/SPIDER_DISENGAGE_RANGE
+// above, so a fleeing/killed target reliably ends the chase rather than
+// re-aggroing on a hair trigger.
+export const GUARD_PROTECT_RADIUS = 220;
+export const GUARD_DISENGAGE_RANGE = 320;
+// How far from the queen's exact position a guard parks while following/
+// idling, so it doesn't render stacked directly on top of her.
+export const GUARD_FOLLOW_RADIUS = 40;
+// A guard only reissues its follow "move" command once the queen's current
+// follow point has drifted more than this far from the guard's last
+// follow-move target, so a stationary queen doesn't cause move-command churn
+// every tick.
+export const GUARD_FOLLOW_REPATH_EPSILON = 10;
+
 // Stage 9: evolution milestones are gated on a colony's PEAK population
 // (highest living-worker count its lineage has ever reached), never current
 // population — see CLAUDE.md's Stage 9 section. Exactly 3 tiers, thresholds
@@ -437,7 +477,11 @@ export const QUEEN_DISENGAGE_RANGE = 300;
 // worker becomes 'worker' via migration (see db.ts's migrateWorkerCaste/
 // backfillWorkerCaste) — this is a durable, persistent property of the unit,
 // not a transient UI label. See CLAUDE.md's Stage 10 section.
-export type Caste = "worker" | "soldier" | "scout";
+// Stage 13B: a fourth caste, "guard" — autonomous-only (see simulation.ts's
+// command-rejection in issueMoveCommand/issueGatherCommand/issueAttackCommand
+// and actions.ts's VALID_CASTES, both deliberately left guard-free), so
+// widening this union does NOT make guard player-selectable or reproducible.
+export type Caste = "worker" | "soldier" | "scout" | "guard";
 
 // Stage 10 (§4): caste determines a unit's BASE stats; Stage 9 evolution
 // then scales whichever of these are "applicable" per trait (see
@@ -460,6 +504,12 @@ export const CASTE_BASE_STATS: Record<
   },
   soldier: { maxHealth: 60, attackDamage: 20, speed: 120, reproduceCost: 100, carryCapacity: 0 },
   scout: { maxHealth: 18, attackDamage: 5, speed: 240, reproduceCost: 60, carryCapacity: 5 },
+  // reproduceCost: Infinity is belt-and-suspenders — the real block on
+  // reproducing a guard is VALID_CASTES (actions.ts) and the reproduce route's
+  // own caste whitelist (index.ts), neither of which includes "guard". This
+  // just ensures guard can never be a sane reproduce target even if some
+  // future caller bypassed those whitelists.
+  guard: { maxHealth: GUARD_MAX_HEALTH, attackDamage: GUARD_ATTACK_DAMAGE, speed: GUARD_SPEED, reproduceCost: Infinity, carryCapacity: 0 },
 };
 
 // Stage 10 (§14): current-visibility fog of war vision radii. Fixed
@@ -472,6 +522,10 @@ export const VISION_RADIUS: Record<"queen" | Caste, number> = {
   worker: 180,
   soldier: 180,
   scout: 400,
+  // Stage 13B: "low vision" per the guard's role brief — lower than every
+  // other living unit's radius, since its job is protecting the queen up
+  // close, not scouting.
+  guard: 90,
 };
 
 // Stage 10 (§18): a defeated colony (no active queen, no living units) keeps

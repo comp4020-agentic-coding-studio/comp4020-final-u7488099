@@ -6,6 +6,8 @@ import {
   BIOMASS_NODE_MAX_AMOUNT,
   type Caste,
   colonySpiralPosition,
+  GUARD_FOLLOW_RADIUS,
+  GUARD_MAX_HEALTH,
   PROTEIN_NODE_AMOUNT,
   QUEEN_MAX_HEALTH,
   RESOURCE_NODES,
@@ -607,11 +609,12 @@ function seedIfEmpty(): void {
     .prepare(
       "INSERT INTO colonies (world_id, queen_x, queen_y, status, queen_health, queen_max_health, peak_population) VALUES (?, ?, ?, 'active', ?, ?, ?)",
     )
-    .run(worldId, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, STARTING_WORKERS);
+    .run(worldId, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, STARTING_WORKERS + 1);
   const colonyId = Number(colonyRowId);
 
   seedColonyResources(colonyId);
   spawnStartingWorkers(colonyId, queenX, queenY);
+  spawnGuard(colonyId, queenX, queenY);
 
   const insertNode = db.prepare(
     "INSERT INTO resource_nodes (world_id, x, y, resource_type, amount, max_amount) VALUES (?, ?, ?, ?, ?, ?)",
@@ -661,6 +664,28 @@ function spawnStartingWorkers(
     });
   }
   return workers;
+}
+
+// Stage 13B: every new colony's single guard, inserted separately from
+// spawnStartingWorkers() rather than folding it into that function's loop —
+// that function's INSERT hardcodes caste='worker' (same explicit-at-insert
+// discipline as its own comment above describes), so a second caste needs
+// its own insert statement rather than a parameter threaded through it.
+// Spawned at a small fixed offset from the queen (not pickSpawnPosition's
+// avoid-overlap spiral search, which is for placing whole colonies apart
+// from each other/spiders — a guard only needs to not stack exactly on the
+// queen).
+function spawnGuard(
+  colonyId: number,
+  queenX: number,
+  queenY: number,
+): { id: number; x: number; y: number; health: number; maxHealth: number; caste: Caste } {
+  const x = queenX;
+  const y = queenY - GUARD_FOLLOW_RADIUS;
+  const { lastInsertRowid } = db
+    .prepare("INSERT INTO workers (colony_id, x, y, health, max_health, caste) VALUES (?, ?, ?, ?, ?, 'guard')")
+    .run(colonyId, x, y, GUARD_MAX_HEALTH, GUARD_MAX_HEALTH);
+  return { id: Number(lastInsertRowid), x, y, health: GUARD_MAX_HEALTH, maxHealth: GUARD_MAX_HEALTH, caste: "guard" };
 }
 
 // Crit 10: a colony with no row in `sessions` pointing at it — at most ever
@@ -877,6 +902,7 @@ export function createColony(avoid: { x: number; y: number; radius: number }[] =
   queenX: number;
   queenY: number;
   workers: { id: number; x: number; y: number; health: number; maxHealth: number; caste: Caste }[];
+  guard: { id: number; x: number; y: number; health: number; maxHealth: number; caste: Caste };
 } {
   const world = db.prepare("SELECT id FROM worlds LIMIT 1").get() as { id: number } | undefined;
   if (!world) throw new Error("no world seeded");
@@ -886,20 +912,22 @@ export function createColony(avoid: { x: number; y: number; radius: number }[] =
 
   let colonyId = 0;
   let workers: { id: number; x: number; y: number; health: number; maxHealth: number; caste: Caste }[] = [];
+  let guard: { id: number; x: number; y: number; health: number; maxHealth: number; caste: Caste } | undefined;
   const tx = db.transaction(() => {
     const colonyInfo = db
       .prepare(
         "INSERT INTO colonies (world_id, queen_x, queen_y, status, queen_health, queen_max_health, peak_population) VALUES (?, ?, ?, 'active', ?, ?, ?)",
       )
-      .run(world.id, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, STARTING_WORKERS);
+      .run(world.id, queenX, queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, STARTING_WORKERS + 1);
     colonyId = Number(colonyInfo.lastInsertRowid);
 
     seedColonyResources(colonyId);
     workers = spawnStartingWorkers(colonyId, queenX, queenY);
+    guard = spawnGuard(colonyId, queenX, queenY);
   });
   tx();
 
-  return { colonyId, queenX, queenY, workers };
+  return { colonyId, queenX, queenY, workers, guard: guard! };
 }
 
 // Crit 10: resolves a session cookie value to the colony it owns, or

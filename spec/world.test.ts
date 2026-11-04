@@ -136,11 +136,16 @@ describe("starting colony state (Section 16C)", () => {
       queenX: number;
       queenY: number;
     };
-    const workers = db.prepare("SELECT x, y FROM workers WHERE colony_id = ?").all(colony.id) as {
+    const workers = db.prepare("SELECT x, y, caste FROM workers WHERE colony_id = ?").all(colony.id) as {
       x: number;
       y: number;
+      caste: string;
     }[];
-    expect(workers.length).toBe(STARTING_WORKERS);
+    // Stage 13B: this raw query hits the same `workers` table the seeded
+    // guard row lives in (caste='guard'), so the total is STARTING_WORKERS
+    // plus exactly one guard — not STARTING_WORKERS alone.
+    expect(workers.length).toBe(STARTING_WORKERS + 1);
+    expect(workers.filter((w) => w.caste === "guard").length).toBe(1);
     for (const w of workers) expect(Math.hypot(w.x - colony.queenX, w.y - colony.queenY)).toBeLessThan(100);
 
     const resources = db
@@ -157,6 +162,12 @@ describe("starting colony state (Section 16C)", () => {
     const minted = createColony();
     expect(minted.workers.length).toBe(STARTING_WORKERS);
     for (const w of minted.workers) expect(Math.hypot(w.x - minted.queenX, w.y - minted.queenY)).toBeLessThan(100);
+
+    // Stage 13B: createColony() returns the guard separately from `workers`,
+    // not merged into it — confirm it exists, has the right caste, and spawns
+    // near the queen just like the normal starting workers do.
+    expect(minted.guard.caste).toBe("guard");
+    expect(Math.hypot(minted.guard.x - minted.queenX, minted.guard.y - minted.queenY)).toBeLessThan(100);
 
     const resources = db
       .prepare("SELECT resource_type AS type, amount FROM colony_resources WHERE colony_id = ?")
@@ -214,7 +225,10 @@ describe("resetProductionWorld (Section 16E: reset mechanism)", () => {
     expect(summary.sessionsCleared).toBe(2);
     expect(summary.actionLogPreservedRows).toBe(2);
     expect(summary.colonies).toBe(1);
-    expect(summary.workers).toBe(STARTING_WORKERS);
+    // Stage 13B: summary.workers is a raw COUNT(*) FROM workers, which now
+    // includes the single reseeded colony's guard row alongside its normal
+    // starting workers.
+    expect(summary.workers).toBe(STARTING_WORKERS + 1);
     expect(summary.resourceNodes).toBe(RESOURCE_NODES.length);
     // Stage 7: the creatures table now also seeds spiders in the same
     // empty-table pass — the total is both populations combined.

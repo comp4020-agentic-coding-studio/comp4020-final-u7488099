@@ -11,11 +11,18 @@ import {
   WORKER_RADIUS,
 } from "../server/balance.ts";
 
-const CASTES: Caste[] = ["worker", "soldier", "scout"];
-const CASTE_DISPLAY_NAMES: Record<Caste, string> = { worker: "Worker", soldier: "Soldier", scout: "Scout" };
+// Stage 13B: guard is deliberately excluded from CASTES — that array drives
+// the reproduce-button wiring and the player-facing selection-count UI, both
+// of which are for player-controllable castes only. Guard still needs
+// entries in the Record<Caste,...> tables below for type-completeness and so
+// it renders/fogs correctly, but it never gets a reproduce button and is
+// never counted in a selection summary.
+const CASTES: Exclude<Caste, "guard">[] = ["worker", "soldier", "scout"];
+const CASTE_DISPLAY_NAMES: Record<Caste, string> = { worker: "Worker", soldier: "Soldier", scout: "Scout", guard: "Guard" };
 // Stage 10: caste is communicated by size/stroke, not a second colour axis —
 // own/foreign colouring (blue/gold vs. purple) is unchanged.
-const CASTE_RADIUS: Record<Caste, number> = { worker: WORKER_RADIUS, soldier: 14, scout: 7 };
+// Stage 13B: guard renders larger than every other caste, reading as "tanky".
+const CASTE_RADIUS: Record<Caste, number> = { worker: WORKER_RADIUS, soldier: 14, scout: 7, guard: 16 };
 
 type EvolutionChoice = "foraging" | "survival" | "brood";
 
@@ -118,7 +125,11 @@ const canvas = document.querySelector<HTMLCanvasElement>("#world")!;
 const ctx = canvas.getContext("2d")!;
 const resourcesEl = document.querySelector<HTMLElement>("#resources")!;
 const statusEl = document.querySelector<HTMLElement>("#status")!;
-const reproduceButtons: Record<Caste, HTMLButtonElement> = {
+// Stage 13B: narrowed to exclude "guard" — there is and should never be a
+// "#reproduce-guard" button (guard cannot be reproduced through this UI at
+// all — see CASTES above), so this stays a 3-entry object without a
+// compile error from the now-4-member Caste union.
+const reproduceButtons: Record<Exclude<Caste, "guard">, HTMLButtonElement> = {
   worker: document.querySelector<HTMLButtonElement>("#reproduce-worker")!,
   soldier: document.querySelector<HTMLButtonElement>("#reproduce-soldier")!,
   scout: document.querySelector<HTMLButtonElement>("#reproduce-scout")!,
@@ -237,7 +248,9 @@ function circle(wx: number, wy: number, r: number, fill: string, stroke: string,
 // Stage 10: caste is communicated by radius (CASTE_RADIUS) and stroke
 // thickness — Soldier thicker-stroked, Scout thinner — never a second
 // colour axis; own/foreign colouring is unchanged.
-const CASTE_STROKE_WIDTH: Record<Caste, number> = { worker: 2, soldier: 3, scout: 1 };
+// Stage 13B: guard gets the thickest stroke of all — "tanky protector" reads
+// most clearly as the heaviest outline.
+const CASTE_STROKE_WIDTH: Record<Caste, number> = { worker: 2, soldier: 3, scout: 1, guard: 4 };
 
 // Stage 5: aphid placeholder marker. A diamond, not a circle, so it reads as
 // visually distinct from every other marker (workers/queen/resource nodes are
@@ -880,11 +893,19 @@ function selectWorkersInBox(a: [number, number], b: [number, number]): void {
   const maxX = Math.max(a[0], b[0]);
   const minY = Math.min(a[1], b[1]);
   const maxY = Math.max(a[1], b[1]);
-  const hits = state.workers.filter((w) => w.x >= minX && w.x <= maxX && w.y >= minY && w.y <= maxY);
+  // Stage 13B: guard is never box-selectable, same "cannot be selected"
+  // restriction hitTest() enforces for single-click below. The type
+  // predicate narrows `hits`'s caste to exclude "guard" so `counts` below
+  // can stay a plain 3-entry record, matching CASTES/reproduceButtons.
+  const workers = state.workers;
+  const hits = workers.filter(
+    (w): w is (typeof workers)[number] & { caste: Exclude<Caste, "guard"> } =>
+      w.caste !== "guard" && w.x >= minX && w.x <= maxX && w.y >= minY && w.y <= maxY,
+  );
   selectedWorkerIds = new Set(hits.map((w) => w.id));
   queenSelected = false;
   if (selectedWorkerIds.size > 0) {
-    const counts: Record<Caste, number> = { worker: 0, soldier: 0, scout: 0 };
+    const counts: Record<Exclude<Caste, "guard">, number> = { worker: 0, soldier: 0, scout: 0 };
     for (const w of hits) counts[w.caste]++;
     const breakdown = CASTES.filter((c) => counts[c] > 0)
       .map((c) => `${counts[c]} ${CASTE_DISPLAY_NAMES[c]}${counts[c] === 1 ? "" : "s"}`)
@@ -904,6 +925,9 @@ function hitTest(wx: number, wy: number): { kind: "queen" | "worker" | "creature
     return { kind: "queen", id: state.colony.id };
   }
   for (const worker of state.workers) {
+    // Stage 13B: guard is never selectable, same restriction
+    // selectWorkersInBox() enforces for box-selection above.
+    if (worker.caste === "guard") continue;
     if (Math.hypot(worker.x - wx, worker.y - wy) <= CASTE_RADIUS[worker.caste]) return { kind: "worker", id: worker.id };
   }
   // Stage 10 (revised): a click can only ever resolve to something inside
@@ -1018,7 +1042,10 @@ function onReturnToQueenClick(): void {
 // any other move, just with a destination and a wider worker set.
 async function onRecallAllClick(): Promise<void> {
   if (!state || state.colony.status !== "active") return;
-  const workerIds = state.workers.map((w) => w.id);
+  // Stage 13B: guard is never player-commandable, so Recall All must never
+  // target one — defense in depth alongside the server's structural
+  // "wrong caste" rejection in issueMoveCommand.
+  const workerIds = state.workers.filter((w) => w.caste !== "guard").map((w) => w.id);
   if (workerIds.length === 0) return;
   const res = await fetch("/api/command/move", {
     method: "POST",
