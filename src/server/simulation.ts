@@ -18,6 +18,7 @@ import {
   MIN_SEPARATION,
   QUEEN_AGGRO_RANGE,
   QUEEN_DISENGAGE_RANGE,
+  QUEEN_STORAGE_CAPACITY,
   QUEEN_REGEN_DELAY,
   QUEEN_REGEN_RATE,
   QUEEN_SPEED,
@@ -56,7 +57,7 @@ type WorkerCommand =
   // it ticks to zero the existing attemptGatherClaim runs exactly as before.
   // See CLAUDE.md's Stage 9 section for why this exists at all.
   | { type: "gather"; resourceId: number; lastKnownX: number; lastKnownY: number; channelRemaining?: number }
-  | { type: "return" } // target is always the worker's own colony's nest — see nestPositions
+  | { type: "return" } // target is the colony's current deposit destination — see resolveDepositDestination
   // Stage 6: ephemeral, same category as the rest — never written to the
   // workers table, always reset to idle on loadSimulation(). No
   // lastKnownX/Y: the target creature's live position is re-read from the
@@ -988,11 +989,29 @@ function findResourceNode(id: number): { resourceType: string; amount: number } 
     | undefined;
 }
 
-function creditColony(colonyId: number, resourceType: string, amount: number): void {
+// Stage 13C: the queen's total storage (sugar+protein+biomass combined) is
+// capped at QUEEN_STORAGE_CAPACITY — this reads the colony's current total
+// fresh (no cached running total anywhere) and credits only as much of
+// `amount` as fits, returning the amount actually credited so the caller
+// (attemptDeposit) knows how much to keep in the carrier's payload. A colony
+// already at or over capacity (e.g. one seeded before this cap existed)
+// simply gets 0 available — its existing balance is never touched or
+// truncated, only further crediting is refused. Synchronous, no await
+// between the read and the write, same single-process guarantee the rest of
+// the economy (attemptGatherClaim, reproduce) already relies on for
+// concurrency safety.
+function creditColony(colonyId: number, resourceType: string, amount: number): number {
+  const totalRow = db
+    .prepare("SELECT COALESCE(SUM(amount), 0) AS total FROM colony_resources WHERE colony_id = ?")
+    .get(colonyId) as { total: number };
+  const available = Math.max(0, QUEEN_STORAGE_CAPACITY - totalRow.total);
+  const credited = Math.min(amount, available);
+  if (credited <= 0) return 0;
   db.prepare(
     `INSERT INTO colony_resources (colony_id, resource_type, amount) VALUES (?, ?, ?)
      ON CONFLICT(colony_id, resource_type) DO UPDATE SET amount = amount + excluded.amount`,
-  ).run(colonyId, resourceType, amount);
+  ).run(colonyId, resourceType, credited);
+  return credited;
 }
 
 // The claim itself: synchronous, no await, atomic per node — same
@@ -1055,23 +1074,43 @@ function attemptGatherClaim(worker: SimWorker, resourceId: number): boolean {
   return true;
 }
 
-// The deposit: colony credit and clearing the worker's carrying land in one
+// The deposit: colony credit and updating the worker's carrying land in one
 // transaction, so "colony credited, then crash before carrying clears" can
 // never cause a double-deposit on reload (loadSimulation would otherwise see
 // carrying still set and re-issue a return). See CLAUDE.md.
+//
+// Stage 13C: a deposit can be partial — creditColony caps at the colony's
+// remaining storage, never silently drops the rest. Whatever wasn't credited
+// stays in worker.carrying exactly as before (no teleporting/duplication: the
+// total of credited+retained always equals the original payload), and the
+// worker's command stays "return" so it keeps retrying on every subsequent
+// tick it's within deposit range — the moment creditColony reports room, the
+// remainder (or the next chunk of it) goes through. A worker only ever goes
+// idle once its entire payload has actually been credited.
 function attemptDeposit(worker: SimWorker): void {
   if (!worker.carrying) {
     worker.command = { type: "idle" }; // defensive; not reachable via normal play
     return;
   }
   const { resourceType, amount } = worker.carrying;
+  let credited = 0;
   const tx = db.transaction(() => {
-    creditColony(worker.colonyId, resourceType, amount);
-    db.prepare("UPDATE workers SET carrying_type = NULL, carrying_amount = NULL WHERE id = ?").run(worker.id);
+    credited = creditColony(worker.colonyId, resourceType, amount);
+    const remaining = amount - credited;
+    db.prepare("UPDATE workers SET carrying_type = ?, carrying_amount = ? WHERE id = ?").run(
+      remaining > 0 ? resourceType : null,
+      remaining > 0 ? remaining : null,
+      worker.id,
+    );
   });
   tx();
-  worker.carrying = null;
-  worker.command = { type: "idle" };
+  const remaining = amount - credited;
+  if (remaining > 0) {
+    worker.carrying = { resourceType, amount: remaining }; // full storage (or partial room) — keep waiting/retrying
+  } else {
+    worker.carrying = null;
+    worker.command = { type: "idle" };
+  }
   dirty = true;
 }
 
@@ -1680,9 +1719,26 @@ function separationDelta(worker: SimWorker, grid: Map<string, GridEntry[]>, dt: 
   return { dx, dy };
 }
 
+// Stage 13C: the single place that resolves where a carrier should deposit.
+// Reads authoritative live state (the queen's current, continuously-updated
+// position in the `colonies` map — the same one advanceQueenMovement writes
+// to every tick), never a cached/stale nest position, so a carrier always
+// walks toward and only deposits at the queen's CURRENT location, adjusting
+// mid-trip if she moves. Deliberately factored out of resolveTarget's
+// "return" branch (rather than inlined there) as the designated extension
+// point for a future nest stage: once nests exist, this is the one function
+// that would start consulting nest state instead of (or in addition to) the
+// queen — nothing else about command resolution would need to change.
+function resolveDepositDestination(colonyId: number): { x: number; y: number } {
+  const colony = colonies.get(colonyId)!;
+  return { x: colony.x, y: colony.y };
+}
+
 // Resolves what a command is currently heading toward and how close counts
-// as arrival. `return`'s target is the worker's own colony's nest, read from
-// the immutable nestPositions cache — no query needed on every tick.
+// as arrival. `return`'s target is always the colony's current deposit
+// destination (see resolveDepositDestination) — re-read fresh every tick, so
+// a queen move mid-return redirects the carrier immediately, never a
+// position captured once at issue time.
 function resolveTarget(
   worker: SimWorker,
   command: WorkerCommand,
@@ -1692,8 +1748,8 @@ function resolveTarget(
     return { x: command.lastKnownX, y: command.lastKnownY, arrivalRange: GATHER_RANGE };
   }
   // command.type === "return"
-  const nest = colonies.get(worker.colonyId)!;
-  return { x: nest.x, y: nest.y, arrivalRange: DEPOSIT_RANGE };
+  const dest = resolveDepositDestination(worker.colonyId);
+  return { x: dest.x, y: dest.y, arrivalRange: DEPOSIT_RANGE };
 }
 
 // Resolves what happens the instant a worker reaches its command's target.

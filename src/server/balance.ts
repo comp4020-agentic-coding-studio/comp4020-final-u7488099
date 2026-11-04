@@ -264,6 +264,14 @@ export const GATHER_RANGE = 30;
 // each other.
 export const DEPOSIT_RANGE = 30;
 
+// Stage 13C: the queen's total emergency storage, shared across every
+// resource type combined (not per-type) — a deposit that would push the
+// colony's sugar+protein+biomass total past this cap is only partially
+// credited (see attemptDeposit), never rejected outright and never
+// overflowed. Pre-nest, this is the colony's only storage; post-nest (not
+// implemented yet) nest storage will presumably supersede/extend it.
+export const QUEEN_STORAGE_CAPACITY = 500;
+
 export const WORKER_SPEED = 150; // world units per second
 
 // Stage 13A: queen is deliberately much slower than any worker.

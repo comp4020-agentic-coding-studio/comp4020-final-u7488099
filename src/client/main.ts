@@ -61,6 +61,7 @@ interface ColonyState {
     queenX: number;
     queenY: number;
     resources: Record<string, number>;
+    storageCapacity: number;
     queenHealth: number;
     queenMaxHealth: number;
     status: "active" | "defeated";
@@ -124,6 +125,7 @@ interface ColonyState {
 const canvas = document.querySelector<HTMLCanvasElement>("#world")!;
 const ctx = canvas.getContext("2d")!;
 const resourcesEl = document.querySelector<HTMLElement>("#resources")!;
+const queenStorageEl = document.querySelector<HTMLElement>("#queen-storage")!;
 const statusEl = document.querySelector<HTMLElement>("#status")!;
 // Stage 13B: narrowed to exclude "guard" — there is and should never be a
 // "#reproduce-guard" button (guard cannot be reproduced through this UI at
@@ -565,6 +567,12 @@ function renderResourceCounts(): void {
   resourcesEl.textContent = Object.entries(state.colony.resources)
     .map(([type, amount]) => `${type}: ${amount}`)
     .join(" · ");
+
+  const used = Object.values(state.colony.resources).reduce((sum, amount) => sum + amount, 0);
+  const capacity = state.colony.storageCapacity;
+  const full = used >= capacity;
+  queenStorageEl.textContent = `Queen Storage: ${used} / ${capacity}${full ? " (FULL)" : ""}`;
+  queenStorageEl.classList.toggle("full", full);
 }
 
 // Stage 9: each reproduce button always shows its caste's current live

@@ -1,4 +1,4 @@
-import { type Caste, RESOURCE_TYPES } from "./balance.ts";
+import { type Caste, QUEEN_STORAGE_CAPACITY, RESOURCE_TYPES } from "./balance.ts";
 import { db } from "./db.ts";
 import { type EvolutionChoice, type EvolutionSelections, getEvolutionModifiers, NO_EVOLUTION } from "./evolution.ts";
 import {
@@ -21,6 +21,10 @@ export interface ColonyState {
     queenX: number;
     queenY: number;
     resources: Record<string, number>;
+    // Stage 13C: the queen's shared total storage cap — resources summed
+    // across all types. A plain exported constant, not per-colony state, but
+    // sent here so the client never needs its own copy of balance.ts's value.
+    storageCapacity: number;
     queenHealth: number;
     queenMaxHealth: number;
     status: "active" | "defeated";
@@ -192,6 +196,7 @@ export function getState(colonyId: number): ColonyState {
       queenX: snapshot?.x ?? colonyRow.queenX,
       queenY: snapshot?.y ?? colonyRow.queenY,
       resources,
+      storageCapacity: QUEEN_STORAGE_CAPACITY,
       queenHealth: snapshot?.health ?? 0,
       queenMaxHealth: snapshot?.maxHealth ?? 0,
       status: snapshot?.status ?? "defeated",

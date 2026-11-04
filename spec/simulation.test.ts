@@ -70,6 +70,10 @@ const {
   GUARD_PROTECT_RADIUS,
   GUARD_FOLLOW_RADIUS,
   GUARD_FOLLOW_REPATH_EPSILON,
+  DEPOSIT_RANGE,
+  QUEEN_STORAGE_CAPACITY,
+  BIOMASS_NODE_MAX_AMOUNT,
+  PROTEIN_NODE_AMOUNT,
 } = await import("../src/server/balance.ts");
 const { getEvolutionModifiers, tierThreshold, traitDisplayName, NO_EVOLUTION } = await import(
   "../src/server/evolution.ts"
@@ -2689,5 +2693,400 @@ describe("Stage 13B: guard caste", () => {
 
     const survivalII = getEvolutionModifiers({ tier1: null, tier2: "survival", tier3: null }, "guard");
     expect(survivalII.attackDamage).toBeGreaterThan(base.attackDamage);
+  });
+});
+
+describe("Stage 13C: moving-queen deposits + finite emergency storage", () => {
+  // Drives a carrying worker's "return" command to completion (or to a
+  // stable non-progressing state near the queen) over a bounded number of
+  // ticks — long enough to cross the whole 3000x3000 world at WORKER_SPEED,
+  // short enough that an infinite-loop bug in attemptDeposit shows up as a
+  // failed assertion instead of a hang.
+  const RETURN_TICKS = 400;
+
+  it("a worker deposits at the queen's moved location, not her original one", () => {
+    const [proteinNode] = findNodesByType("protein");
+    const worker = registerTestWorker(9200, proteinNode.x, proteinNode.y);
+    expect(sim.issueGatherCommand(worker.id, proteinNode.id, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+    expect(sim.getWorkerCommand(worker.id)).toBe("return");
+
+    const originalQueen = { ...liveQueenPosition() };
+    const target = { x: originalQueen.x + 400, y: originalQueen.y + 400 };
+    expect(sim.issueQueenMoveCommand(colony.id, target.x, target.y)).toBeNull();
+
+    for (let i = 0; i < RETURN_TICKS; i++) {
+      sim.advanceSimulation(TICK_DT);
+      if (sim.getWorkerCommand(worker.id) === "idle") break;
+    }
+
+    expect(sim.getWorkerCommand(worker.id)).toBe("idle");
+    expect(workerById(worker.id).carrying).toBeNull();
+    const finalQueen = liveQueenPosition();
+    const finalWorker = workerById(worker.id);
+    expect(Math.hypot(finalWorker.x - finalQueen.x, finalWorker.y - finalQueen.y)).toBeLessThanOrEqual(
+      DEPOSIT_RANGE + 1,
+    );
+  });
+
+  it("a carrier redirects mid-return when the queen moves, rather than heading to her stale position", () => {
+    const queenStart = liveQueenPosition();
+    // Place the worker far from the queen (QUEEN_SPEED is only 1/10th of
+    // WORKER_SPEED, so the queen needs many ticks of travel before her
+    // displacement is large enough to produce a measurable redirect — a
+    // worker starting right on top of a real protein node is too close for
+    // that to show up reliably).
+    const farNodeId = insertNode(queenStart.x - 500, queenStart.y - 500, "protein", PROTEIN_NODE_AMOUNT);
+    const farNode = { x: queenStart.x - 500, y: queenStart.y - 500 };
+    const worker = registerTestWorker(9201, farNode.x, farNode.y);
+    expect(sim.issueGatherCommand(worker.id, farNodeId, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+    expect(sim.getWorkerCommand(worker.id)).toBe("return");
+
+    // A handful of ticks of travel toward the original queen position.
+    for (let i = 0; i < 10; i++) sim.advanceSimulation(TICK_DT);
+    const beforeMove = { x: workerById(worker.id).x, y: workerById(worker.id).y };
+
+    // Move the queen far away, perpendicular to the worker's current heading.
+    const farTarget = { x: liveQueenPosition().x + 500, y: liveQueenPosition().y - 500 };
+    expect(sim.issueQueenMoveCommand(colony.id, farTarget.x, farTarget.y)).toBeNull();
+
+    // Enough ticks for the queen (QUEEN_SPEED) to have moved far enough that
+    // the worker's heading toward her visibly changes.
+    for (let i = 0; i < 40; i++) sim.advanceSimulation(TICK_DT);
+    const afterRedirect = { x: workerById(worker.id).x, y: workerById(worker.id).y };
+
+    // The worker's heading changed in response to the queen's move — it did
+    // not keep walking in exactly the same direction as before.
+    //
+    // Note on the threshold: because QUEEN_SPEED is exactly WORKER_SPEED/10,
+    // a worker in pure pursuit of a queen drifting perpendicular to its
+    // approach asymptotically bends by at most ~atan(QUEEN_SPEED /
+    // WORKER_SPEED) ≈ 0.0997 rad, regardless of distance or tick count — so
+    // a 0.1 rad threshold is above what this geometry can ever produce.
+    // 0.05 rad comfortably demonstrates a real, non-trivial redirect while
+    // staying under that physical ceiling.
+    const headingBefore = Math.atan2(beforeMove.y - farNode.y, beforeMove.x - farNode.x);
+    const headingAfter = Math.atan2(afterRedirect.y - beforeMove.y, afterRedirect.x - beforeMove.x);
+    expect(Math.abs(headingAfter - headingBefore)).toBeGreaterThan(0.05);
+  });
+
+  it("never deposits at the queen's former location once she has moved away", () => {
+    const originalQueen = { ...liveQueenPosition() };
+    // The worker must start far enough from the queen's original position
+    // that, by the time it travels close enough to deposit, the queen (who
+    // moves at only 1/10th WORKER_SPEED) has had enough real time to have
+    // displaced more than DEPOSIT_RANGE from where she started — a worker
+    // starting right next to a real protein node catches up to the queen's
+    // barely-moved position too quickly for that to be true.
+    const farX = originalQueen.x - 800;
+    const farY = originalQueen.y - 800;
+    const farNodeId = insertNode(farX, farY, "protein", PROTEIN_NODE_AMOUNT);
+    const worker = registerTestWorker(9202, farX, farY);
+    expect(sim.issueGatherCommand(worker.id, farNodeId, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+
+    // Move the queen far enough away that the worker's old destination is
+    // well outside the new DEPOSIT_RANGE.
+    const target = { x: originalQueen.x + 600, y: originalQueen.y };
+    expect(sim.issueQueenMoveCommand(colony.id, target.x, target.y)).toBeNull();
+
+    for (let i = 0; i < RETURN_TICKS; i++) {
+      sim.advanceSimulation(TICK_DT);
+      // At no point should the worker sit at the queen's old position while
+      // idle (i.e. deposited) — it should only ever go idle near wherever
+      // the queen currently is.
+      if (sim.getWorkerCommand(worker.id) === "idle") {
+        const w = workerById(worker.id);
+        const distFromOld = Math.hypot(w.x - originalQueen.x, w.y - originalQueen.y);
+        expect(distFromOld).toBeGreaterThan(DEPOSIT_RANGE);
+        break;
+      }
+    }
+    expect(sim.getWorkerCommand(worker.id)).toBe("idle");
+  });
+
+  it("credits a deposit exactly once — no double-credit, no under-credit", () => {
+    const queen = queenPosition();
+    const nodeId = insertNode(queen.x + 20, queen.y, "sugar", SUGAR_NODE_MAX_AMOUNT);
+    const worker = registerTestWorker(9203, queen.x + 20, queen.y);
+    const before = resourceAmount("sugar");
+
+    expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+    sim.advanceSimulation(TICK_DT); // deposits
+
+    expect(resourceAmount("sugar")).toBe(before + GATHER_YIELD);
+    expect(workerById(worker.id).carrying).toBeNull();
+
+    // Further ticks must not re-credit anything.
+    for (let i = 0; i < 10; i++) sim.advanceSimulation(TICK_DT);
+    expect(resourceAmount("sugar")).toBe(before + GATHER_YIELD);
+  });
+
+  it("storage capacity is shared across all resource types combined, not per-type", () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'sugar'").run(
+      300,
+      colony.id,
+    );
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'biomass'").run(
+      190,
+      colony.id,
+    );
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'protein'").run(
+      0,
+      colony.id,
+    );
+    sim.loadSimulation();
+    // Total is 490/500 — only 10 units of room left, regardless of type.
+    const queen = queenPosition();
+    const nodeId = insertNode(queen.x + 20, queen.y, "protein", PROTEIN_NODE_AMOUNT);
+    const worker = registerTestWorker(9204, queen.x + 20, queen.y);
+    expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+    sim.advanceSimulation(TICK_DT);
+
+    const total = resourceAmount("sugar") + resourceAmount("biomass") + resourceAmount("protein");
+    expect(total).toBe(QUEEN_STORAGE_CAPACITY);
+  });
+
+  it("existing starting inventory counts toward the cap", () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'sugar'").run(
+      QUEEN_STORAGE_CAPACITY - STARTING_PROTEIN,
+      colony.id,
+    );
+    sim.loadSimulation();
+    // Total is already exactly at capacity (STARTING_PROTEIN + the sugar set
+    // above) before any deposit — the pre-existing starting protein must be
+    // counted, not ignored.
+    const queen = queenPosition();
+    const nodeId = insertNode(queen.x + 20, queen.y, "biomass", BIOMASS_NODE_MAX_AMOUNT);
+    const worker = registerTestWorker(9205, queen.x + 20, queen.y);
+    expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+    sim.advanceSimulation(TICK_DT);
+
+    expect(resourceAmount("biomass")).toBe(0); // no room at all
+    expect(workerById(worker.id).carrying).toEqual({ resourceType: "biomass", amount: GATHER_YIELD });
+  });
+
+  it("a partial deposit credits only what fits and the carrier retains the remainder", () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'sugar'").run(
+      QUEEN_STORAGE_CAPACITY - STARTING_PROTEIN - 6,
+      colony.id,
+    );
+    sim.loadSimulation();
+    // 6 units of room remain, worker carries GATHER_YIELD (10) > 6.
+    const queen = queenPosition();
+    const nodeId = insertNode(queen.x + 20, queen.y, "biomass", BIOMASS_NODE_MAX_AMOUNT);
+    const worker = registerTestWorker(9206, queen.x + 20, queen.y);
+    expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+    sim.advanceSimulation(TICK_DT);
+
+    expect(resourceAmount("biomass")).toBe(6);
+    expect(workerById(worker.id).carrying).toEqual({ resourceType: "biomass", amount: GATHER_YIELD - 6 });
+    expect(sim.getWorkerCommand(worker.id)).toBe("return"); // still waiting/retrying, not idle
+    const total = resourceAmount("sugar") + resourceAmount("biomass") + resourceAmount("protein");
+    expect(total).toBe(QUEEN_STORAGE_CAPACITY);
+  });
+
+  it("when storage is completely full, the carrier keeps its entire payload and keeps waiting", () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'sugar'").run(
+      QUEEN_STORAGE_CAPACITY - STARTING_PROTEIN,
+      colony.id,
+    );
+    sim.loadSimulation();
+    const queen = queenPosition();
+    const nodeId = insertNode(queen.x + 20, queen.y, "biomass", BIOMASS_NODE_MAX_AMOUNT);
+    const worker = registerTestWorker(9207, queen.x + 20, queen.y);
+    expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+
+    for (let i = 0; i < 5; i++) sim.advanceSimulation(TICK_DT);
+
+    expect(resourceAmount("biomass")).toBe(0);
+    expect(workerById(worker.id).carrying).toEqual({ resourceType: "biomass", amount: GATHER_YIELD });
+    expect(sim.getWorkerCommand(worker.id)).toBe("return");
+  });
+
+  it("spending resources (reproduction) frees capacity and lets a waiting carrier deposit", () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'sugar'").run(
+      QUEEN_STORAGE_CAPACITY - STARTING_PROTEIN,
+      colony.id,
+    );
+    sim.loadSimulation();
+    const queen = queenPosition();
+    const nodeId = insertNode(queen.x + 20, queen.y, "biomass", BIOMASS_NODE_MAX_AMOUNT);
+    const worker = registerTestWorker(9208, queen.x + 20, queen.y);
+    expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+    sim.advanceSimulation(TICK_DT); // full — stays carrying
+    expect(workerById(worker.id).carrying).toEqual({ resourceType: "biomass", amount: GATHER_YIELD });
+
+    // Spend protein via reproduction, freeing exactly STARTING_PROTEIN of room.
+    expect(actions.reproduce(colony.id, "worker")).toEqual({ ok: true });
+
+    sim.advanceSimulation(TICK_DT); // now there's room — should deposit
+
+    expect(workerById(worker.id).carrying).toBeNull();
+    expect(sim.getWorkerCommand(worker.id)).toBe("idle");
+    expect(resourceAmount("biomass")).toBe(GATHER_YIELD);
+  });
+
+  it("concurrent deposits in the same tick never push the total over capacity", () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'sugar'").run(
+      QUEEN_STORAGE_CAPACITY - STARTING_PROTEIN - GATHER_YIELD,
+      colony.id,
+    );
+    sim.loadSimulation();
+    // Exactly GATHER_YIELD units of room; three workers each carrying
+    // GATHER_YIELD (10) all arrive and attempt to deposit on the very same
+    // tick — only the first-processed one can fully clear.
+    const queen = queenPosition();
+    const nodeIds = [
+      insertNode(queen.x + 20, queen.y, "biomass", BIOMASS_NODE_MAX_AMOUNT),
+      insertNode(queen.x + 22, queen.y, "biomass", BIOMASS_NODE_MAX_AMOUNT),
+      insertNode(queen.x + 24, queen.y, "biomass", BIOMASS_NODE_MAX_AMOUNT),
+    ];
+    const group = [9209, 9210, 9211].map((id, i) => registerTestWorker(id, queen.x + 20 + i * 2, queen.y));
+    for (let i = 0; i < group.length; i++) {
+      expect(sim.issueGatherCommand(group[i].id, nodeIds[i], colony.id)).toBeNull();
+    }
+    advanceThroughGatherChannel();
+    for (const w of group) expect(sim.getWorkerCommand(w.id)).toBe("return");
+
+    sim.advanceSimulation(TICK_DT); // all three attempt to deposit on this same tick
+
+    const total = resourceAmount("sugar") + resourceAmount("biomass") + resourceAmount("protein");
+    expect(total).toBeLessThanOrEqual(QUEEN_STORAGE_CAPACITY);
+    expect(resourceAmount("biomass")).toBe(GATHER_YIELD); // only the room that existed was handed out, exactly once
+    const stillCarrying = group.filter((w) => workerById(w.id).carrying !== null);
+    expect(stillCarrying).toHaveLength(2); // two of the three couldn't fit and are still waiting
+  });
+
+  it("no negative resource balances ever result from a deposit", () => {
+    const queen = queenPosition();
+    const nodeId = insertNode(queen.x + 20, queen.y, "sugar", SUGAR_NODE_MAX_AMOUNT);
+    const worker = registerTestWorker(9212, queen.x + 20, queen.y);
+    expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+    sim.advanceSimulation(TICK_DT);
+
+    expect(resourceAmount("sugar")).toBeGreaterThanOrEqual(0);
+    expect(resourceAmount("protein")).toBeGreaterThanOrEqual(0);
+    expect(resourceAmount("biomass")).toBeGreaterThanOrEqual(0);
+  });
+
+  it("checkpoint/reload preserves both deposited balances and a still-carrying worker's payload", () => {
+    db.prepare("UPDATE colony_resources SET amount = ? WHERE colony_id = ? AND resource_type = 'sugar'").run(
+      QUEEN_STORAGE_CAPACITY - STARTING_PROTEIN,
+      colony.id,
+    );
+    sim.loadSimulation();
+    const queen = queenPosition();
+    const nodeId = insertNode(queen.x + 20, queen.y, "biomass", BIOMASS_NODE_MAX_AMOUNT);
+    // Must be a real seeded worker (not registerTestWorker's synthetic,
+    // SQL-row-less kind) so it survives the loadSimulation() calls below —
+    // see the "carrying survives a reload..." precedent test.
+    const [worker] = sim.getWorkersForColony(colony.id);
+    sim.registerWorker({
+      id: worker.id,
+      colonyId: colony.id,
+      x: queen.x + 20,
+      y: queen.y,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
+    });
+    expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+    sim.advanceSimulation(TICK_DT); // full storage — worker keeps its payload
+
+    const carryingBefore = workerById(worker.id).carrying;
+    expect(carryingBefore).toEqual({ resourceType: "biomass", amount: GATHER_YIELD });
+    const sugarBefore = resourceAmount("sugar");
+
+    sim.checkpointSimulation();
+    sim.loadSimulation();
+
+    expect(resourceAmount("sugar")).toBe(sugarBefore);
+    expect(workerById(worker.id).carrying).toEqual(carryingBefore);
+    expect(sim.getWorkerCommand(worker.id)).toBe("return");
+  });
+
+  it("worker and scout gathering remain functional", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    const worker = registerTestWorker(9214, sugarNode.x, sugarNode.y);
+    expect(sim.issueGatherCommand(worker.id, sugarNode.id, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+    expect(workerById(worker.id).carrying).toEqual({ resourceType: "sugar", amount: GATHER_YIELD });
+
+    const [, proteinNode2] = findNodesByType("protein"); // avoid colliding node with worker above
+    sim.registerWorker({
+      id: 9215,
+      colonyId: colony.id,
+      x: proteinNode2.x,
+      y: proteinNode2.y,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "scout",
+    });
+    expect(sim.issueGatherCommand(9215, proteinNode2.id, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+    // A scout's carry capacity (CASTE_BASE_STATS.scout.carryCapacity) is 5,
+    // not GATHER_YIELD (10) — that's a worker-only figure.
+    expect(workerById(9215).carrying).toEqual({ resourceType: "protein", amount: 5 });
+  });
+
+  it("soldier and guard still cannot gather", () => {
+    const [sugarNode] = findNodesByType("sugar");
+    sim.registerWorker({
+      id: 9216,
+      colonyId: colony.id,
+      x: sugarNode.x,
+      y: sugarNode.y,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "soldier",
+    });
+    expect(sim.issueGatherCommand(9216, sugarNode.id, colony.id)).toBe("wrong caste");
+    const guard = sim.getWorkersForColony(colony.id).find((w) => w.caste === "guard")!;
+    expect(sim.issueGatherCommand(guard.id, sugarNode.id, colony.id)).toBe("wrong caste");
+  });
+
+  it("a defeated colony cannot continue depositing resources", () => {
+    const queen = queenPosition();
+    const nodeId = insertNode(queen.x + 20, queen.y, "sugar", SUGAR_NODE_MAX_AMOUNT);
+    const worker = registerTestWorker(9217, queen.x + 20, queen.y);
+    expect(sim.issueGatherCommand(worker.id, nodeId, colony.id)).toBeNull();
+    advanceThroughGatherChannel();
+    expect(sim.getWorkerCommand(worker.id)).toBe("return");
+
+    sim.applyDamageToQueen(colony.id, QUEEN_MAX_HEALTH, 777);
+    expect(sim.getColonySnapshot(colony.id)?.status).toBe("defeated");
+
+    // colony_resources is deleted on defeat (defeatColony) — no further
+    // deposit can credit a row that no longer exists, and the worker itself
+    // is deleted too, so there's nothing left to even attempt a deposit.
+    expect(sim.getWorkersForColony(colony.id).some((w) => w.id === worker.id)).toBe(false);
+    expect(
+      db.prepare("SELECT COUNT(*) AS n FROM colony_resources WHERE colony_id = ?").get(colony.id) as { n: number },
+    ).toEqual({ n: 0 });
+  });
+
+  it("existing queen movement and guard follow behaviour remain functional", () => {
+    const start = { ...liveQueenPosition() };
+    const target = { x: start.x + 30, y: start.y };
+    expect(sim.issueQueenMoveCommand(colony.id, target.x, target.y)).toBeNull();
+    for (let i = 0; i < 200; i++) sim.advanceSimulation(TICK_DT);
+
+    const after = liveQueenPosition();
+    expect(Math.hypot(after.x - target.x, after.y - target.y)).toBeLessThan(1);
+
+    const guard = sim.getWorkersForColony(colony.id).find((w) => w.caste === "guard")!;
+    expect(Math.hypot(guard.x - after.x, guard.y - (after.y - GUARD_FOLLOW_RADIUS))).toBeLessThan(
+      GUARD_FOLLOW_REPATH_EPSILON + 1,
+    );
   });
 });

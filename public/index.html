@@ -19,6 +19,13 @@
       #resources {
         font-weight: 600;
       }
+      #queen-storage {
+        font-weight: 600;
+        margin-top: 0;
+      }
+      #queen-storage.full {
+        color: #b71c1c;
+      }
       #status {
         min-height: 1.5rem;
         color: #555;
@@ -523,6 +530,7 @@
         <a id="admin-link" href="/admin" hidden>Admin</a>
       </div>
       <p id="resources">sugar: 0 · protein: 0 · biomass: 0</p>
+      <p id="queen-storage">Queen Storage: 0 / 500</p>
       <canvas id="world" width="960" height="600"></canvas>
       <p id="hint">
         Drag a box around workers to select them, then click a resource node, an aphid, or empty ground to command
