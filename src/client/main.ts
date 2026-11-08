@@ -924,7 +924,7 @@ function selectWorkersInBox(a: [number, number], b: [number, number]): void {
   }
 }
 
-function hitTest(wx: number, wy: number): { kind: "queen" | "worker" | "creature" | "node"; id: number } | null {
+function hitTest(wx: number, wy: number): { kind: "queen" | "worker" | "creature" | "node" | "enemy-worker"; id: number } | null {
   if (!state) return null;
   // Stage 13A: own queen only — foreign queens are drawn (see state.colonies
   // render loop above) but deliberately never checked here, so they stay
@@ -950,6 +950,16 @@ function hitTest(wx: number, wy: number): { kind: "queen" | "worker" | "creature
     if (!isVisible(creature.x, creature.y, vision)) continue;
     const r = creature.species === "spider" ? SPIDER_RADIUS : APHID_RADIUS;
     if (Math.hypot(creature.x - wx, creature.y - wy) <= r + 4) return { kind: "creature", id: creature.id };
+  }
+  // Stage 14A: an enemy colony's worker is clickable (for a PvP attack
+  // command) but never selectable — it's never added to selectedWorkerIds,
+  // only ever dispatched to onEnemyWorkerClick. Gated by the same fog
+  // visibility check as creatures/nodes above, so a fog-hidden enemy unit
+  // can never be clicked, exactly like a hidden creature/node falls through
+  // to a plain move instead.
+  for (const worker of state.otherWorkers) {
+    if (!isVisible(worker.x, worker.y, vision)) continue;
+    if (Math.hypot(worker.x - wx, worker.y - wy) <= CASTE_RADIUS[worker.caste]) return { kind: "enemy-worker", id: worker.id };
   }
   for (const node of state.resourceNodes) {
     if (!isVisible(node.x, node.y, vision)) continue;
@@ -991,6 +1001,10 @@ function onCanvasClick(sx: number, sy: number): void {
   }
   if (hit.kind === "creature") {
     onCreatureClick(hit.id);
+    return;
+  }
+  if (hit.kind === "enemy-worker") {
+    onEnemyWorkerClick(hit.id);
     return;
   }
   onNodeClick(hit.id);
@@ -1102,6 +1116,31 @@ async function onCreatureClick(creatureId: number): Promise<void> {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ workerIds, creatureId }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    statusEl.textContent = body.error ?? "attack failed";
+    return;
+  }
+  statusEl.textContent = describeBatchOutcome(workerIds.length, body.errors, "attacking");
+  setState(body);
+}
+
+// Stage 14A: mirrors onCreatureClick's shape exactly — same selected-workers
+// precondition, same batch-outcome reporting — just targeting another
+// colony's worker (targetWorkerId) instead of a creature (creatureId). The
+// server (not this client) is what actually enforces ownership/caste/
+// friendly-fire rules; this is purely dispatch.
+async function onEnemyWorkerClick(targetWorkerId: number): Promise<void> {
+  const workerIds = [...selectedWorkerIds];
+  if (workerIds.length === 0) {
+    statusEl.textContent = "Select a worker first.";
+    return;
+  }
+  const res = await fetch("/api/command/attack", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds, targetWorkerId }),
   });
   const body = await res.json();
   if (!res.ok) {

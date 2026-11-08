@@ -63,7 +63,19 @@ type WorkerCommand =
   // lastKnownX/Y: the target creature's live position is re-read from the
   // `creatures` Map every tick (see handleAttackCommand), not captured once
   // at issue time like gather's lastKnownX/Y is.
-  | { type: "attack"; creatureId: number; cooldownRemaining: number };
+  // Stage 14A: a second "attack" shape, discriminated by targetType, for
+  // PvP — targets a live enemy worker (looked up in the `workers` Map every
+  // tick, same live-lookup discipline as creatureId above) instead of a
+  // creature. No lastKnownX/Y or captured colonyId either: a dead target (or
+  // one whose colony was defeated and wiped) simply disappears from the
+  // `workers` Map, so handleAttackWorkerTarget's plain "no such target" guard
+  // already covers both "target died" and "target's colony got defeated" —
+  // see killWorker/defeatColony. Two variants of the same "attack" type
+  // (rather than a nested `target` field) keep every existing `command.type
+  // === "attack"` check working unchanged — callers just add a `targetType`
+  // narrow where they touch creatureId/targetWorkerId specifically.
+  | { type: "attack"; targetType: "creature"; creatureId: number; cooldownRemaining: number }
+  | { type: "attack"; targetType: "worker"; targetWorkerId: number; cooldownRemaining: number };
 
 interface SimWorker {
   id: number;
@@ -101,7 +113,18 @@ export type AttackCommandError =
   | "no such creature"
   | "worker is busy returning resources"
   | "wrong caste"
-  | "colony defeated";
+  | "colony defeated"
+  // Stage 14A: PvP-specific rejections. "no such target" covers a
+  // nonexistent targetWorkerId AND a target whose colony has since been
+  // defeated (defeatColony wipes that colony's workers synchronously, so by
+  // the time this runs a defeated-colony target is already just gone from
+  // the `workers` Map — no separate "colony defeated" check needed on the
+  // target side). "cannot attack own colony" is its own distinct error
+  // (unlike the owner-lookup-looks-like-missing discipline above) because
+  // there's no information to leak here: the attacker already knows which
+  // worker ids are their own.
+  | "no such target"
+  | "cannot attack own colony";
 
 // Stage 5: a neutral creature (first species: aphid). Stage 6 makes it
 // interactable: health/maxHealth are durable (see db.ts's creatures table),
@@ -932,7 +955,49 @@ export function issueAttackCommand(
   if (worker.carrying) return "worker is busy returning resources";
   const creature = creatures.get(creatureId);
   if (!creature) return "no such creature";
-  worker.command = { type: "attack", creatureId, cooldownRemaining: 0 };
+  worker.command = { type: "attack", targetType: "creature", creatureId, cooldownRemaining: 0 };
+  return null;
+}
+
+// Stage 14A: the PvP sibling of issueAttackCommand above — same batch-command
+// contract, same attacker-side guards (ownership/active-colony/caste/carrying,
+// in the same order), reusing the exact same AttackCommandError union. A
+// deliberately separate function rather than a third parameter on
+// issueAttackCommand: the two target kinds resolve against entirely
+// different Maps (creatures vs workers) with different target-side checks, so
+// forcing one signature to cover both would need its own internal
+// discriminator anyway — this just makes that discriminator the function
+// name/call site instead, which is what index.ts's route also keys off of
+// (presence of `creatureId` vs `targetWorkerId` in the request body, never an
+// ambiguous shared id field — see CLAUDE.md's Stage 14A section).
+//
+// ownerColonyId is, as with every other issue*Command, resolved server-side
+// from the caller's session — never trusted from the client (Crit 10).
+// Target-side validation deliberately never leaks *why* a target was
+// rejected: a nonexistent id, a dead unit, a guard (not a valid PvP target in
+// this stage — see CLAUDE.md), and a unit belonging to a just-defeated colony
+// (defeatColony deletes that colony's workers from this same Map
+// synchronously, so there is nothing left here to distinguish "defeated" from
+// "never existed") are all indistinguishable and all report "no such
+// target", mirroring the existing own-worker-lookup discipline above.
+export function issueAttackWorkerCommand(
+  workerId: number,
+  targetWorkerId: number,
+  ownerColonyId: number,
+): AttackCommandError | null {
+  if (!isColonyActive(ownerColonyId)) return "colony defeated";
+  const worker = workers.get(workerId);
+  if (!worker || worker.colonyId !== ownerColonyId) return "no such worker";
+  if (worker.caste === "guard") return "wrong caste";
+  if (worker.carrying) return "worker is busy returning resources";
+  const target = workers.get(targetWorkerId);
+  if (!target || target.caste === "guard") return "no such target";
+  // No friendly fire: checked as its own distinct error (unlike the
+  // nonexistent-target cases above) since there's no ownership information
+  // to protect here — the attacker already knows which worker ids are their
+  // own.
+  if (target.colonyId === ownerColonyId) return "cannot attack own colony";
+  worker.command = { type: "attack", targetType: "worker", targetWorkerId, cooldownRemaining: 0 };
   return null;
 }
 
@@ -1156,7 +1221,7 @@ function killCreature(creature: SimCreature): number {
   // place — no auto-gather of the new carcass, no auto-retarget to another
   // creature. The player must issue both explicitly.
   for (const worker of workers.values()) {
-    if (worker.command.type === "attack" && worker.command.creatureId === creature.id) {
+    if (worker.command.type === "attack" && worker.command.targetType === "creature" && worker.command.creatureId === creature.id) {
       worker.command = { type: "idle" };
     }
   }
@@ -1172,7 +1237,7 @@ function killCreature(creature: SimCreature): number {
 // exists, nothing can ever later run attemptDeposit for this worker id. This
 // is the entire carried-resource-on-death rule — no separate code path, so
 // nothing can duplicate or re-credit it. See CLAUDE.md.
-function killWorker(worker: SimWorker, cause: string, creatureId?: number): void {
+function killWorker(worker: SimWorker, cause: string, creatureId?: number, attackerWorkerId?: number): void {
   db.prepare("DELETE FROM workers WHERE id = ?").run(worker.id);
   workers.delete(worker.id);
   // Mirrors killCreature's attacker-idle-sweep for the reverse direction:
@@ -1185,8 +1250,21 @@ function killWorker(worker: SimWorker, cause: string, creatureId?: number): void
       creature.command = { type: "idle", remaining: pickIdleDuration(creature, WANDER_PARAMS[creature.species]) };
     }
   }
+  // Stage 14A: mirrors the sweep above for the new PvP direction — any other
+  // player-controlled worker (any colony, including this victim's own, though
+  // no-PvP/no-friendly-fire mean only an enemy ever actually holds one of
+  // these) mid-attack of this now-dead worker drops to idle rather than
+  // holding a dangling targetWorkerId. Same single-pass-this-tick visibility
+  // as the creature sweep: workers.values() is iterated in one
+  // single-threaded pass by advanceSimulation's own per-worker loop, so an
+  // attacker processed later in the same tick already sees this.
+  for (const other of workers.values()) {
+    if (other.command.type === "attack" && other.command.targetType === "worker" && other.command.targetWorkerId === worker.id) {
+      other.command = { type: "idle" };
+    }
+  }
   dirty = true;
-  logAction(worker.colonyId, "worker_died", { workerId: worker.id, cause, creatureId });
+  logAction(worker.colonyId, "worker_died", { workerId: worker.id, cause, creatureId, attackerWorkerId });
 }
 
 // Mirrors applyDamage: health is written synchronously on every hit, same
@@ -1203,6 +1281,20 @@ export function applyDamageToWorker(workerId: number, amount: number, spiderId: 
   db.prepare("UPDATE workers SET health = ? WHERE id = ?").run(worker.health, worker.id);
   dirty = true;
   if (worker.health <= 0) killWorker(worker, "spider", spiderId);
+}
+
+// Stage 14A: the PvP sibling of applyDamageToWorker above — identical
+// synchronous-write-on-hit shape, just logging "pvp" + the attacking worker's
+// id as cause/attackerWorkerId instead of "spider" + a creature id. Kept
+// separate (rather than widening applyDamageToWorker's own signature) so the
+// existing spider-damage call sites/tests above are untouched byte-for-byte,
+// matching this module's existing precedent of additive sibling functions
+// over widened ones (see issueAttackWorkerCommand next to issueAttackCommand).
+function applyPvpDamageToWorker(target: SimWorker, amount: number, attackerWorkerId: number): void {
+  target.health = Math.max(0, target.health - amount);
+  db.prepare("UPDATE workers SET health = ? WHERE id = ?").run(target.health, target.id);
+  dirty = true;
+  if (target.health <= 0) killWorker(target, "pvp", undefined, attackerWorkerId);
 }
 
 export function isColonyActive(colonyId: number): boolean {
@@ -1541,7 +1633,11 @@ function advanceGuards(dt: number): void {
     // check is defensive, not load-bearing.
     if (!colony || colony.status !== "active") continue;
 
-    if (guard.command.type === "attack") {
+    // Stage 14A: a guard only ever issues/holds its own creature-targeting
+    // attack command (never the new worker-targeting PvP variant — that's
+    // 14B scope per CLAUDE.md), so this narrows on targetType too, not just
+    // type, before touching creatureId.
+    if (guard.command.type === "attack" && guard.command.targetType === "creature") {
       const target = creatures.get(guard.command.creatureId);
       const stillEngaged =
         target !== undefined &&
@@ -1553,7 +1649,7 @@ function advanceGuards(dt: number): void {
     if (guard.command.type !== "attack") {
       const threat = findGuardThreat(guard, colony);
       if (threat) {
-        guard.command = { type: "attack", creatureId: threat.id, cooldownRemaining: 0 };
+        guard.command = { type: "attack", targetType: "creature", creatureId: threat.id, cooldownRemaining: 0 };
       } else {
         advanceGuardFollow(guard, colony);
       }
@@ -1573,8 +1669,19 @@ function handleAttackCommand(
   separation: { dx: number; dy: number },
   dt: number,
 ): void {
-  const creature = creatures.get(command.creatureId);
-  if (!creature) {
+  // Stage 14A: resolve the live target's current position once, up front,
+  // regardless of which of the two "attack" variants this is — everything
+  // below (chase, range, cooldown, separation) is identical for a creature
+  // target and a PvP worker target; only target resolution and damage
+  // application differ. Always a fresh Map lookup, never a captured
+  // position, same "chase the CURRENT position" discipline the original
+  // creature-only version of this function already established. A plain
+  // `{x, y}` view (rather than the live SimCreature/SimWorker itself) is all
+  // the shared chase/range/cooldown logic below needs; the damage-application
+  // branch further down re-resolves its own correctly-typed target.
+  const targetPosition =
+    command.targetType === "creature" ? creatures.get(command.creatureId) : workers.get(command.targetWorkerId);
+  if (!targetPosition) {
     worker.command = { type: "idle" };
     return;
   }
@@ -1588,17 +1695,20 @@ function handleAttackCommand(
   const modifiers = colony ? getEvolutionModifiers(colony.evolution, worker.caste) : undefined;
   const attackSpeed = CASTE_BASE_STATS[worker.caste].speed * (modifiers?.chaseSpeedMultiplier ?? 1);
 
-  const dx = creature.x - worker.x;
-  const dy = creature.y - worker.y;
+  const dx = targetPosition.x - worker.x;
+  const dy = targetPosition.y - worker.y;
   const dist = Math.hypot(dx, dy);
 
   if (dist > WORKER_ATTACK_RANGE) {
-    const step = Math.min(attackSpeed * dt, dist - WORKER_ATTACK_RANGE + ARRIVAL_EPSILON);
+    const step =
+      command.targetType === "worker"
+        ? Math.min(attackSpeed * dt, dist)
+        : Math.min(attackSpeed * dt, dist - WORKER_ATTACK_RANGE + ARRIVAL_EPSILON);
     worker.x = clamp(worker.x + (dx / dist) * step + separation.dx, 0, worldBounds.width);
     worker.y = clamp(worker.y + (dy / dist) * step + separation.dy, 0, worldBounds.height);
   } else {
     // Already in range: still take the separation nudge so multiple
-    // attackers on the same creature don't stack on top of each other.
+    // attackers on the same target don't stack on top of each other.
     worker.x = clamp(worker.x + separation.dx, 0, worldBounds.width);
     worker.y = clamp(worker.y + separation.dy, 0, worldBounds.height);
   }
@@ -1606,22 +1716,40 @@ function handleAttackCommand(
 
   const cooldownRemaining = Math.max(0, command.cooldownRemaining - dt);
   if (dist <= WORKER_ATTACK_RANGE && cooldownRemaining <= 0) {
-    const creatureId = creature.id;
-    const species = creature.species;
-    // Stage 9 Survival II: applies only along this existing creature-attack
-    // path (aphids, spiders) — attack target resolution never touches
-    // workers/colonies, so this cannot introduce PvP by construction.
+    // Stage 9 Survival II: applies to both target kinds equally — an
+    // evolved attacker hits exactly as hard against an enemy worker as
+    // against a creature.
     const attackDamage = modifiers?.attackDamage ?? CASTE_BASE_STATS[worker.caste].attackDamage;
-    const carcassId = applyDamage(creature, attackDamage);
-    // Stage 7: aphid kills deliberately get no new log line (existing
-    // aphid-combat tests/assertions are unaffected) — only a lethal hit on a
-    // spider logs, gated on species.
-    if (carcassId !== null && species === "spider") {
-      logAction(worker.colonyId, "spider_died", { creatureId, carcassId });
+    if (command.targetType === "creature") {
+      const creature = creatures.get(command.creatureId);
+      // Re-checked rather than reusing targetPosition: another worker
+      // processed earlier this same tick could have just killed it.
+      if (creature) {
+        const creatureId = creature.id;
+        const species = creature.species;
+        const carcassId = applyDamage(creature, attackDamage);
+        // Stage 7: aphid kills deliberately get no new log line (existing
+        // aphid-combat tests/assertions are unaffected) — only a lethal hit
+        // on a spider logs, gated on species.
+        if (carcassId !== null && species === "spider") {
+          logAction(worker.colonyId, "spider_died", { creatureId, carcassId });
+        }
+      }
+    } else {
+      // Stage 14A: a worker-vs-worker hit. Re-resolved fresh (not reusing
+      // targetPosition) for the same reason as the creature branch above —
+      // another attacker processed earlier this same tick may already have
+      // killed it, in which case this is a no-op, which is exactly the
+      // "exactly once" death guarantee: killWorker deletes the target from
+      // the `workers` Map synchronously inside applyPvpDamageToWorker, so a
+      // concurrent lethal hit landing later in this tick, or in the very
+      // next tick, finds nothing here to damage.
+      const target = workers.get(command.targetWorkerId);
+      if (target) applyPvpDamageToWorker(target, attackDamage, worker.id);
     }
-    // killCreature (inside applyDamage) may already have reset this worker
-    // to idle if that hit was lethal — only write the cooldown back if the
-    // command is still "attack".
+    // A lethal hit above may already have reset this worker to idle (via
+    // killCreature's or killWorker's own attacker-idle-sweep) — only write
+    // the cooldown back if the command is still "attack".
     if (worker.command.type === "attack") {
       worker.command = { ...worker.command, cooldownRemaining: WORKER_ATTACK_COOLDOWN };
     }

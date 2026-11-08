@@ -1,4 +1,4 @@
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { beforeEach, describe, expect, it } from "vitest";
 
 // Stage 1b direct-module-level testability seam: this file is the one
@@ -74,6 +74,7 @@ const {
   QUEEN_STORAGE_CAPACITY,
   BIOMASS_NODE_MAX_AMOUNT,
   PROTEIN_NODE_AMOUNT,
+  CASTE_BASE_STATS,
 } = await import("../src/server/balance.ts");
 const { getEvolutionModifiers, tierThreshold, traitDisplayName, NO_EVOLUTION } = await import(
   "../src/server/evolution.ts"
@@ -3088,5 +3089,407 @@ describe("Stage 13C: moving-queen deposits + finite emergency storage", () => {
     expect(Math.hypot(guard.x - after.x, guard.y - (after.y - GUARD_FOLLOW_RADIUS))).toBeLessThan(
       GUARD_FOLLOW_REPATH_EPSILON + 1,
     );
+  });
+});
+
+describe("Stage 14A: PvP unit combat", () => {
+  // A second, genuinely-active colony to attack/be-attacked-by. Mirrors the
+  // real pattern used by Stage 8 test B / Stage 9 test I: defeat the seeded
+  // colony's queen (any synthetic damage source id works — defeatColony never
+  // inspects it) and mint a fresh one via createColony()/registerColony() so
+  // both colonies are simultaneously active in sim state.
+  async function makeEnemyColony(): Promise<{ colonyId: number; queenX: number; queenY: number }> {
+    const { createColony } = await import("../src/server/db.ts");
+    const fresh = createColony();
+    sim.registerColony(fresh.colonyId, fresh.queenX, fresh.queenY, QUEEN_MAX_HEALTH, QUEEN_MAX_HEALTH, fresh.workers.length);
+    return fresh;
+  }
+
+  // registerTestWorker hardcodes caste: "worker" — PvP tests that need a
+  // Scout or Soldier combatant must register directly with the real
+  // CASTE_BASE_STATS maxHealth for that caste instead.
+  function registerCasteWorker(
+    id: number,
+    colonyId: number,
+    x: number,
+    y: number,
+    caste: "worker" | "soldier" | "scout",
+    health?: number,
+  ) {
+    const maxHealth = CASTE_BASE_STATS[caste].maxHealth;
+    sim.registerWorker({ id, colonyId, x, y, health: health ?? maxHealth, maxHealth, caste });
+    const found = sim.getWorkersForColony(colonyId).find((w) => w.id === id);
+    if (!found) throw new Error(`failed to register worker ${id}`);
+    return found;
+  }
+
+  function anyWorkerById(id: number) {
+    for (const c of [colony.id, ...sim.getAllColonies().map((c2) => c2.id)]) {
+      const found = sim.getWorkersForColony(c).find((w) => w.id === id);
+      if (found) return found;
+    }
+    throw new Error(`no such worker in sim state: ${id}`);
+  }
+
+  it("Worker vs Worker: a commanded attacker chases, ranges, and kills an enemy worker, same as a creature target", async () => {
+    const enemy = await makeEnemyColony();
+    const attacker = registerCasteWorker(14001, colony.id, enemy.queenX, enemy.queenY, "worker");
+    const targetId = 14002;
+    sim.registerWorker({
+      id: targetId,
+      colonyId: enemy.colonyId,
+      x: enemy.queenX,
+      y: enemy.queenY,
+      health: WORKER_ATTACK_DAMAGE,
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
+    });
+
+    expect(sim.issueAttackWorkerCommand(attacker.id, targetId, colony.id)).toBeNull();
+    expect(sim.getWorkerCommand(attacker.id)).toBe("attack");
+
+    sim.advanceSimulation(TICK_DT); // in range already — kills in one hit
+
+    expect(sim.getWorkersForColony(enemy.colonyId).some((w) => w.id === targetId)).toBe(false);
+    expect(sim.getWorkerCommand(attacker.id)).toBe("idle");
+  });
+
+  it("Scout vs Scout: PvP combat works identically for the scout caste", async () => {
+    const enemy = await makeEnemyColony();
+    const attacker = registerCasteWorker(14003, colony.id, enemy.queenX, enemy.queenY, "scout");
+    const targetId = 14004;
+    sim.registerWorker({
+      id: targetId,
+      colonyId: enemy.colonyId,
+      x: enemy.queenX,
+      y: enemy.queenY,
+      health: CASTE_BASE_STATS.scout.attackDamage,
+      maxHealth: CASTE_BASE_STATS.scout.maxHealth,
+      caste: "scout",
+    });
+
+    expect(sim.issueAttackWorkerCommand(attacker.id, targetId, colony.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getWorkersForColony(enemy.colonyId).some((w) => w.id === targetId)).toBe(false);
+  });
+
+  it("Soldier vs Soldier: PvP combat works identically for the soldier caste", async () => {
+    const enemy = await makeEnemyColony();
+    const attacker = registerCasteWorker(14005, colony.id, enemy.queenX, enemy.queenY, "soldier");
+    const targetId = 14006;
+    sim.registerWorker({
+      id: targetId,
+      colonyId: enemy.colonyId,
+      x: enemy.queenX,
+      y: enemy.queenY,
+      health: CASTE_BASE_STATS.soldier.attackDamage,
+      maxHealth: CASTE_BASE_STATS.soldier.maxHealth,
+      caste: "soldier",
+    });
+
+    expect(sim.issueAttackWorkerCommand(attacker.id, targetId, colony.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getWorkersForColony(enemy.colonyId).some((w) => w.id === targetId)).toBe(false);
+  });
+
+  it("rejects a friendly-fire attack command with 'cannot attack own colony', and issues no command", () => {
+    const attacker = registerTestWorker(14010, 2000, 2000);
+    const ally = registerTestWorker(14011, 2010, 2000);
+
+    expect(sim.issueAttackWorkerCommand(attacker.id, ally.id, colony.id)).toBe("cannot attack own colony");
+    expect(sim.getWorkerCommand(attacker.id)).toBe("idle");
+  });
+
+  it("rejects an attack command issued by a worker that does not belong to the requester's own colony", async () => {
+    const enemy = await makeEnemyColony();
+    // A worker that genuinely belongs to the enemy colony — the requester
+    // (our seeded `colony`) tries to command it, which must fail exactly like
+    // commanding any other colony's worker (ownership is always re-derived
+    // server-side, never trusted from a client-supplied workerId).
+    const notOurs = registerCasteWorker(14012, enemy.colonyId, enemy.queenX, enemy.queenY, "worker");
+    const target = registerTestWorker(14013, 2000, 2000);
+
+    expect(sim.issueAttackWorkerCommand(notOurs.id, target.id, colony.id)).toBe("no such worker");
+  });
+
+  it("Guard cannot be manually commanded to PvP-attack — rejected with 'wrong caste', combat decisions are server-AI-only", async () => {
+    const enemy = await makeEnemyColony();
+    const guard = sim.getWorkersForColony(colony.id).find((w) => w.caste === "guard")!;
+    const target = registerCasteWorker(14014, enemy.colonyId, guard.x + 10, guard.y, "worker");
+
+    expect(sim.issueAttackWorkerCommand(guard.id, target.id, colony.id)).toBe("wrong caste");
+    expect(sim.getWorkerCommand(guard.id)).toBe("idle");
+  });
+
+  it("the Queen is never a valid PvP attacker or target — she has no worker-table row to command or hit", () => {
+    // The queen isn't in the `workers` map at all (she's tracked on the
+    // colony record itself — see getColonySnapshot), so no numeric id could
+    // ever resolve to her as either attacker or target. A sentinel id well
+    // outside any real worker/colony id range stands in for "her id", since
+    // colony ids and worker ids share no namespace guarantee against each
+    // other and a real colony.id could coincidentally collide with a real
+    // worker id.
+    const attacker = registerTestWorker(14015, 2000, 2000);
+    const target = registerTestWorker(14016, 2010, 2000);
+    expect(sim.issueAttackWorkerCommand(attacker.id, 999999999, colony.id)).toBe("no such target");
+    expect(sim.issueAttackWorkerCommand(999999999, target.id, colony.id)).toBe("no such worker");
+  });
+
+  it("existing creature-attack (issueAttackCommand) behaviour is unaffected by the new PvP pathway", () => {
+    const [creature] = sim.getCreaturesForWorld(world.id);
+    const worker = registerTestWorker(14099, creature.x, creature.y);
+    expect(sim.issueAttackCommand(worker.id, creature.id, colony.id)).toBeNull();
+    sim.advanceSimulation(TICK_DT);
+    expect(creatureById(creature.id).health).toBe(creature.health - WORKER_ATTACK_DAMAGE);
+  });
+
+  it("chases a moving enemy worker's live position every tick, not where it was when the command was issued", async () => {
+    const enemy = await makeEnemyColony();
+    const targetId = 14017;
+    // World is only WORLD.width x WORLD.height (3000x3000, clamped) — fixed
+    // mid-map coordinates, well away from any edge, so neither the target's
+    // walk nor the attacker's chase ever clamps against a world bound.
+    const startX = 1500;
+    const fixedY = 1500;
+    sim.registerWorker({
+      id: targetId,
+      colonyId: enemy.colonyId,
+      x: startX,
+      y: fixedY,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
+    });
+    const attacker = registerCasteWorker(14018, colony.id, startX + 300, fixedY, "worker");
+    expect(sim.issueAttackWorkerCommand(attacker.id, targetId, colony.id)).toBeNull();
+
+    // Move the target away every tick, slower than the attacker's chase
+    // speed so the gap still eventually closes — like a player actively
+    // repositioning it. This proves the attacker re-aims at the live
+    // position every tick rather than beelining for the stale
+    // command-issue-time spot, which a fixed-distance-away assertion
+    // wouldn't distinguish from. This target is a synthetic
+    // (registerWorker-only) fixture with no backing SQL row, so it's
+    // repositioned by re-registering it in place — not by writing to SQL and
+    // calling loadSimulation(), which would erase it entirely (loadSimulation
+    // rebuilds the in-memory `workers` map strictly from the workers table).
+    let inRange = false;
+    for (let i = 0; i < 300 && !inRange; i++) {
+      const t = anyWorkerById(targetId);
+      sim.registerWorker({
+        id: targetId,
+        colonyId: enemy.colonyId,
+        x: t.x - 5 * TICK_DT,
+        y: t.y,
+        health: t.health,
+        maxHealth: t.maxHealth,
+        caste: "worker",
+      });
+      sim.advanceSimulation(TICK_DT);
+      const live = anyWorkerById(targetId);
+      const w = anyWorkerById(attacker.id);
+      inRange = Math.hypot(w.x - live.x, w.y - live.y) <= WORKER_ATTACK_RANGE + 1e-6;
+    }
+    expect(inRange).toBe(true);
+
+    const liveTarget = anyWorkerById(targetId);
+    expect(liveTarget.x).not.toBe(startX); // the target actually moved — otherwise this test would pass trivially
+  });
+
+  it("damage only lands within WORKER_ATTACK_RANGE and is gated by WORKER_ATTACK_COOLDOWN, same as creature combat", async () => {
+    const enemy = await makeEnemyColony();
+    const targetId = 14019;
+    sim.registerWorker({
+      id: targetId,
+      colonyId: enemy.colonyId,
+      x: enemy.queenX,
+      y: enemy.queenY,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
+    });
+    const attacker = registerCasteWorker(14020, colony.id, enemy.queenX, enemy.queenY, "worker");
+    expect(sim.issueAttackWorkerCommand(attacker.id, targetId, colony.id)).toBeNull();
+
+    sim.advanceSimulation(TICK_DT); // already in range — first hit lands immediately
+    const afterFirstHit = anyWorkerById(targetId).health;
+    expect(afterFirstHit).toBe(WORKER_MAX_HEALTH - WORKER_ATTACK_DAMAGE);
+
+    sim.advanceSimulation(TICK_DT); // well within the 1s cooldown
+    expect(anyWorkerById(targetId).health).toBe(afterFirstHit);
+
+    for (let i = 0; i < 15; i++) sim.advanceSimulation(TICK_DT); // clears cooldown, lands exactly one more hit
+    expect(anyWorkerById(targetId).health).toBe(afterFirstHit - WORKER_ATTACK_DAMAGE);
+  });
+
+  it("evolution modifiers (Survival II's +50% attack damage) apply to PvP damage exactly like creature damage", async () => {
+    function bumpPeakPopulationTo(target: number): void {
+      db.prepare("UPDATE colonies SET peak_population = ? WHERE id = ?").run(target, colony.id);
+      sim.loadSimulation();
+    }
+    bumpPeakPopulationTo(EVOLUTION_TIER_2_POPULATION);
+    expect(actions.selectEvolution(colony.id, 1, "foraging")).toEqual({ ok: true });
+    expect(actions.selectEvolution(colony.id, 2, "survival")).toEqual({ ok: true });
+
+    const enemy = await makeEnemyColony();
+    const targetId = 14021;
+    sim.registerWorker({
+      id: targetId,
+      colonyId: enemy.colonyId,
+      x: enemy.queenX,
+      y: enemy.queenY,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
+    });
+    const attacker = registerCasteWorker(14022, colony.id, enemy.queenX, enemy.queenY, "worker");
+    expect(sim.issueAttackWorkerCommand(attacker.id, targetId, colony.id)).toBeNull();
+
+    sim.advanceSimulation(TICK_DT);
+
+    const expectedDamage = Math.round(WORKER_ATTACK_DAMAGE * SURVIVAL_II_ATTACK_MULTIPLIER);
+    expect(anyWorkerById(targetId).health).toBe(WORKER_MAX_HEALTH - expectedDamage);
+  });
+
+  it("a killed enemy worker is fully removed from sim state (not just zeroed health)", async () => {
+    const enemy = await makeEnemyColony();
+    const targetId = 14023;
+    sim.registerWorker({
+      id: targetId,
+      colonyId: enemy.colonyId,
+      x: enemy.queenX,
+      y: enemy.queenY,
+      health: WORKER_ATTACK_DAMAGE,
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
+    });
+    const attacker = registerCasteWorker(14024, colony.id, enemy.queenX, enemy.queenY, "worker");
+    expect(sim.issueAttackWorkerCommand(attacker.id, targetId, colony.id)).toBeNull();
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getWorkersForColony(enemy.colonyId).some((w) => w.id === targetId)).toBe(false);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM workers WHERE id = ?").get(targetId) as { n: number }).n).toBe(0);
+  });
+
+  it("two attackers targeting the same enemy worker in the same lethal tick kill it exactly once — no double death/duplicate carcass logic", async () => {
+    const enemy = await makeEnemyColony();
+    const targetId = 14025;
+    sim.registerWorker({
+      id: targetId,
+      colonyId: enemy.colonyId,
+      x: enemy.queenX,
+      y: enemy.queenY,
+      health: WORKER_ATTACK_DAMAGE, // dies to a single hit — both attackers land in the same tick
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
+    });
+    const a = registerCasteWorker(14026, colony.id, enemy.queenX, enemy.queenY, "worker");
+    const b = registerCasteWorker(14027, colony.id, enemy.queenX + 5, enemy.queenY, "worker");
+    expect(sim.issueAttackWorkerCommand(a.id, targetId, colony.id)).toBeNull();
+    expect(sim.issueAttackWorkerCommand(b.id, targetId, colony.id)).toBeNull();
+
+    expect(() => sim.advanceSimulation(TICK_DT)).not.toThrow();
+
+    expect(sim.getWorkersForColony(enemy.colonyId).some((w) => w.id === targetId)).toBe(false);
+    expect(sim.getWorkerCommand(a.id)).toBe("idle");
+    expect(sim.getWorkerCommand(b.id)).toBe("idle");
+    const deaths = db
+      .prepare("SELECT COUNT(*) AS n FROM action_log WHERE action = 'worker_died' AND detail LIKE ?")
+      .get(`%"workerId":${targetId}%`) as { n: number };
+    expect(deaths.n).toBe(1);
+  });
+
+  it("a killed worker carrying resources loses that payload — it is never credited to either colony", async () => {
+    const enemy = await makeEnemyColony();
+    const targetId = 14028;
+    sim.registerWorker({
+      id: targetId,
+      colonyId: enemy.colonyId,
+      x: enemy.queenX,
+      y: enemy.queenY,
+      health: WORKER_ATTACK_DAMAGE,
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
+    });
+    // Give the target a carried payload directly — registerWorker's object
+    // literal doesn't expose `carrying`, so it's poked onto the live sim
+    // worker record the same way other synthetic-fixture tests reach into
+    // in-memory state that has no public setter.
+    const target = sim.getWorkersExcludingColony(colony.id).find((w) => w.id === targetId)!;
+    (target as { carrying: unknown }).carrying = { resourceType: "sugar", amount: GATHER_YIELD };
+
+    const beforeAttackerColony = resourceAmount("sugar");
+    const attacker = registerCasteWorker(14029, colony.id, enemy.queenX, enemy.queenY, "worker");
+    expect(sim.issueAttackWorkerCommand(attacker.id, targetId, colony.id)).toBeNull();
+
+    sim.advanceSimulation(TICK_DT);
+
+    expect(sim.getWorkersForColony(enemy.colonyId).some((w) => w.id === targetId)).toBe(false);
+    expect(resourceAmount("sugar")).toBe(beforeAttackerColony); // never credited to the killer's colony
+    const enemyResource = db
+      .prepare("SELECT amount FROM colony_resources WHERE colony_id = ? AND resource_type = 'sugar'")
+      .get(enemy.colonyId) as { amount: number } | undefined;
+    expect(enemyResource?.amount ?? 0).toBe(0); // never credited to the victim's colony either
+  });
+
+  it("a worker's attack command against a target in a just-defeated colony degrades to idle, same as any other invalid/missing target", async () => {
+    const enemy = await makeEnemyColony();
+    const targetId = 14030;
+    sim.registerWorker({
+      id: targetId,
+      colonyId: enemy.colonyId,
+      x: 2900, // far from the attacker below so it's still chasing, not yet in range, when the colony is defeated
+      y: 1500,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
+    });
+    const attacker = registerCasteWorker(14031, colony.id, 100, 1500, "worker");
+    expect(sim.issueAttackWorkerCommand(attacker.id, targetId, colony.id)).toBeNull();
+
+    sim.defeatColony(enemy.colonyId, "test", 999); // deletes the enemy colony's workers, including the target
+
+    expect(() => sim.advanceSimulation(TICK_DT)).not.toThrow();
+    expect(sim.getWorkerCommand(attacker.id)).toBe("idle");
+  });
+
+  it("issueAttackWorkerCommand rejects a target belonging to an already-defeated colony with 'no such target'", async () => {
+    const enemy = await makeEnemyColony();
+    const targetId = 14032;
+    sim.registerWorker({
+      id: targetId,
+      colonyId: enemy.colonyId,
+      x: enemy.queenX,
+      y: enemy.queenY,
+      health: WORKER_MAX_HEALTH,
+      maxHealth: WORKER_MAX_HEALTH,
+      caste: "worker",
+    });
+    sim.defeatColony(enemy.colonyId, "test", 999); // deletes the target along with the rest of the enemy colony's workers
+
+    const attacker = registerTestWorker(14033, 2000, 2000);
+    expect(sim.issueAttackWorkerCommand(attacker.id, targetId, colony.id)).toBe("no such target");
+  });
+
+  it("client source: an enemy worker is only ever hit-tested when visible, and is never added to the selection set", () => {
+    const source = readFileSync("src/client/main.ts", "utf8");
+
+    // hitTest's enemy-worker branch must check isVisible before ever
+    // returning an "enemy-worker" hit — a fog-hidden enemy must fall through
+    // exactly like a fog-hidden creature/node, never becoming clickable.
+    const enemyWorkerLoop = source.slice(source.indexOf("for (const worker of state.otherWorkers)"));
+    const loopBody = enemyWorkerLoop.slice(0, enemyWorkerLoop.indexOf("\n  }"));
+    expect(loopBody).toContain("isVisible(worker.x, worker.y, vision)");
+
+    // selectWorkersInBox (drag-select) must never iterate state.otherWorkers —
+    // an enemy unit must never be addable to selectedWorkerIds by any path.
+    const selectFn = source.slice(
+      source.indexOf("function selectWorkersInBox"),
+      source.indexOf("\nfunction ", source.indexOf("function selectWorkersInBox") + 1),
+    );
+    expect(selectFn).not.toContain("otherWorkers");
   });
 });

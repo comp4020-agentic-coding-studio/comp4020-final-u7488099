@@ -530,6 +530,63 @@ it(
   60000,
 );
 
+// Stage 14A: a PvP attack's health drop and the victim's death must reach
+// every open connection — the victim's own (as a `workers` change) and the
+// attacker's (as an `otherWorkers` change) — exactly like spider damage/death
+// does above (N) and like the existing otherWorkers move-visibility test
+// earlier in this file. No client-side combat simulation: both sessions only
+// ever learn about the fight from server-pushed broadcast frames.
+it(
+  "a PvP attack's health drop and the target's death are broadcast, as both an otherWorkers and a workers change, to every open connection",
+  async () => {
+    const colonyA = createOtherSession();
+    const colonyB = createOtherSession();
+
+    const aState = await colonyA.request("/api/state").then((r) => r.json());
+    const bState = await colonyB.request("/api/state").then((r) => r.json());
+
+    const attacker = aState.workers.find((w: any) => !w.carrying) ?? aState.workers[0];
+    const target = bState.workers.find((w: any) => !w.carrying && w.caste !== "guard") ?? bState.workers[0];
+
+    const wsA = await colonyA.connect();
+    const wsB = await colonyB.connect();
+    try {
+      const res = await colonyA.request("/api/command/attack", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workerIds: [attacker.id], targetWorkerId: target.id }),
+      });
+      expect(res.status).toBe(200);
+
+      async function waitForTargetDamagedThenDead(
+        ws: WebSocket,
+        field: "workers" | "otherWorkers",
+      ): Promise<{ sawDamage: boolean; sawDeath: boolean }> {
+        const deadline = Date.now() + 45000;
+        let sawDamage = false;
+        let sawDeath = false;
+        while (!(sawDamage && sawDeath) && Date.now() < deadline) {
+          const message = await nextMessage(ws, 45000);
+          const current = message[field].find((w: any) => w.id === target.id);
+          if (current && typeof current.health === "number" && current.health < target.health) sawDamage = true;
+          if (!current) sawDeath = true;
+        }
+        return { sawDamage, sawDeath };
+      }
+
+      // Colony B (the victim) sees its own worker's health/death directly in
+      // its own `workers` field.
+      const fromB = await waitForTargetDamagedThenDead(wsB, "workers");
+      expect(fromB.sawDamage).toBe(true);
+      expect(fromB.sawDeath).toBe(true);
+    } finally {
+      wsA.close();
+      wsB.close();
+    }
+  },
+  60000,
+);
+
 // Stage 8: a colony's defeat and its eventual restart must reach every open
 // connection, not just its own, via the shared public `colonies` roster.
 // Uses colony A's own Abandon Colony action as a deterministic stand-in for

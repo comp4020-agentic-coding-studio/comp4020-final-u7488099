@@ -19,6 +19,7 @@ import {
   getAllWorkersWithColony,
   getCreaturesForWorld,
   issueAttackCommand,
+  issueAttackWorkerCommand,
   issueGatherCommand,
   issueMoveCommand,
   issueQueenMoveCommand,
@@ -582,14 +583,36 @@ app.post("/api/command/gather", (req, res) => {
 // (see simulation.ts) — nothing here persists beyond issuing the command;
 // chasing, range/cooldown resolution, and damage all happen in the existing
 // advanceSimulation tick, with no new interval.
+//
+// Stage 14A: the same route now accepts a second target shape for PvP —
+// `{ workerIds, targetWorkerId }` instead of `{ workerIds, creatureId }`.
+// Exactly one of creatureId/targetWorkerId must be present; this is the
+// explicit discriminator the brief asks for, chosen as "which field is
+// present" rather than a separate `targetType` body field, since creature
+// ids and worker ids are independent SQLite autoincrement sequences that can
+// (and in this codebase's own tests, do) collide — see multiplayer.test.ts's
+// Stage 7 §6 comment. Keeping two differently-named fields means a body can
+// never be ambiguous about which id-space a given number belongs to.
+// Existing creature-attack request bodies (`{ workerIds, creatureId }`) are
+// completely unchanged — this is purely additive.
 app.post("/api/command/attack", (req, res) => {
-  const { workerIds, creatureId } = req.body ?? {};
+  const { workerIds, creatureId, targetWorkerId } = req.body ?? {};
   if (!Array.isArray(workerIds) || workerIds.length === 0 || !workerIds.every((id) => typeof id === "number")) {
     res.status(400).json({ error: "workerIds must be a non-empty array of numbers" });
     return;
   }
+  if (typeof creatureId === "number" && typeof targetWorkerId === "number") {
+    res.status(400).json({ error: "only one of creatureId or targetWorkerId may be given" });
+    return;
+  }
+  if (typeof targetWorkerId === "number") {
+    runBatchCommand(req, res, req.colonyId, "attack", workerIds, (workerId, colonyId) =>
+      issueAttackWorkerCommand(workerId, targetWorkerId, colonyId),
+    );
+    return;
+  }
   if (typeof creatureId !== "number") {
-    res.status(400).json({ error: "creatureId is required" });
+    res.status(400).json({ error: "creatureId or targetWorkerId is required" });
     return;
   }
   runBatchCommand(req, res, req.colonyId, "attack", workerIds, (workerId, colonyId) =>
