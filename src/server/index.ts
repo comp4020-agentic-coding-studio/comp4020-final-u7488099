@@ -19,6 +19,7 @@ import {
   getAllWorkersWithColony,
   getCreaturesForWorld,
   issueAttackCommand,
+  issueAttackQueenCommand,
   issueAttackWorkerCommand,
   issueGatherCommand,
   issueMoveCommand,
@@ -595,14 +596,30 @@ app.post("/api/command/gather", (req, res) => {
 // never be ambiguous about which id-space a given number belongs to.
 // Existing creature-attack request bodies (`{ workerIds, creatureId }`) are
 // completely unchanged — this is purely additive.
+//
+// Stage 14B: a third target shape, `{ workerIds, targetQueenColonyId }`,
+// alongside the two above — exactly one of creatureId/targetWorkerId/
+// targetQueenColonyId must be present, same "which field is present" explicit
+// discriminator reasoning as Stage 14A's own comment above (a queen target is
+// addressed by colony id, a wholly separate id-space from both creature ids
+// and worker ids, so there is never any ambiguity about which Map a given
+// number belongs to). ownerColonyId is, as with every other target kind,
+// resolved server-side from req.colonyId — never trusted from the body.
 app.post("/api/command/attack", (req, res) => {
-  const { workerIds, creatureId, targetWorkerId } = req.body ?? {};
+  const { workerIds, creatureId, targetWorkerId, targetQueenColonyId } = req.body ?? {};
   if (!Array.isArray(workerIds) || workerIds.length === 0 || !workerIds.every((id) => typeof id === "number")) {
     res.status(400).json({ error: "workerIds must be a non-empty array of numbers" });
     return;
   }
-  if (typeof creatureId === "number" && typeof targetWorkerId === "number") {
-    res.status(400).json({ error: "only one of creatureId or targetWorkerId may be given" });
+  const targetFieldsGiven = [creatureId, targetWorkerId, targetQueenColonyId].filter((v) => typeof v === "number").length;
+  if (targetFieldsGiven > 1) {
+    res.status(400).json({ error: "only one of creatureId, targetWorkerId, or targetQueenColonyId may be given" });
+    return;
+  }
+  if (typeof targetQueenColonyId === "number") {
+    runBatchCommand(req, res, req.colonyId, "attack", workerIds, (workerId, colonyId) =>
+      issueAttackQueenCommand(workerId, targetQueenColonyId, colonyId),
+    );
     return;
   }
   if (typeof targetWorkerId === "number") {
@@ -612,7 +629,7 @@ app.post("/api/command/attack", (req, res) => {
     return;
   }
   if (typeof creatureId !== "number") {
-    res.status(400).json({ error: "creatureId or targetWorkerId is required" });
+    res.status(400).json({ error: "creatureId, targetWorkerId, or targetQueenColonyId is required" });
     return;
   }
   runBatchCommand(req, res, req.colonyId, "attack", workerIds, (workerId, colonyId) =>

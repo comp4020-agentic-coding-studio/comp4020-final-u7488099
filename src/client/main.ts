@@ -924,11 +924,17 @@ function selectWorkersInBox(a: [number, number], b: [number, number]): void {
   }
 }
 
-function hitTest(wx: number, wy: number): { kind: "queen" | "worker" | "creature" | "node" | "enemy-worker"; id: number } | null {
+function hitTest(
+  wx: number,
+  wy: number,
+): { kind: "queen" | "worker" | "creature" | "node" | "enemy-worker" | "enemy-queen"; id: number } | null {
   if (!state) return null;
-  // Stage 13A: own queen only — foreign queens are drawn (see state.colonies
-  // render loop above) but deliberately never checked here, so they stay
-  // non-selectable with no extra code.
+  // Stage 13A/14B: own queen only resolves to the selectable "queen" kind —
+  // a foreign queen never does, even though both are drawn identically in
+  // size/position (see state.colonies render loop above). This keeps "my own
+  // queen can be selected and moved, but never attacks" true with no extra
+  // code: an enemy queen is checked separately below as "enemy-queen", a
+  // distinct, non-selectable kind only ever dispatched to onEnemyQueenClick.
   if (state.colony.status !== "defeated" && Math.hypot(state.colony.queenX - wx, state.colony.queenY - wy) <= QUEEN_RADIUS) {
     return { kind: "queen", id: state.colony.id };
   }
@@ -950,6 +956,21 @@ function hitTest(wx: number, wy: number): { kind: "queen" | "worker" | "creature
     if (!isVisible(creature.x, creature.y, vision)) continue;
     const r = creature.species === "spider" ? SPIDER_RADIUS : APHID_RADIUS;
     if (Math.hypot(creature.x - wx, creature.y - wy) <= r + 4) return { kind: "creature", id: creature.id };
+  }
+  // Stage 14B: an enemy colony's active queen is clickable (for a PvP attack
+  // command, issued with targetQueenColonyId) but never selectable — mirrors
+  // onEnemyWorkerClick's dispatch shape exactly, just one level up (colony
+  // id, not worker id). A ruin is never a valid attack target, so this is
+  // gated on status === "active" in addition to the same fog visibility
+  // check as creatures/enemy-workers/nodes — a fog-hidden enemy queen can
+  // never be clicked, exactly like any other hidden entity falls through to
+  // a plain move instead. Checked before enemy-worker so a click landing on
+  // both an overlapping queen and a nearby worker always resolves to the
+  // queen, same "more specific first" ordering creature-before-node uses.
+  for (const colony of state.colonies) {
+    if (colony.id === state.colony.id || colony.status !== "active") continue;
+    if (!isVisible(colony.queenX, colony.queenY, vision)) continue;
+    if (Math.hypot(colony.queenX - wx, colony.queenY - wy) <= QUEEN_RADIUS) return { kind: "enemy-queen", id: colony.id };
   }
   // Stage 14A: an enemy colony's worker is clickable (for a PvP attack
   // command) but never selectable — it's never added to selectedWorkerIds,
@@ -1005,6 +1026,10 @@ function onCanvasClick(sx: number, sy: number): void {
   }
   if (hit.kind === "enemy-worker") {
     onEnemyWorkerClick(hit.id);
+    return;
+  }
+  if (hit.kind === "enemy-queen") {
+    onEnemyQueenClick(hit.id);
     return;
   }
   onNodeClick(hit.id);
@@ -1148,6 +1173,31 @@ async function onEnemyWorkerClick(targetWorkerId: number): Promise<void> {
     return;
   }
   statusEl.textContent = describeBatchOutcome(workerIds.length, body.errors, "attacking");
+  setState(body);
+}
+
+// Stage 14B: mirrors onEnemyWorkerClick's shape exactly — same
+// selected-workers precondition, same batch-outcome reporting — just
+// targeting another colony's queen (targetQueenColonyId) instead of one of
+// her workers. The server (not this client) enforces ownership/caste/
+// own-queen/defeated-target rules; this is purely dispatch.
+async function onEnemyQueenClick(targetQueenColonyId: number): Promise<void> {
+  const workerIds = [...selectedWorkerIds];
+  if (workerIds.length === 0) {
+    statusEl.textContent = "Select a worker first.";
+    return;
+  }
+  const res = await fetch("/api/command/attack", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workerIds, targetQueenColonyId }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    statusEl.textContent = body.error ?? "attack failed";
+    return;
+  }
+  statusEl.textContent = describeBatchOutcome(workerIds.length, body.errors, "attacking the enemy queen");
   setState(body);
 }
 

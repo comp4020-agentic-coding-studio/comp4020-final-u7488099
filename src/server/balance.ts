@@ -408,6 +408,14 @@ export const GUARD_ATTACK_COOLDOWN = WORKER_ATTACK_COOLDOWN;
 // re-aggroing on a hair trigger.
 export const GUARD_PROTECT_RADIUS = 220;
 export const GUARD_DISENGAGE_RANGE = 320;
+// A hostile player unit (unlike a hostile creature) only starts an attack
+// after lingering within GUARD_PROTECT_RADIUS for this long — a guard
+// stationed right next to the queen would otherwise reach and kill a player
+// attacker the instant it got within melee range of its own target, before
+// it could land a single hit. This reaction window gives a solo attacker a
+// real chance to engage before the defending guard responds, while still
+// guaranteeing a guard eventually engages any attacker that stays nearby.
+export const GUARD_PLAYER_UNIT_REACTION_DELAY = 2;
 // How far from the queen's exact position a guard parks while following/
 // idling, so it doesn't render stacked directly on top of her.
 export const GUARD_FOLLOW_RADIUS = 40;

@@ -58,6 +58,15 @@ function closestNode(state: any, worker: any, resourceType: string) {
   );
 }
 
+// Picks the nearest creature to a given worker, mirroring closestNode above
+// — same travel-bounding rationale.
+function closestCreature(state: any, worker: any, creatures: any[]) {
+  if (creatures.length === 0) throw new Error("no creatures to choose from");
+  return creatures.reduce((best: any, c: any) =>
+    Math.hypot(c.x - worker.x, c.y - worker.y) < Math.hypot(best.x - worker.x, best.y - worker.y) ? c : best,
+  );
+}
+
 async function waitForResourceIncrease(resourceType: string, baseline: number, timeoutMs = 15000): Promise<any> {
   const deadline = Date.now() + timeoutMs;
   let state = await getState();
@@ -434,8 +443,13 @@ it(
   "killing an aphid leaves a carcass that can be gathered and deposited like any other resource",
   async () => {
     const before = await getState();
-    const worker = before.workers.find((w: any) => !w.carrying) ?? before.workers[0];
-    const creature = before.creatures[0];
+    // A Guard can never be commanded to attack (wrong caste).
+    const commandable = before.workers.filter((w: any) => !w.carrying && w.caste !== "guard");
+    const worker = commandable[0];
+    expect(worker, "need at least one commandable (non-guard) worker").toBeDefined();
+    const aphids = before.creatures.filter((c: any) => c.species === "aphid");
+    expect(aphids.length, "seed should always include at least one aphid").toBeGreaterThan(0);
+    const creature = closestCreature(before, worker, aphids);
     const baselineProtein = before.colony.resources.protein;
     // The creature wanders (and is chased) before it dies, so its death
     // position won't match where it started — identify the new carcass by
@@ -512,7 +526,8 @@ it(
     const spider = before.creatures.find((c: any) => c.species === "spider");
     expect(spider, "seed should always include at least one spider").toBeDefined();
     const baselineProtein = before.colony.resources.protein;
-    const attackers = before.workers.filter((w: any) => !w.carrying);
+    // A Guard can never be commanded to attack (wrong caste).
+    const attackers = before.workers.filter((w: any) => !w.carrying && w.caste !== "guard");
     expect(attackers.length).toBeGreaterThan(0);
     const existingItemIds = new Set(
       before.resourceNodes.filter((n: any) => n.kind === "item").map((n: any) => n.id),
@@ -547,8 +562,8 @@ it(
     // idle worker, which could be anywhere on the map.
     const survivingAttackerIds = new Set(attackers.map((w: any) => w.id));
     const gatherer =
-      state.workers.find((w: any) => survivingAttackerIds.has(w.id) && !w.carrying) ??
-      state.workers.find((w: any) => !w.carrying);
+      state.workers.find((w: any) => survivingAttackerIds.has(w.id) && !w.carrying && w.caste !== "guard") ??
+      state.workers.find((w: any) => !w.carrying && w.caste !== "guard");
     expect(gatherer, "need at least one idle worker left alive to gather the carcass").toBeDefined();
     const gathererId = gatherer.id;
     const gatherRes = await request("/api/command/gather", {

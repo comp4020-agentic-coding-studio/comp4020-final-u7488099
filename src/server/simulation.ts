@@ -14,6 +14,7 @@ import {
   GUARD_DISENGAGE_RANGE,
   GUARD_FOLLOW_RADIUS,
   GUARD_FOLLOW_REPATH_EPSILON,
+  GUARD_PLAYER_UNIT_REACTION_DELAY,
   GUARD_PROTECT_RADIUS,
   MIN_SEPARATION,
   QUEEN_AGGRO_RANGE,
@@ -75,7 +76,17 @@ type WorkerCommand =
   // === "attack"` check working unchanged — callers just add a `targetType`
   // narrow where they touch creatureId/targetWorkerId specifically.
   | { type: "attack"; targetType: "creature"; creatureId: number; cooldownRemaining: number }
-  | { type: "attack"; targetType: "worker"; targetWorkerId: number; cooldownRemaining: number };
+  | { type: "attack"; targetType: "worker"; targetWorkerId: number; cooldownRemaining: number }
+  // Stage 14B: a third "attack" shape, for PvP queen targeting — targets a
+  // live enemy colony (looked up in the `colonies` Map every tick, same
+  // live-lookup discipline as creatureId/targetWorkerId above) by colony id,
+  // never a worker id: there is exactly one queen per colony, and her
+  // position/health already live on SimColony, not a SimWorker. A colony
+  // that gets defeated (ruin) or never existed is indistinguishable here —
+  // handleAttackCommand's target-resolution guard covers both the same way
+  // the worker-target variant's "target died or its colony got defeated"
+  // guard already does.
+  | { type: "attack"; targetType: "queen"; targetQueenColonyId: number; cooldownRemaining: number };
 
 interface SimWorker {
   id: number;
@@ -125,6 +136,12 @@ export type AttackCommandError =
   // worker ids are their own.
   | "no such target"
   | "cannot attack own colony";
+
+// Stage 14B: queen-attack rejections reuse the exact same AttackCommandError
+// union above (the attacker-side errors are identical; "no such target" and
+// "cannot attack own colony" already cover the target-colony-missing/
+// defeated and own-colony cases with the same no-info-to-leak reasoning as
+// the worker-target variant) — no new error strings needed.
 
 // Stage 5: a neutral creature (first species: aphid). Stage 6 makes it
 // interactable: health/maxHealth are durable (see db.ts's creatures table),
@@ -202,6 +219,15 @@ interface SimColony {
 const colonies = new Map<number, SimColony>();
 let dirty = false;
 
+// Stage 14B revision: ephemeral, per-guard tracking of how long the guard's
+// current candidate hostile-worker threat has been continuously visible —
+// never persisted, same "resets on restart" treatment as a creature's wander
+// state or a colony's moveTarget. Keyed by guard id; cleared the instant the
+// candidate changes (a different worker, or the same one going out of range)
+// so a threat has to linger uninterrupted for GUARD_PLAYER_UNIT_REACTION_DELAY
+// before advanceGuards acts on it — see findGuardThreat's call site.
+const guardWorkerThreatTimers = new Map<number, { workerId: number; elapsed: number }>();
+
 // Loads authoritative state from SQLite — the last checkpoint, or the
 // initial seed on a first boot. A worker with no carried payload starts
 // idle, same as before; a worker restored mid-carry (Stage 4) instead starts
@@ -213,6 +239,7 @@ export function loadSimulation(): void {
     | undefined;
   worldBounds = world ?? { width: 0, height: 0 };
 
+  guardWorkerThreatTimers.clear();
   colonies.clear();
   const colonyRows = db
     .prepare(
@@ -974,12 +1001,14 @@ export function issueAttackCommand(
 // ownerColonyId is, as with every other issue*Command, resolved server-side
 // from the caller's session — never trusted from the client (Crit 10).
 // Target-side validation deliberately never leaks *why* a target was
-// rejected: a nonexistent id, a dead unit, a guard (not a valid PvP target in
-// this stage — see CLAUDE.md), and a unit belonging to a just-defeated colony
-// (defeatColony deletes that colony's workers from this same Map
-// synchronously, so there is nothing left here to distinguish "defeated" from
-// "never existed") are all indistinguishable and all report "no such
-// target", mirroring the existing own-worker-lookup discipline above.
+// rejected: a nonexistent id, a dead unit, and a unit belonging to a
+// just-defeated colony (defeatColony deletes that colony's workers from this
+// same Map synchronously, so there is nothing left here to distinguish
+// "defeated" from "never existed") are all indistinguishable and all report
+// "no such target", mirroring the existing own-worker-lookup discipline
+// above. A guard IS a valid target here (Stage 14B PvP fix) — only the
+// attacker-side check above keeps a guard from being commanded by its own
+// owner; nothing on the target side excludes it.
 export function issueAttackWorkerCommand(
   workerId: number,
   targetWorkerId: number,
@@ -991,13 +1020,39 @@ export function issueAttackWorkerCommand(
   if (worker.caste === "guard") return "wrong caste";
   if (worker.carrying) return "worker is busy returning resources";
   const target = workers.get(targetWorkerId);
-  if (!target || target.caste === "guard") return "no such target";
+  if (!target) return "no such target";
   // No friendly fire: checked as its own distinct error (unlike the
   // nonexistent-target cases above) since there's no ownership information
   // to protect here — the attacker already knows which worker ids are their
   // own.
   if (target.colonyId === ownerColonyId) return "cannot attack own colony";
   worker.command = { type: "attack", targetType: "worker", targetWorkerId, cooldownRemaining: 0 };
+  return null;
+}
+
+// Stage 14B: the queen-targeting sibling of issueAttackWorkerCommand above —
+// same attacker-side guards in the same order, same AttackCommandError union,
+// same "never trust a client-supplied attacker colony id" discipline
+// (ownerColonyId is always resolved server-side from the caller's session).
+// Target resolution differs only in which Map it reads: a colony id against
+// `colonies`, not a worker id against `workers`. isColonyActive doubles as
+// both "does this colony exist" and "is it not a ruin" — a nonexistent id and
+// an already-defeated colony id are indistinguishable here, same
+// no-info-to-leak reasoning the worker-target variant already uses for its
+// own "no such target".
+export function issueAttackQueenCommand(
+  workerId: number,
+  targetQueenColonyId: number,
+  ownerColonyId: number,
+): AttackCommandError | null {
+  if (!isColonyActive(ownerColonyId)) return "colony defeated";
+  const worker = workers.get(workerId);
+  if (!worker || worker.colonyId !== ownerColonyId) return "no such worker";
+  if (worker.caste === "guard") return "wrong caste";
+  if (worker.carrying) return "worker is busy returning resources";
+  if (targetQueenColonyId === ownerColonyId) return "cannot attack own colony";
+  if (!isColonyActive(targetQueenColonyId)) return "no such target";
+  worker.command = { type: "attack", targetType: "queen", targetQueenColonyId, cooldownRemaining: 0 };
   return null;
 }
 
@@ -1440,7 +1495,12 @@ export function applyEvolutionSelection(colonyId: number, tier: 1 | 2 | 3, choic
 // against an already-defeated colony updates zero rows and returns
 // immediately, before any worker/resource deletion or logging — exactly-
 // once is enforced by the database, not by caller discipline.
-export function defeatColony(colonyId: number, cause: string, creatureId?: number): void {
+// Stage 14B: attackerWorkerId is additive, mirroring killWorker's own
+// optional creatureId/attackerWorkerId pair — a spider-caused defeat passes
+// creatureId, a PvP queen kill passes attackerWorkerId, and the two are never
+// both set for the same call. Logged alongside cause exactly like
+// killWorker's own "who did this" fields.
+export function defeatColony(colonyId: number, cause: string, creatureId?: number, attackerWorkerId?: number): void {
   // Stage 12: generated in JS (not SQL's datetime('now')) so the exact same
   // ISO string lands in both the durable column and the in-memory SimColony
   // below — isRuinExpired() (ecology.ts) only ever has to parse one format.
@@ -1469,6 +1529,16 @@ export function defeatColony(colonyId: number, cause: string, creatureId?: numbe
       creature.command = { type: "idle", remaining: pickIdleDuration(creature, WANDER_PARAMS[creature.species]) };
     }
   }
+  // Stage 14B: the player-attacker mirror of the creature sweep above — any
+  // worker (any colony, including a guard that had engaged this colony's
+  // queen) mid-attack of this now-defeated colony's queen drops to idle
+  // rather than holding a dangling targetQueenColonyId. Same single-pass-
+  // this-tick visibility as every other sweep in this function.
+  for (const other of workers.values()) {
+    if (other.command.type === "attack" && other.command.targetType === "queen" && other.command.targetQueenColonyId === colonyId) {
+      other.command = { type: "idle" };
+    }
+  }
 
   const colony = colonies.get(colonyId);
   if (colony) {
@@ -1478,7 +1548,7 @@ export function defeatColony(colonyId: number, cause: string, creatureId?: numbe
   }
 
   dirty = true;
-  logAction(colonyId, "colony_defeated", { cause, creatureId });
+  logAction(colonyId, "colony_defeated", { cause, creatureId, attackerWorkerId });
 }
 
 // Mirrors applyDamageToWorker's durability discipline (synchronous write on
@@ -1494,6 +1564,25 @@ export function applyDamageToQueen(colonyId: number, amount: number, spiderId: n
   db.prepare("UPDATE colonies SET queen_health = ? WHERE id = ?").run(colony.health, colony.id);
   dirty = true;
   if (colony.health <= 0) defeatColony(colonyId, "spider", spiderId);
+}
+
+// Stage 14B: the PvP sibling of applyDamageToQueen above — identical
+// synchronous-write-on-hit shape and defeatColony hand-off, just logging
+// "pvp" + the attacking worker's id instead of "spider" + a creature id.
+// Kept separate rather than widening applyDamageToQueen's own signature, same
+// additive-sibling precedent applyPvpDamageToWorker already established
+// alongside applyDamageToWorker. defeatColony's own `WHERE status = 'active'`
+// guard (plus this function's own already-defeated no-op check above) is what
+// actually guarantees a queen can only be defeated once even if several
+// attackers land a lethal hit in the same tick.
+function applyPvpDamageToQueen(colonyId: number, amount: number, attackerWorkerId: number): void {
+  const colony = colonies.get(colonyId);
+  if (!colony || colony.status !== "active") return;
+  colony.health = Math.max(0, colony.health - amount);
+  colony.timeSinceLastDamage = 0;
+  db.prepare("UPDATE colonies SET queen_health = ? WHERE id = ?").run(colony.health, colony.id);
+  dirty = true;
+  if (colony.health <= 0) defeatColony(colonyId, "pvp", undefined, attackerWorkerId);
 }
 
 // Stage 8: passive queen regeneration, called once per tick from
@@ -1565,21 +1654,62 @@ function isChasingColony(creature: SimCreature, colonyId: number): boolean {
   return false;
 }
 
-// Bounded, single linear pass over the world's (typically small) creature
-// population — same order of magnitude as advanceSpider's own per-spider
-// nearest-worker scan, not a new all-pairs cost. Nearest-by-distance with
-// ascending-id tiebreak, same deterministic tie-break idiom advanceSpider
-// uses for its own target selection.
-function findGuardThreat(guard: SimWorker, colony: SimColony): SimCreature | null {
-  let nearest: SimCreature | null = null;
+// Stage 14B revision: unlike isChasingColony's creature-threat sibling, a
+// hostile player unit does NOT get a "threat regardless of distance" bypass
+// here — a declared PvP attack command alone used to make a Guard beeline
+// for the attacker from anywhere on the map, reaching and killing it (Guard
+// speed + a stationary head start against a lone approaching worker) well
+// before the attacker ever closed to WORKER_ATTACK_RANGE of its own target.
+// That made solo worker-vs-worker/queen PvP structurally unwinnable against
+// any guarded colony, not just an occasional risk — see findGuardThreat,
+// which now gates a hostile worker on GUARD_PROTECT_RADIUS proximity alone,
+// exactly like the plain "hostile creature loitering nearby" case already
+// does. A fast/lucky attacker that reaches melee range before entering the
+// Guard's protection radius now gets a real window to land hits.
+
+// Stage 14B: "a living Worker/Scout/Soldier from another ACTIVE colony" per
+// the brief's own definition — guard-caste is structurally excluded (guards
+// are autonomous defenders, never themselves a commandable "player unit" and
+// never a Guard-AI target), and isColonyActive already means "not a ruin",
+// so a defeated colony's (already-deleted) workers can never match this.
+function isHostilePlayerUnit(worker: SimWorker, colonyId: number): boolean {
+  return worker.caste !== "guard" && worker.colonyId !== colonyId && isColonyActive(worker.colonyId);
+}
+
+// Stage 14B: a guard's chosen threat is now either an NPC creature or a
+// hostile player unit — both resolve to the exact same "attack" command
+// shapes a player-controlled worker already uses (see advanceGuards below),
+// so this is the only place that needs to know about both kinds at once.
+type GuardThreat = { kind: "creature"; id: number } | { kind: "worker"; id: number };
+
+// Bounded, single linear pass over the world's (typically small) creature AND
+// worker populations — same order of magnitude as advanceSpider's own
+// per-spider nearest-worker scan, not a new all-pairs cost; no spatial grid
+// needed since both populations are already small. Nearest-by-distance,
+// ascending-id tiebreak among creatures (unchanged from Stage 13B); the
+// creature pass runs first so an exact creature/worker distance tie
+// deterministically favors the (incumbent) creature, same "first found wins"
+// idiom used elsewhere in this module.
+function findGuardThreat(guard: SimWorker, colony: SimColony): GuardThreat | null {
+  let nearest: GuardThreat | null = null;
   let nearestDist = Infinity;
   for (const creature of creatures.values()) {
     if (!GUARD_HOSTILE_SPECIES.has(creature.species)) continue;
     const distFromQueen = Math.hypot(creature.x - colony.x, creature.y - colony.y);
     if (distFromQueen > GUARD_PROTECT_RADIUS && !isChasingColony(creature, colony.id)) continue;
     const dist = Math.hypot(creature.x - guard.x, creature.y - guard.y);
-    if (dist < nearestDist || (dist === nearestDist && nearest !== null && creature.id < nearest.id)) {
-      nearest = creature;
+    if (dist < nearestDist || (dist === nearestDist && nearest !== null && nearest.kind === "creature" && creature.id < nearest.id)) {
+      nearest = { kind: "creature", id: creature.id };
+      nearestDist = dist;
+    }
+  }
+  for (const other of workers.values()) {
+    if (!isHostilePlayerUnit(other, colony.id)) continue;
+    const distFromQueen = Math.hypot(other.x - colony.x, other.y - colony.y);
+    if (distFromQueen > GUARD_PROTECT_RADIUS) continue;
+    const dist = Math.hypot(other.x - guard.x, other.y - guard.y);
+    if (dist < nearestDist) {
+      nearest = { kind: "worker", id: other.id };
       nearestDist = dist;
     }
   }
@@ -1610,19 +1740,26 @@ function advanceGuardFollow(guard: SimWorker, colony: SimColony): void {
   guard.command = { type: "move", targetX: followX, targetY: followY };
 }
 
-// Stage 13B: the guard caste's entire autonomous brain, modeled directly on
-// advanceSpider's shape (live target re-read every tick, disengage-range
-// abandonment, deterministic nearest-threat selection) — three priorities,
-// checked in order, every tick: (1) keep fighting an already-engaged threat
-// or disengage from one that died/fled, (2) otherwise look for a new threat
-// near the queen, (3) otherwise follow the queen. Deliberately only ever
-// produces "idle"/"move"/"attack" commands — the exact same WorkerCommand
-// variants a player-controlled worker already uses — so the generic
-// per-worker loop below (movement resolution, handleAttackCommand) executes
-// a guard's decision with zero new execution code. Called once per tick,
-// after advanceQueenMovement so a guard reacts to the queen's already-
-// updated position this same tick, and before the per-worker loop so that
-// loop picks up whatever command this function just decided on, same tick.
+// Stage 13B/14B: the guard caste's entire autonomous brain, modeled directly
+// on advanceSpider's shape (live target re-read every tick, disengage-range
+// abandonment, deterministic nearest-threat selection) — a small, flat
+// priority check, run in order, every tick: (1) keep fighting an
+// already-engaged threat (creature or, since 14B, hostile player unit) or
+// disengage from one that died/fled/left, (2) otherwise look for a new
+// threat — an immediate attacker of the queen/guard takes priority by virtue
+// of findGuardThreat's own distance-to-guard ordering (an attacker close
+// enough to be hitting the queen or guard is, structurally, also the nearest
+// threat) — within the existing protection radius, (3) otherwise follow the
+// queen. Deliberately only ever produces "idle"/"move"/"attack" commands —
+// the exact same WorkerCommand variants a player-controlled worker already
+// uses — so the generic per-worker loop below (movement resolution,
+// handleAttackCommand) executes a guard's decision with zero new execution
+// code; a hostile worker a guard engages takes guard damage through the
+// exact same applyPvpDamageToWorker/killWorker path a player-vs-player hit
+// already uses. Called once per tick, after advanceQueenMovement so a guard
+// reacts to the queen's already-updated position this same tick, and before
+// the per-worker loop so that loop picks up whatever command this function
+// just decided on, same tick.
 function advanceGuards(dt: number): void {
   for (const guard of workers.values()) {
     if (guard.caste !== "guard") continue;
@@ -1633,10 +1770,11 @@ function advanceGuards(dt: number): void {
     // check is defensive, not load-bearing.
     if (!colony || colony.status !== "active") continue;
 
-    // Stage 14A: a guard only ever issues/holds its own creature-targeting
-    // attack command (never the new worker-targeting PvP variant — that's
-    // 14B scope per CLAUDE.md), so this narrows on targetType too, not just
-    // type, before touching creatureId.
+    // Stage 14B: a guard now holds either a creature-targeting or a
+    // worker-targeting attack command (never a queen-targeting one — a guard
+    // never attacks a queen, hostile or otherwise, per the brief), so
+    // disengagement is checked per-targetType, same shape as before, just
+    // with a second arm added.
     if (guard.command.type === "attack" && guard.command.targetType === "creature") {
       const target = creatures.get(guard.command.creatureId);
       const stillEngaged =
@@ -1644,15 +1782,46 @@ function advanceGuards(dt: number): void {
         Math.hypot(target.x - guard.x, target.y - guard.y) <= GUARD_DISENGAGE_RANGE &&
         Math.hypot(target.x - colony.x, target.y - colony.y) <= GUARD_DISENGAGE_RANGE;
       if (!stillEngaged) guard.command = { type: "idle" };
+    } else if (guard.command.type === "attack" && guard.command.targetType === "worker") {
+      const target = workers.get(guard.command.targetWorkerId);
+      const stillEngaged =
+        target !== undefined &&
+        isHostilePlayerUnit(target, colony.id) &&
+        Math.hypot(target.x - guard.x, target.y - guard.y) <= GUARD_DISENGAGE_RANGE &&
+        Math.hypot(target.x - colony.x, target.y - colony.y) <= GUARD_DISENGAGE_RANGE;
+      if (!stillEngaged) guard.command = { type: "idle" };
     }
 
     if (guard.command.type !== "attack") {
       const threat = findGuardThreat(guard, colony);
-      if (threat) {
-        guard.command = { type: "attack", targetType: "creature", creatureId: threat.id, cooldownRemaining: 0 };
+      // Stage 14B revision: a hostile creature still engages the instant
+      // it's found (unchanged — see tests 12/"engages a spider..."), but a
+      // hostile player unit must first linger for
+      // GUARD_PLAYER_UNIT_REACTION_DELAY, tracked per-guard in
+      // guardWorkerThreatTimers. The timer resets the moment the candidate
+      // changes (a different worker, or none at all) rather than persisting
+      // across a gap, so a threat has to be continuously visible, not just
+      // cumulatively — the same "disengage on absence" discipline the attack
+      // arms above already use for an in-progress fight.
+      if (threat?.kind === "worker") {
+        const timer = guardWorkerThreatTimers.get(guard.id);
+        const elapsed = timer && timer.workerId === threat.id ? timer.elapsed + dt : dt;
+        guardWorkerThreatTimers.set(guard.id, { workerId: threat.id, elapsed });
+        if (elapsed >= GUARD_PLAYER_UNIT_REACTION_DELAY) {
+          guard.command = { type: "attack", targetType: "worker", targetWorkerId: threat.id, cooldownRemaining: 0 };
+        } else {
+          advanceGuardFollow(guard, colony);
+        }
       } else {
-        advanceGuardFollow(guard, colony);
+        guardWorkerThreatTimers.delete(guard.id);
+        if (threat?.kind === "creature") {
+          guard.command = { type: "attack", targetType: "creature", creatureId: threat.id, cooldownRemaining: 0 };
+        } else {
+          advanceGuardFollow(guard, colony);
+        }
       }
+    } else {
+      guardWorkerThreatTimers.delete(guard.id);
     }
   }
 }
@@ -1669,19 +1838,31 @@ function handleAttackCommand(
   separation: { dx: number; dy: number },
   dt: number,
 ): void {
-  // Stage 14A: resolve the live target's current position once, up front,
-  // regardless of which of the two "attack" variants this is — everything
-  // below (chase, range, cooldown, separation) is identical for a creature
-  // target and a PvP worker target; only target resolution and damage
-  // application differ. Always a fresh Map lookup, never a captured
-  // position, same "chase the CURRENT position" discipline the original
-  // creature-only version of this function already established. A plain
-  // `{x, y}` view (rather than the live SimCreature/SimWorker itself) is all
-  // the shared chase/range/cooldown logic below needs; the damage-application
-  // branch further down re-resolves its own correctly-typed target.
+  // Stage 14A/14B: resolve the live target's current position once, up
+  // front, regardless of which of the three "attack" variants this is —
+  // everything below (chase, range, cooldown, separation) is identical for a
+  // creature target, a PvP worker target, and a PvP queen target; only
+  // target resolution and damage application differ. Always a fresh Map
+  // lookup, never a captured position, same "chase the CURRENT position"
+  // discipline the original creature-only version of this function already
+  // established. A plain `{x, y}` view (rather than the live
+  // SimCreature/SimWorker/SimColony itself) is all the shared chase/range/
+  // cooldown logic below needs; the damage-application branch further down
+  // re-resolves its own correctly-typed target.
   const targetPosition =
-    command.targetType === "creature" ? creatures.get(command.creatureId) : workers.get(command.targetWorkerId);
-  if (!targetPosition) {
+    command.targetType === "creature"
+      ? creatures.get(command.creatureId)
+      : command.targetType === "worker"
+        ? workers.get(command.targetWorkerId)
+        : colonies.get(command.targetQueenColonyId);
+  // Stage 14B: a queen target additionally disappears (as a valid attack
+  // target) the instant her colony is defeated — defeatColony's own sweep
+  // already idles this command before the next tick runs, but a lethal hit
+  // landing earlier in this very tick (another attacker killed her first)
+  // means the colony row is still in the Map, just no longer active. Guard
+  // against attacking a fresh ruin the same way a dead creature/worker target
+  // already falls through to idle.
+  if (!targetPosition || (command.targetType === "queen" && (targetPosition as SimColony).status !== "active")) {
     worker.command = { type: "idle" };
     return;
   }
@@ -1700,8 +1881,14 @@ function handleAttackCommand(
   const dist = Math.hypot(dx, dy);
 
   if (dist > WORKER_ATTACK_RANGE) {
+    // Stage 14B: a queen target is also a living, potentially-moving target
+    // (Stage 13A queen movement) — same uncapped full-speed chase as a PvP
+    // worker target, for the same reason the original PvP chase-step fix
+    // applied: capping the step to "dist - WORKER_ATTACK_RANGE" assumes the
+    // target holds still while this worker closes in, which silently stalls
+    // the chase just outside range against a target that's moving away.
     const step =
-      command.targetType === "worker"
+      command.targetType === "worker" || command.targetType === "queen"
         ? Math.min(attackSpeed * dt, dist)
         : Math.min(attackSpeed * dt, dist - WORKER_ATTACK_RANGE + ARRIVAL_EPSILON);
     worker.x = clamp(worker.x + (dx / dist) * step + separation.dx, 0, worldBounds.width);
@@ -1735,7 +1922,7 @@ function handleAttackCommand(
           logAction(worker.colonyId, "spider_died", { creatureId, carcassId });
         }
       }
-    } else {
+    } else if (command.targetType === "worker") {
       // Stage 14A: a worker-vs-worker hit. Re-resolved fresh (not reusing
       // targetPosition) for the same reason as the creature branch above —
       // another attacker processed earlier this same tick may already have
@@ -1746,6 +1933,16 @@ function handleAttackCommand(
       // next tick, finds nothing here to damage.
       const target = workers.get(command.targetWorkerId);
       if (target) applyPvpDamageToWorker(target, attackDamage, worker.id);
+    } else {
+      // Stage 14B: a worker-vs-queen hit. Re-resolved fresh (not reusing
+      // targetPosition) for the same reason as the other two branches —
+      // another attacker may have already landed the lethal hit earlier this
+      // same tick. applyPvpDamageToQueen's own already-defeated check (plus
+      // defeatColony's DB-level `WHERE status = 'active'` guard) is what
+      // guarantees the queen is only ever defeated once, exactly like
+      // killWorker already guarantees for a worker target.
+      const targetColony = colonies.get(command.targetQueenColonyId);
+      if (targetColony) applyPvpDamageToQueen(targetColony.id, attackDamage, worker.id);
     }
     // A lethal hit above may already have reset this worker to idle (via
     // killCreature's or killWorker's own attacker-idle-sweep) — only write

@@ -151,7 +151,11 @@ it("lets session B observe, via its own state, a worker move issued by session A
   const aliceState = await getState(alice);
   await getState(bob); // make sure Bob's colony exists before Alice acts
 
-  const aliceWorker = aliceState.workers[0];
+  // A Guard can never be commanded to move (wrong caste) — see
+  // realtime.test.ts's createSessionWithCommandableWorker for why this
+  // shared dev DB can hand a fresh colony a Guard-only roster.
+  const aliceWorker = aliceState.workers.find((w: any) => w.caste !== "guard");
+  if (!aliceWorker) throw new Error("no commandable (non-guard) worker in Alice's colony");
   const target = {
     x: aliceWorker.x > aliceState.world.width / 2 ? 0 : aliceState.world.width,
     y: aliceWorker.y > aliceState.world.height / 2 ? 0 : aliceState.world.height,
@@ -201,8 +205,10 @@ it("rejects a session's attempt to command a worker that belongs to someone else
   expect(Math.hypot(bobWorkerAfter.x - bobWorker.x, bobWorkerAfter.y - bobWorker.y)).toBeLessThan(5);
 
   // Sanity check this isn't just "move is broken": Alice can still command
-  // her own workers in the same request shape.
-  const aliceWorker = aliceState.workers[0];
+  // her own workers in the same request shape. A Guard can never be
+  // commanded to move (wrong caste), so filter one out here too.
+  const aliceWorker = aliceState.workers.find((w: any) => w.caste !== "guard");
+  if (!aliceWorker) throw new Error("no commandable (non-guard) worker in Alice's colony");
   const resOwn = await alice("/api/command/move", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -227,7 +233,12 @@ it("rejects a session's attempt to attack a worker belonging to someone else's c
   const aliceState = await getState(alice);
   const bobState = await getState(bob);
   const bobWorker = bobState.workers[0];
-  const aliceWorker = aliceState.workers[0];
+  // Alice's worker is the attacker here, so it must be able to actually
+  // issue an attack command — a Guard can never be commanded to attack
+  // (wrong caste), which would reject before ever reaching creatureId
+  // resolution and silently defeat this test's intent.
+  const aliceWorker = aliceState.workers.find((w: any) => w.caste !== "guard");
+  if (!aliceWorker) throw new Error("no commandable (non-guard) worker in Alice's colony");
 
   await alice("/api/command/attack", {
     method: "POST",
@@ -278,8 +289,12 @@ it(
       aliceState.resourceNodes.filter((n: any) => n.kind === "item").map((n: any) => n.id),
     );
 
-    const aliceWorker = aliceState.workers.find((w: any) => !w.carrying) ?? aliceState.workers[0];
-    const bobWorker = bobState.workers.find((w: any) => !w.carrying) ?? bobState.workers[0];
+    // Both workers must actually be able to issue an attack command — a
+    // Guard can never be commanded to attack (wrong caste).
+    const aliceWorker = aliceState.workers.find((w: any) => !w.carrying && w.caste !== "guard");
+    const bobWorker = bobState.workers.find((w: any) => !w.carrying && w.caste !== "guard");
+    if (!aliceWorker) throw new Error("no commandable (non-guard) worker in Alice's colony");
+    if (!bobWorker) throw new Error("no commandable (non-guard) worker in Bob's colony");
 
     const [resA, resB] = await Promise.all([
       alice("/api/command/attack", {
@@ -318,8 +333,24 @@ it(
 
 it("logs who did what, server-side, in a form queryable over the API and attributable to the acting colony", async () => {
   const alice = createSession();
-  const aliceState = await getState(alice);
-  const aliceWorker = aliceState.workers[0];
+  let aliceState = await getState(alice);
+  // A Guard can never be commanded to move (wrong caste). Long-lived shared
+  // dev DBs can hand a fresh colony a Guard-only roster (ambient combat
+  // since Stage 7/14B can leave Guards as the only survivors), so fall back
+  // to reproducing a fresh worker — costs exactly STARTING_PROTEIN, which
+  // every active colony starts with — same pattern realtime.test.ts uses.
+  let aliceWorker = aliceState.workers.find((w: any) => w.caste !== "guard");
+  if (!aliceWorker) {
+    const reproRes = await alice("/api/reproduce", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ caste: "worker" }),
+    });
+    expect(reproRes.status).toBe(200);
+    aliceState = await getState(alice);
+    aliceWorker = aliceState.workers.find((w: any) => w.caste !== "guard");
+  }
+  if (!aliceWorker) throw new Error("no commandable (non-guard) worker in Alice's colony");
   const destination = {
     x: aliceWorker.x > aliceState.world.width / 2 ? 0 : aliceState.world.width,
     y: aliceWorker.y > aliceState.world.height / 2 ? 0 : aliceState.world.height,

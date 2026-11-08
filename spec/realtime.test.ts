@@ -62,6 +62,18 @@ function closestNode(state: any, worker: any, resourceType: string) {
   );
 }
 
+// Same idea as closestNode, but for creatures: picking state.creatures[0]
+// with no distance bound can hand a travel-bound test a target clear across
+// the 3000x3000 world (worst case diagonal ~4243 units, ~28s at
+// WORKER_SPEED=150) — long enough to blow past a 20s "did it get hit yet"
+// deadline on pure travel time alone, with nothing actually broken.
+function closestCreature(state: any, worker: any) {
+  if (state.creatures.length === 0) throw new Error("no creatures in the world");
+  return state.creatures.reduce((best: any, c: any) =>
+    Math.hypot(c.x - worker.x, c.y - worker.y) < Math.hypot(best.x - worker.x, best.y - worker.y) ? c : best,
+  );
+}
+
 // Waits on a sequence of broadcast frames until one shows the given resource
 // above its baseline — a gather command only credits on arrival, so the
 // immediate post-command frame(s) won't show it yet.
@@ -108,6 +120,31 @@ function createOtherSession() {
   return { request: sessionRequest, connect: sessionConnect };
 }
 
+// This shared, long-lived dev DB accumulates colonies whose non-guard
+// workers have been killed off by real PvP combat, leaving some colonies
+// with only a Guard in their roster (a Guard is now a valid PvP target
+// itself — see issueAttackWorkerCommand — but it is still never
+// player-commandable, so a surviving Guard can never gather/move/attack on
+// its own colony's behalf). A freshly-minted session can land on exactly
+// such a colony (either a battle-damaged previously-unclaimed spare, or one
+// that's simply never had a non-guard worker added back). Retry with fresh
+// sessions until one actually has a commandable (non-guard) worker, rather
+// than letting a Guard-only roster silently produce a "wrong caste" rejection
+// disguised as this test's own assertion failing.
+async function createSessionWithCommandableWorker(): Promise<{
+  session: ReturnType<typeof createOtherSession>;
+  state: any;
+  worker: any;
+}> {
+  for (let attempt = 0; attempt < 25; attempt++) {
+    const session = createOtherSession();
+    const state = await session.request("/api/state").then((r) => r.json());
+    const worker = state.workers.find((w: any) => !w.carrying && w.caste !== "guard");
+    if (worker) return { session, state, worker };
+  }
+  throw new Error("could not find a session with a commandable (non-guard) worker after 25 attempts");
+}
+
 it("a worker move issued by one colony is delivered, as an otherWorkers update, to another colony's own open WebSocket connection with no reload", async () => {
   const colonyA = createOtherSession();
   const colonyB = createOtherSession();
@@ -115,7 +152,11 @@ it("a worker move issued by one colony is delivered, as an otherWorkers update, 
   const aState = await colonyA.request("/api/state").then((r) => r.json());
   await colonyB.request("/api/state").then((r) => r.json()); // ensure colony B's session/colony exists first
 
-  const aWorker = aState.workers[0];
+  // A Guard can never be commanded to move (wrong caste) — see
+  // createSessionWithCommandableWorker's comment below for why this
+  // shared dev DB can hand a fresh colony a Guard-only roster.
+  const aWorker = aState.workers.find((w: any) => w.caste !== "guard");
+  if (!aWorker) throw new Error("no commandable (non-guard) worker in colony A");
   const target = { x: Math.min(aState.world.width - 10, aWorker.x + 500), y: aWorker.y };
 
   const wsB = await colonyB.connect();
@@ -144,7 +185,9 @@ it(
   "pushes the updated resources to an open connection when a gather command completes, with no reload",
   async () => {
     const before = await getState();
-    const worker = before.workers[0];
+    // A Guard can never be commanded to gather (wrong caste).
+    const worker = before.workers.find((w: any) => !w.carrying && w.caste !== "guard");
+    if (!worker) throw new Error("no commandable (non-guard) worker in this colony");
     const node = closestNode(before, worker, "sugar");
 
     const ws = await connect();
@@ -175,7 +218,13 @@ it(
     const [wsA, wsB] = await Promise.all([connect(), connect()]);
     try {
       const before = await getState();
-      const worker = before.workers[1];
+      // A Guard can never be commanded to gather (wrong caste — see
+      // CLAUDE.md), and a surviving Guard can end up as a colony's lowest-id
+      // (or only) worker once its colony's other workers have been killed off
+      // by real PvP combat — so an unfiltered index pick risks landing on
+      // one. Filter it out like createSessionWithCommandableWorker() does.
+      const worker = before.workers.find((w: any) => !w.carrying && w.caste !== "guard");
+      if (!worker) throw new Error("no commandable (non-guard) worker in this colony");
       const node = closestNode(before, worker, "sugar");
 
       const res = await request("/api/command/gather", {
@@ -201,7 +250,9 @@ it(
 
 it("worker movement is broadcast to open WebSocket clients without a reload", async () => {
   const before = await getState();
-  const worker = before.workers[0];
+  // A Guard can never be commanded to move (wrong caste).
+  const worker = before.workers.find((w: any) => w.caste !== "guard");
+  if (!worker) throw new Error("no commandable (non-guard) worker in this colony");
   const target = { x: Math.min(before.world.width - 10, worker.x + 500), y: worker.y };
 
   const ws = await connect();
@@ -279,7 +330,7 @@ async function gatherProteinUntil(targetProtein: number): Promise<void> {
   let state = await getState();
   const deadline = Date.now() + 45000;
   while (state.colony.resources.protein < targetProtein && Date.now() < deadline) {
-    const idleWorkers = state.workers.filter((w: any) => !w.carrying);
+    const idleWorkers = state.workers.filter((w: any) => !w.carrying && w.caste !== "guard");
     for (const worker of idleWorkers) {
       const node = closestNode(state, worker, "protein");
       await request("/api/command/gather", {
@@ -326,7 +377,9 @@ it(
   "the full claim -> carrying -> return -> deposit lifecycle is visible over the wire to two open connections",
   async () => {
     const before = await getState();
-    const worker = before.workers.find((w: any) => !w.carrying) ?? before.workers[0];
+    // A Guard can never be commanded to gather (wrong caste).
+    const worker = before.workers.find((w: any) => !w.carrying && w.caste !== "guard");
+    if (!worker) throw new Error("no commandable (non-guard) worker in this colony");
     const node = closestNode(before, worker, "sugar");
     const baselineSugar = before.colony.resources.sugar;
 
@@ -427,9 +480,33 @@ it("I: aphid wandering is visible over an open WebSocket connection without a re
 it(
   "N: an attack's health drop, the creature's death, and its carcass are broadcast identically to every open connection",
   async () => {
-    const before = await getState();
-    const worker = before.workers.find((w: any) => !w.carrying) ?? before.workers[0];
-    const creature = before.creatures[0];
+    let before = await getState();
+    // Same Guard-caste filtering as the gather test above — a Guard can
+    // never be commanded to attack either (wrong caste). Unlike the other
+    // tests in this file, this one can't just retry with a fresh session
+    // (createOtherSession) — it deliberately shares this file's single
+    // module-scope session/colony, which the shared long-lived dev DB can
+    // leave with only a Guard in its roster by the time this test runs
+    // (see createSessionWithCommandableWorker's comment above). Reproducing
+    // a plain worker (costs exactly STARTING_PROTEIN, which every active
+    // colony always has at least once) is a reliable, always-available way
+    // to restore a commandable worker to this specific colony.
+    let worker = before.workers.find((w: any) => !w.carrying && w.caste !== "guard");
+    if (!worker) {
+      const reproRes = await request("/api/reproduce", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ caste: "worker" }),
+      });
+      expect(reproRes.status).toBe(200);
+      before = await getState();
+      worker = before.workers.find((w: any) => !w.carrying && w.caste !== "guard");
+    }
+    if (!worker) throw new Error("no commandable (non-guard) worker in this colony");
+    // Nearest creature to the attacking worker, not creatures[0] — bounds
+    // travel time the same way closestNode already does for gather tests
+    // (see closestCreature's comment above).
+    const creature = closestCreature(before, worker);
     // The creature wanders (and is chased) before it dies, so its death
     // position won't match where it started — identify the new carcass by
     // which item-node id is new, not by position.
@@ -488,13 +565,11 @@ it(
 it(
   "a worker injured or killed by a spider is visible, as an otherWorkers health/presence change, to another colony's own open WebSocket connection",
   async () => {
-    const colonyA = createOtherSession();
+    const { session: colonyA, state: aState, worker: aWorker } = await createSessionWithCommandableWorker();
     const colonyB = createOtherSession();
 
-    const aState = await colonyA.request("/api/state").then((r) => r.json());
     await colonyB.request("/api/state").then((r) => r.json()); // ensure colony B's session/colony exists first
 
-    const aWorker = aState.workers.find((w: any) => !w.carrying) ?? aState.workers[0];
     const spider = aState.creatures.find((c: any) => c.species === "spider");
     expect(spider, "seed should always include at least one spider").toBeDefined();
 
@@ -536,17 +611,22 @@ it(
 // does above (N) and like the existing otherWorkers move-visibility test
 // earlier in this file. No client-side combat simulation: both sessions only
 // ever learn about the fight from server-pushed broadcast frames.
+//
+// A lone attacking worker is not reliably enough to finish off a
+// Guard-defended target within this test's timeout: the Guard (150 HP,
+// 25 dmg, spawned within GUARD_PROTECT_RADIUS of its own queen) typically
+// kills a solo 30-HP attacker before that attacker's third, lethal hit
+// against the 30-HP target lands — see the queen-PvP test below for the
+// identical reasoning applied to a queen target. Two attacking workers (the
+// agreed minimum fix — see CLAUDE.md's Stage 14B section) is enough to
+// reliably finish the target off within the timeout with no change to any
+// combat/balance code.
 it(
   "a PvP attack's health drop and the target's death are broadcast, as both an otherWorkers and a workers change, to every open connection",
   async () => {
-    const colonyA = createOtherSession();
-    const colonyB = createOtherSession();
-
-    const aState = await colonyA.request("/api/state").then((r) => r.json());
-    const bState = await colonyB.request("/api/state").then((r) => r.json());
-
-    const attacker = aState.workers.find((w: any) => !w.carrying) ?? aState.workers[0];
-    const target = bState.workers.find((w: any) => !w.carrying && w.caste !== "guard") ?? bState.workers[0];
+    const { session: colonyA, state: aState } = await createSessionWithCommandableWorker();
+    const { session: colonyB, worker: target } = await createSessionWithCommandableWorker();
+    const attackers = aState.workers.filter((w: any) => !w.carrying && w.caste !== "guard").slice(0, 2);
 
     const wsA = await colonyA.connect();
     const wsB = await colonyB.connect();
@@ -554,7 +634,7 @@ it(
       const res = await colonyA.request("/api/command/attack", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ workerIds: [attacker.id], targetWorkerId: target.id }),
+        body: JSON.stringify({ workerIds: attackers.map((w: any) => w.id), targetWorkerId: target.id }),
       });
       expect(res.status).toBe(200);
 
@@ -641,6 +721,117 @@ it(
     }
   },
   60000,
+);
+
+// Stage 14B: a realistic siege against a defended colony now that a Guard is
+// itself a valid PvP target (see issueAttackWorkerCommand) — the Guard must
+// be killed first, since GUARD_PROTECT_RADIUS keeps it engaged with any
+// attacker that gets close enough to reach the queen (see Stage 14A's
+// isHostilePlayerUnit/findGuardThreat reasoning). 10 attacking workers are
+// pooled across as many freshly-minted colonies as it takes to reach that
+// total (a single colony's starting roster is nowhere near enough), attack
+// the Guard first, and — once it's confirmed dead — the surviving attackers
+// are re-commanded against the queen herself. Guard damage, Guard death,
+// queen damage, and the colony's eventual defeat are each observed purely
+// from server-pushed broadcast frames, with no client-side combat
+// simulation, exactly like every other realtime PvP test in this file.
+it(
+  "10 pooled attackers kill an enemy colony's guard first, then the survivors defeat the queen, all broadcast live",
+  async () => {
+    const colonyB = createOtherSession();
+    const bState = await colonyB.request("/api/state").then((r) => r.json());
+    const guard = bState.workers.find((w: any) => w.caste === "guard");
+    if (!guard) throw new Error("colony B has no guard");
+    const startingQueenHealth = bState.colonies.find((c: any) => c.id === bState.colony.id).health;
+
+    // Pool attacking workers across as many fresh colonies as it takes to
+    // reach 10 total, trimming the last group so the total is exactly 10.
+    const squad: { session: ReturnType<typeof createOtherSession>; workerIds: number[] }[] = [];
+    let total = 0;
+    while (total < 10) {
+      const session = createOtherSession();
+      const state = await session.request("/api/state").then((r) => r.json());
+      const ids = state.workers.filter((w: any) => !w.carrying && w.caste !== "guard").map((w: any) => w.id);
+      if (ids.length === 0) continue;
+      const taken = ids.slice(0, 10 - total);
+      squad.push({ session, workerIds: taken });
+      total += taken.length;
+    }
+    expect(total).toBe(10);
+
+    const wsB = await colonyB.connect();
+    try {
+      for (const group of squad) {
+        const res = await group.session.request("/api/command/attack", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ workerIds: group.workerIds, targetWorkerId: guard.id }),
+        });
+        expect(res.status).toBe(200);
+      }
+
+      async function waitForGuardDamagedThenDead(): Promise<{ sawDamage: boolean; sawDeath: boolean }> {
+        const deadline = Date.now() + 45000;
+        let sawDamage = false;
+        let sawDeath = false;
+        while (!(sawDamage && sawDeath) && Date.now() < deadline) {
+          const message = await nextMessage(wsB, 45000);
+          const current = message.workers.find((w: any) => w.id === guard.id);
+          if (current && typeof current.health === "number" && current.health < guard.health) sawDamage = true;
+          if (!current) sawDeath = true;
+        }
+        return { sawDamage, sawDeath };
+      }
+
+      const guardSeen = await waitForGuardDamagedThenDead();
+      expect(guardSeen.sawDamage).toBe(true);
+      expect(guardSeen.sawDeath).toBe(true);
+
+      // The Guard is dead — re-command whichever attackers survived against
+      // the queen herself.
+      const survivorGroups: { session: ReturnType<typeof createOtherSession>; workerIds: number[] }[] = [];
+      for (const group of squad) {
+        const state = await group.session.request("/api/state").then((r) => r.json());
+        const aliveIds = state.workers.filter((w: any) => group.workerIds.includes(w.id)).map((w: any) => w.id);
+        if (aliveIds.length > 0) survivorGroups.push({ session: group.session, workerIds: aliveIds });
+      }
+      expect(survivorGroups.length).toBeGreaterThan(0);
+
+      const wsA = await survivorGroups[0].session.connect();
+      try {
+        for (const group of survivorGroups) {
+          const res = await group.session.request("/api/command/attack", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ workerIds: group.workerIds, targetQueenColonyId: bState.colony.id }),
+          });
+          expect(res.status).toBe(200);
+        }
+
+        async function waitForQueenDamagedThenDefeated(): Promise<{ sawDamage: boolean; sawDefeat: boolean }> {
+          const deadline = Date.now() + 45000;
+          let sawDamage = false;
+          let sawDefeat = false;
+          while (!(sawDamage && sawDefeat) && Date.now() < deadline) {
+            const message = await nextMessage(wsA, 45000);
+            const roster = message.colonies.find((c: any) => c.id === bState.colony.id);
+            if (roster && typeof roster.health === "number" && roster.health < startingQueenHealth) sawDamage = true;
+            if (roster && roster.status === "defeated") sawDefeat = true;
+          }
+          return { sawDamage, sawDefeat };
+        }
+
+        const queenSeen = await waitForQueenDamagedThenDefeated();
+        expect(queenSeen.sawDamage).toBe(true);
+        expect(queenSeen.sawDefeat).toBe(true);
+      } finally {
+        wsA.close();
+      }
+    } finally {
+      wsB.close();
+    }
+  },
+  120000,
 );
 
 // Stage 8: this file's module-scope session/colony is shared by every test
