@@ -1,42 +1,19 @@
-# Crit 10
+# Crit 10 Reflection — Fly by Instruments
 
-**What was the breakthrough that moved the work forward?**
+For Crit 10, my main goal was to turn Colony from a shared simulation into an actual multi-user game. The previous version could persist state and broadcast updates, but it still did not properly represent separate players. Having two browsers looking at the same colony was not enough to satisfy my idea of multiplayer.
 
-I'd assumed "give each session its own colony" was the whole architecture,
-and started implementing it as a straightforward lazy-creation flow: no
-cookie, mint a colony, done. The red spec file I wasn't allowed to touch
-caught something I hadn't actually thought through — a test that fetches
-alice's state, then bob's, then checks that alice's *own* response already
-lists bob's colony in the shared roster. My first instinct was that this
-had to be a flaw in the test's ordering, since bob's colony plainly didn't
-exist yet when alice's request was served. It took sitting with that
-discomfort for a while — re-reading the test rather than assuming it was
-wrong — before I saw that the test wasn't describing a race, it was
-describing a requirement: the world has to stay one step ahead of whoever
-joins it next. The fix (always keep one spare, pre-minted colony sitting
-unclaimed, so a session's own response already contains the colony the very
-next joiner will get) only became obvious once I stopped treating the test
-as an obstacle to route around and started treating it as the actual spec
-for a behaviour I hadn't designed for yet.
+I introduced separate colonies associated with different browser sessions. Each player could have their own queen, workers and resources while still existing in the same world. This meant I also needed ownership checks on the server. A player should be able to see another colony, but should not be able to command its workers or spend its resources.
 
-The second one was quieter but just as real: I redesigned the WebSocket
-broadcast to compute `getState(colonyId)` per connection, which felt like
-the obviously correct per-colony analogue of the old single shared payload.
-It broke a test I'd assumed would just keep passing — two connections to
-the same colony seeing byte-identical state. Diffing my new code against
-`git show HEAD:src/server/index.ts` rather than guessing showed the
-original never recomputed state per client at all; it computed once per
-tick and fanned out the same string. My "obviously correct" version had
-quietly dropped an invariant the original architecture gave me for free.
+This was one of the more important design changes because it made the multiplayer requirement meaningful. The server could no longer assume that every request belonged to the same colony. It had to identify the player making the request and verify that the requested action was allowed.
 
-**What did this work change about who I want to be as a software developer?**
+Two specific problems came out of a spec file I wasn't allowed to weaken, and both taught me something I hadn't designed for. The first was a test asserting that a session's own very first response already had to list the next session's colony in the shared roster — which looked impossible, since that colony didn't exist yet. My first instinct was that the test had to be wrong, but sitting with it longer showed it wasn't describing a race, it was describing a real requirement: the world has to stay one step ahead of whoever joins it next. The fix was to always keep one spare, pre-minted colony sitting unclaimed rather than creating colonies lazily. The second was quieter: I redesigned the WebSocket broadcast to compute state per connection, which felt like the obviously correct per-colony version of the old shared payload, and it broke a test expecting two connections to the same colony to see byte-identical state. Diffing against the previous committed version rather than guessing showed the original had never recomputed state per client — it computed once per tick and fanned the same payload out to everyone. My "obviously correct" rewrite had quietly dropped an invariant the original design gave me for free.
 
-Both of these were cases where a test I was forbidden to weaken was, in
-effect, more right than my first read of the requirements. The rule not to
-touch `spec/multiplayer.test.ts` could have felt like a constraint to work
-around; instead it forced me to actually resolve the disagreement between
-what I'd built and what the test expected, rather than settling for "the
-test must be wrong" the moment my code didn't match it. I want to keep that
-instinct — when a spec I trust and my implementation disagree, assume the
-spec is teaching me something about the design before assuming it's a bug
-in the spec.
+I also added an action log to help observe what happened on the server. This was useful because realtime applications can be difficult to debug just by watching the interface. If an action failed or produced an unexpected result, I needed a way to distinguish between a client problem, a rejected command and an actual server-side state change.
+
+The crit's emphasis on using the deployed application from the URL alone also made me think about the experience of someone who had never seen the project before. I was familiar with the controls and the intended gameplay, but a new visitor would not necessarily understand them. This was a reminder that a technically working application can still be difficult to use.
+
+I continued using Claude Code to implement and test the changes. The most useful part of the workflow was separating the requirements into things I could verify: different sessions must resolve to different colonies, commands must respect ownership, and changes must be visible across connected browsers. These were much clearer targets than simply asking Claude to make the game multiplayer. Both problems above were also cases where a test I was forbidden to touch turned out to be more right than my first reading of the requirements — I want to keep trusting a spec I believe in over assuming it's the one that's wrong.
+
+The main limitation at this stage was that the world still lacked many of the mechanics I originally imagined. Separate colonies could exist, but there were not yet enough interesting ways for them to interact. After the crit, I continued developing the game through additional stages, including hunting, worker survival, evolution, different unit types and eventually PvP combat.
+
+Looking back, Crit 10 was the point where the project became genuinely multiplayer rather than just technically realtime. It also showed me that adding more players creates new responsibilities around identity, permissions and debugging. Those decisions became part of the foundation for the later gameplay systems.

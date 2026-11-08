@@ -1,35 +1,19 @@
-# Crit 9
+# Crit 9 Reflection — All at Once
 
-**What was the breakthrough that moved the work forward?**
+For Crit 9, I focused on making Colony realtime and deciding what should happen when multiple actions reach the server at nearly the same time. The previous version already had persistent state, but it still behaved more like a collection of requests than a continuously running game.
 
-Realising that the brief's required multi-user decision wasn't a prose
-question to answer after the fact — it was something I could actually go
-verify. Instead of reasoning in the abstract about what happens when two
-people act on the colony at once, I wrote a test for the exact race (two
-simultaneous `reproduce` calls competing for the same protein) before I'd
-decided what to say about it, and watched it already pass. The decision
-("the server is the single authority, clients never resolve conflicts
-themselves") came out of that result, not the other way around. It changed
-the order I work in: write the test for the claim, then make the claim,
-not the reverse.
+I introduced WebSockets so that the server could push updates to connected browsers without requiring them to refresh. I chose this over repeated polling because I expected the game to involve frequent movement and state changes. A shared world would not feel very convincing if different players were constantly looking at outdated versions of it.
 
-The second breakthrough was smaller but cost me real time to find: a second
-spec file that mutates the same shared colony as last week's broke the old
-test intermittently, and the cause wasn't my code — Vitest's default file
-ordering turned out to be a cache/size heuristic, not alphabetical, so which
-file ran first wasn't deterministic. I didn't accept "it's flaky" as an
-answer; I went and read the sequencer's actual source until I understood
-why, then fixed the real cause (a path-ordered sequencer) instead of
-reaching for a workaround like isolating the tests or adding retries.
+The other important part was concurrency. I used reproduction as a concrete example because it involves spending a limited resource. If a colony had enough protein for only one worker and two reproduction commands arrived together, only one should succeed. Otherwise, the game would effectively create resources from nothing. Rather than reason about this in the abstract, I wrote a test for the exact race — two simultaneous reproduce calls competing for the same protein — before deciding what the rule should be, and let the test's result justify the decision rather than the other way around.
 
-**What did this work change about who I want to be as a software developer?**
+I decided to keep the server authoritative over state changes. Clients could request reproduction, but the server would check the current resources and decide whether the request was valid. Since the application was running on one Node.js server, I could keep the critical mutation path synchronous rather than introducing a more complicated distributed locking system. The brief requires my pod to argue for whichever multi-user option I didn't pick, so I made a point of choosing this decision myself rather than letting Claude pick one of the reasonable alternatives for me — I wanted it to be something I actually believed, not just a plausible paragraph.
 
-The brief says my pod will be asked to argue for the multi-user option I
-didn't pick, which meant the decision had to be mine in a way that would
-hold up out loud, not just a plausible paragraph. I caught myself about to
-let the agent pick one of the four candidate decisions for me "since they're
-all reasonable" — and stopped, because defending a decision I don't
-actually believe is worse than making a smaller one I do. Choosing the
-topic myself, then using the agent to verify the technical fact underneath
-it rather than write the justification, felt like the right split of labour
-to keep.
+A second, smaller problem cost me real time: a new spec file that mutated the same shared colony as an older one started breaking that older test intermittently. It wasn't my application code — Vitest's default file ordering is a cache/size heuristic, not alphabetical, so which spec file ran first wasn't deterministic. I read the test runner's own sequencing logic until I understood the actual cause, then fixed it with a custom path-ordered test sequencer rather than papering over it with retries.
+
+This made me think more carefully about the difference between realtime updates and correct shared state. WebSockets can make changes appear quickly, but that does not automatically mean the underlying decisions are consistent. If two browsers see an impossible result, displaying it immediately does not make the application good.
+
+I also learned that automated tests were particularly useful for problems that were difficult to reproduce manually. Clicking twice quickly in a browser was not a reliable way to test concurrency. Sending competing requests and checking the final state gave me much stronger evidence that the server behaved correctly.
+
+Claude Code was useful for implementing the WebSocket connection and writing the tests, but the main design decision — what consistency should mean for the game — was mine. I wanted every action to have one authoritative result that all connected players could observe.
+
+At the end of this crit, Colony had a much better technical foundation for multiplayer. However, it still did not properly distinguish different players and their colonies. The next challenge was to make the shared world genuinely multi-user, where each person had their own identity and could affect the same environment without controlling someone else's units.

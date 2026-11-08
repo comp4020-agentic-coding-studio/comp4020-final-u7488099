@@ -1,34 +1,17 @@
-# Crit 8
+# Crit 8 Reflection — It's Alive!
 
-**What was the breakthrough that moved the work forward?**
+For this crit, I wanted to get the first working version of Colony running online. My original idea was a multiplayer ant-colony game where players could gather resources, grow their colonies and eventually interact with each other in a shared world. However, I realised that trying to build the whole game immediately would make it difficult to tell whether the basic idea actually worked.
 
-Realising the Dockerfile's base image choice wasn't a detail to fix later —
-it was load-bearing for whether `better-sqlite3` would even build on Fly's
-remote builder. The starter's `busybox` placeholder has no Node runtime at
-all, so the Dockerfile had to become a real multi-stage build regardless of
-stack. Once I knew the persistence layer would be a native SQLite binding, I
-checked prebuilt-binary coverage before writing a line of game logic:
-`node:24-slim` (glibc) over `node:24-alpine` (musl), confirmed by actually
-building the image locally before the first deploy rather than trusting the
-reasoning. That one decision, made early and verified rather than assumed,
-is why the stage 0 deploy — and every one after it — just worked instead of
-failing on Fly's builder two hours before the cutoff.
+I started with one shared colony containing a queen and a small number of workers. The main actions were gathering protein and spending it to reproduce more workers. This was a very small part of my original idea, but it gave the game a basic loop where one action created the resources needed for another.
 
-The second breakthrough was smaller but changed how I staged the whole
-build: discovering Node 24 strips TypeScript types natively meant the server
-never needs a build step at all, only the browser bundle does. That
-collapsed what I'd planned as a two-stage compile (tsc for the server,
-esbuild for the client) into one, and meant `CMD` could just run
-`src/server/index.ts` directly. I verified it with a two-line throwaway file
-before designing the Dockerfile around it, rather than finding out the hard
-way inside a failed container build.
+Before writing any game logic, I had to get a real server running on Fly.io, and the Docker base image turned out to matter more than I expected: `better-sqlite3` needed a native binary, so I checked prebuilt-binary compatibility by building the image locally — `node:24-slim` (glibc) rather than the smaller `alpine`/musl image — before the first deploy, instead of assuming it would just work. I also found that Node 24 strips TypeScript types natively, so the server didn't need a build step at all, only the browser bundle did.
 
-**What did this work change about who I want to be as a software developer?**
+The most important technical requirement at this stage was persistence. I used SQLite with a Fly.io volume so that the colony's progress would survive a server restart. I tested this properly rather than just assuming it worked: I gathered protein up to a known value over HTTP, restarted the live Fly machine, and confirmed the state still showed the same protein count afterwards. This made me realise persistence was also part of the gameplay design — if the colony disappeared whenever the server restarted, growing it would not feel meaningful.
 
-I noticed myself wanting to add `ws` wiring in stage 0 "since the dependency
-was already there anyway" — and stopping, because the actual scope was
-gather-and-reproduce, not realtime. Writing that boundary into `CLAUDE.md`
-before any code existed, rather than after catching myself mid-feature,
-felt like the right instinct to keep. The habit I want to keep is deciding
-scope on purpose and writing it down where future-me (or an agent) will
-read it, instead of discovering the boundary by drifting past it.
+I also started defining what I meant by a good version of this game. I wanted the player to understand what their actions did and why those actions mattered. I connected this to meaningful play from Salen and Zimmerman, emergence from Juul, and persistent virtual worlds from Bartle. These ideas helped me justify why I was starting with a simple gathering and reproduction loop instead of adding many unrelated features.
+
+Claude Code helped me implement the prototype and write tests, but I still had to decide what the first version should include. I deliberately left out artwork, complicated worker behaviour and most of the multiplayer mechanics. I noticed myself wanting to wire up WebSockets early "since the dependency was already there anyway," and stopped, since realtime wasn't part of this crit's scope — I wrote that boundary into CLAUDE.md before writing more code, rather than discovering it by drifting past it later. Looking back, leaving those things out was the right call, because it gave me a working foundation I could actually deploy and test.
+
+The biggest limitation was that the game did not yet feel very alive. Workers and resources existed, but there was not much happening continuously, and different players could not control their own colonies. My next priority was therefore to introduce realtime updates and make the world behave more like a simulation rather than a collection of individual button presses.
+
+This crit helped me understand the value of starting with a small working system. I did not have a particularly impressive game yet, but I had a persistent foundation and a clearer idea of what needed to happen next.
