@@ -25,3 +25,16 @@ Whether the game is interesting cannot be established by passing tests. I judge 
 I rejected permanent offline protection because I wanted a vulnerable, changing world rather than a base that waits safely for its owner. I also avoided nests, eggs, complex buildings and finished artwork. Those features might add depth, but they would not compensate for unreliable shared-state behaviour. Simple shapes kept attention on whether the underlying mechanics worked.
 
 This is still a prototype, not a balanced commercial game. Its main achievement is connecting a small set of actions to consequences that other people can see and affect.
+
+## Marker Access — Admin Interface
+
+The project includes an admin interface for inspecting and managing the shared game world.
+
+For assessment purposes, the following demo credentials are available:
+
+- **Username:** `admin`
+- **Password:** `12345678`
+
+The admin interface is separate from the normal player experience. Markers can use these credentials to explore the administrative functionality.
+
+Please use the normal game interface when testing multiplayer gameplay.
